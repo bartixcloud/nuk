@@ -1,0 +1,35 @@
+[project]
+name = "nuk"
+version = "0.1.0"
+description = "Minimal Kubernetes-shaped Docker Compose deployer (nuklaut controller CLI)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["pyyaml>=6"]
+
+[project.scripts]
+nuk = "nuk:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["nuk"]
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.11"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+# Lint is tuned to PASS the existing terse stdlib CLI without rewriting it
+# (deliberate bare-dict return types, single-line stdlib import). High-value
+# rules only: pyflakes (F), bugbear (B), pyupgrade (UP). Tightening toward the
+# org canon (import sorting, strict typing) is deferred to the "generalize" step.
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["F", "B", "UP"]
