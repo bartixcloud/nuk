@@ -31,6 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write   # dispatch deploy.yml
     env:
       TAG: ${{ needs.release-please.outputs.tag_name }}
     steps:
