@@ -23,9 +23,7 @@ def test_legacy_single_host_gets_maintenance_only():
     but it is a cross-file (@file) reference — NOT an app-local middleware
     definition — so http.middlewares stays empty when nothing strips/redirects.
     """
-    doc = nuk.build_ingress(
-        "bartix", [{"host": "bartix.de", "service": "web", "port": 8080}]
-    )
+    doc = nuk.build_ingress("bartix", [{"host": "bartix.de", "service": "web", "port": 8080}])
     assert doc == {
         "http": {
             "routers": {
@@ -38,9 +36,7 @@ def test_legacy_single_host_gets_maintenance_only():
                 }
             },
             "services": {
-                "bartix-0": {
-                    "loadBalancer": {"servers": [{"url": "http://bartix-web-1:8080"}]}
-                }
+                "bartix-0": {"loadBalancer": {"servers": [{"url": "http://bartix-web-1:8080"}]}}
             },
         }
     }
@@ -75,36 +71,25 @@ def test_kolbe_pathprefix_split():
     mws = doc["http"]["middlewares"]
 
     # /api router: Host && PathPrefix, strip middleware attached, points at backend
-    assert (
-        routers["kolbe-0"]["rule"]
-        == "Host(`kolbe.astrojones.de`) && PathPrefix(`/api`)"
-    )
+    assert routers["kolbe-0"]["rule"] == "Host(`kolbe.astrojones.de`) && PathPrefix(`/api`)"
     # strip middleware first, then the inherited maintenance-errors reference
     assert routers["kolbe-0"]["middlewares"] == [
         "kolbe-0-strip",
         "maintenance-errors@file",
     ]
     assert mws["kolbe-0-strip"] == {"stripPrefix": {"prefixes": ["/api"]}}
-    assert (
-        services["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
-        == "http://kolbe-backend-1:8000"
-    )
+    assert services["kolbe-0"]["loadBalancer"]["servers"][0]["url"] == "http://kolbe-backend-1:8000"
 
     # catch-all frontend router: plain Host, only the inherited maintenance mw
     assert routers["kolbe-1"]["rule"] == "Host(`kolbe.astrojones.de`)"
     assert routers["kolbe-1"]["middlewares"] == ["maintenance-errors@file"]
-    assert (
-        services["kolbe-1"]["loadBalancer"]["servers"][0]["url"]
-        == "http://kolbe-frontend-1:80"
-    )
+    assert services["kolbe-1"]["loadBalancer"]["servers"][0]["url"] == "http://kolbe-frontend-1:80"
 
 
 def test_path_without_strip_has_no_local_middleware():
     """PathPrefix without stripPrefix defines no app-local middleware; the router
     still inherits the maintenance-errors reference."""
-    doc = nuk.build_ingress(
-        "a", [{"host": "h", "path": "/x", "service": "s", "port": 1}]
-    )
+    doc = nuk.build_ingress("a", [{"host": "h", "path": "/x", "service": "s", "port": 1}])
     assert doc["http"]["routers"]["a-0"]["rule"] == "Host(`h`) && PathPrefix(`/x`)"
     assert doc["http"]["routers"]["a-0"]["middlewares"] == ["maintenance-errors@file"]
     # no app-local middleware DEFINITIONS (maintenance-errors lives in global.yml)
@@ -171,9 +156,7 @@ def test_auth_oauth_with_pathprefix_orders_oauth_then_strip():
 
 
 def test_explicit_priority():
-    doc = nuk.build_ingress(
-        "a", [{"host": "h", "service": "s", "port": 1, "priority": 100}]
-    )
+    doc = nuk.build_ingress("a", [{"host": "h", "service": "s", "port": 1, "priority": 100}])
     assert doc["http"]["routers"]["a-0"]["priority"] == 100
 
 
@@ -317,9 +300,7 @@ def test_override_env_from_and_db_env_both_present_db_env_last(tmp_path):
 
 
 def test_override_without_env_from_or_db_env_has_no_env_file():
-    ov = nuk.build_override(
-        "bartix", [{"host": "bartix.de", "service": "web", "port": 8080}]
-    )
+    ov = nuk.build_override("bartix", [{"host": "bartix.de", "service": "web", "port": 8080}])
     assert ov["services"] == {"web": {"networks": ["edge"]}}
     assert "env_file" not in ov["services"]["web"]
 
@@ -434,9 +415,7 @@ def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
 
     def fake_pg(app, prev, driver=None):
         seen.append(driver)
-        return (
-            f"postgresql+{driver}" if driver else "postgresql"
-        ) + f"://{app}:x@h:5432/{app}"
+        return (f"postgresql+{driver}" if driver else "postgresql") + f"://{app}:x@h:5432/{app}"
 
     monkeypatch.setattr(nuk, "ensure_postgres", fake_pg)
     nuk.provision_databases("app", {"postgres": {"driver": "asyncpg"}})
@@ -445,6 +424,77 @@ def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
 
     nuk.provision_databases("app", {"postgres": True})
     assert seen == ["asyncpg", None]
+
+
+# --- source provenance: github_url + manifest stamping ------------------------
+
+
+@pytest.mark.parametrize(
+    "remote,expected",
+    [
+        ("git@github.com:astrojones/kolbe.git", "https://github.com/astrojones/kolbe"),
+        ("https://github.com/astrojones/kolbe.git", "https://github.com/astrojones/kolbe"),
+        ("https://github.com/astrojones/kolbe", "https://github.com/astrojones/kolbe"),
+        ("git@github.com:astrojones/kolbe", "https://github.com/astrojones/kolbe"),
+        ("  https://github.com/astrojones/kolbe.git\n", "https://github.com/astrojones/kolbe"),
+    ],
+)
+def test_github_url_normalises(remote, expected):
+    assert nuk.github_url(remote) == expected
+
+
+@pytest.mark.parametrize(
+    "remote",
+    ["git@gitlab.com:astrojones/kolbe.git", "", "not a url", "https://example.com/x"],
+)
+def test_github_url_rejects_non_github(remote):
+    assert nuk.github_url(remote) is None
+
+
+def test_persist_manifest_stamps_source_repo_from_origin(tmp_path, monkeypatch):
+    """--repo-path apply: a manifest without spec.source.repo gets one stamped
+    from the checkout's git origin, so nukview can link the app to its repo."""
+    monkeypatch.setattr(nuk, "git_origin", lambda p: "https://github.com/astrojones/kolbe")
+    spec = {
+        "apiVersion": "nuk/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "kolbe"},
+        "spec": {"ingress": []},
+    }
+    src = tmp_path / "deployment.yml"
+    src.write_text("placeholder")
+    dest = tmp_path / "manifest.yml"
+    nuk.persist_manifest(spec, src, dest, "/ws")
+    out = yaml.safe_load(dest.read_text())
+    assert out["spec"]["source"]["repo"] == "https://github.com/astrojones/kolbe"
+
+
+def test_persist_manifest_preserves_declared_source_repo(tmp_path, monkeypatch):
+    """A manifest that already declares spec.source.repo is copied verbatim; the
+    declared source wins over the git origin and the file is left untouched."""
+    monkeypatch.setattr(nuk, "git_origin", lambda p: "https://github.com/astrojones/OTHER")
+    spec = {
+        "apiVersion": "nuk/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "x"},
+        "spec": {"source": {"repo": "https://github.com/astrojones/declared"}},
+    }
+    src = tmp_path / "deployment.yml"
+    src.write_text("verbatim-content")
+    dest = tmp_path / "manifest.yml"
+    nuk.persist_manifest(spec, src, dest, "/ws")
+    assert dest.read_text() == "verbatim-content"
+
+
+def test_persist_manifest_verbatim_when_origin_unavailable(tmp_path, monkeypatch):
+    """No git origin (e.g. not a github checkout) => plain verbatim copy, no stamp."""
+    monkeypatch.setattr(nuk, "git_origin", lambda p: None)
+    spec = {"apiVersion": "nuk/v1", "kind": "Deployment", "metadata": {"name": "x"}, "spec": {}}
+    src = tmp_path / "deployment.yml"
+    src.write_text("verbatim")
+    dest = tmp_path / "manifest.yml"
+    nuk.persist_manifest(spec, src, dest, None)
+    assert dest.read_text() == "verbatim"
 
 
 # --- version flag (used by the controller CD smoke check) ---------------------

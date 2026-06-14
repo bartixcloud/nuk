@@ -5,6 +5,7 @@ Manifest (apiVersion: nuk/v1, kind: Deployment) describes one git repo with a
 compose project, optional ingress hosts, and env files. State lives entirely in
 /opt/nuklaut/ on the host; no daemon, no database.
 """
+
 from __future__ import annotations
 import argparse, os, re, secrets, shutil, subprocess, sys, textwrap
 from pathlib import Path
@@ -39,6 +40,46 @@ def project_dir(name: str) -> Path:
     return DEPLOYS / name
 
 
+def github_url(remote: str) -> str | None:
+    """Normalise a git remote (ssh or https) to its github.com web URL, or None."""
+    remote = remote.strip()
+    m = re.match(r"git@github\.com:(.+?)(?:\.git)?$", remote) or re.match(
+        r"https?://github\.com/(.+?)(?:\.git)?$", remote
+    )
+    return f"https://github.com/{m.group(1)}" if m else None
+
+
+def git_origin(repo_path: str) -> str | None:
+    """github.com web URL for repo_path's origin remote, or None if unavailable."""
+    try:
+        out = subprocess.run(
+            ["git", "-C", repo_path, "config", "--get", "remote.origin.url"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return github_url(out)
+
+
+def persist_manifest(spec: dict, src_path: Path, dest: Path, repo_path: str | None) -> None:
+    """Write the deployment manifest to the controller for nukview to read.
+
+    Copied verbatim, except: when applied with --repo-path and the manifest did
+    not declare spec.source.repo, stamp it from the checkout's git origin. This
+    gives nukview a repo link for workflow-deployed apps, whose CI passes
+    --repo-path and whose manifests usually omit source.repo.
+    """
+    src = spec["spec"].get("source") or {}
+    origin = git_origin(repo_path) if repo_path else None
+    if origin and not src.get("repo"):
+        spec["spec"]["source"] = {**src, "repo": origin}
+        dest.write_text(yaml.safe_dump(spec, sort_keys=False))
+    else:
+        shutil.copy(src_path, dest)
+
+
 def compose_args(name: str, spec: dict) -> list[str]:
     repo = project_dir(name) / "repo"
     cf = spec["spec"].get("compose", {}).get("file", "docker-compose.yml")
@@ -65,8 +106,9 @@ def resolve_env_from(spec: dict) -> list[str]:
     return refs
 
 
-def build_override(name: str, ingress: list[dict], db_env: str | None = None,
-                    env_from: list[str] | None = None) -> dict | None:
+def build_override(
+    name: str, ingress: list[dict], db_env: str | None = None, env_from: list[str] | None = None
+) -> dict | None:
     """Compose override joining each ingress service to the shared edge network
     (Traefik ingress). Each ingress service also gets an `env_file` list so its
     container actually receives the requested secrets — `docker compose
@@ -99,8 +141,9 @@ def build_override(name: str, ingress: list[dict], db_env: str | None = None,
     return {"services": services, "networks": networks}
 
 
-def write_override(name: str, ingress: list[dict], db_env: str | None = None,
-                    env_from: list[str] | None = None) -> None:
+def write_override(
+    name: str, ingress: list[dict], db_env: str | None = None, env_from: list[str] | None = None
+) -> None:
     doc = build_override(name, ingress, db_env, env_from)
     if doc is None:
         return
@@ -156,17 +199,21 @@ def build_ingress(name: str, ingress: list[dict]) -> dict | None:
         if "priority" in ing:
             router["priority"] = ing["priority"]
         routers[rid] = router
-        services[rid] = {"loadBalancer": {"servers": [
-            {"url": f"http://{name}-{ing['service']}-1:{ing['port']}"}
-        ]}}
+        services[rid] = {
+            "loadBalancer": {
+                "servers": [{"url": f"http://{name}-{ing['service']}-1:{ing['port']}"}]
+            }
+        }
         if ing.get("www"):
             host = ing["host"]
             wid, rdid = f"{rid}-www", f"{rid}-www-redirect"
-            middlewares[rdid] = {"redirectRegex": {
-                "regex": rf"^https?://www\.{re.escape(host)}/(.*)",
-                "replacement": f"https://{host}/${{1}}",
-                "permanent": True,
-            }}
+            middlewares[rdid] = {
+                "redirectRegex": {
+                    "regex": rf"^https?://www\.{re.escape(host)}/(.*)",
+                    "replacement": f"https://{host}/${{1}}",
+                    "permanent": True,
+                }
+            }
             routers[wid] = {
                 "rule": f"Host(`www.{host}`)",
                 "entryPoints": ["websecure"],
@@ -226,6 +273,7 @@ def _chown_deploy(path: Path) -> None:
     if os.geteuid() != 0:
         return
     import pwd
+
     try:
         u = pwd.getpwnam("deploy")
         os.chown(path, u.pw_uid, u.pw_gid)
@@ -256,9 +304,24 @@ def write_db_env(app: str, env: dict[str, str]) -> str:
 
 def _psql(sql: str, db: str = "postgres") -> str:
     return subprocess.run(
-        ["docker", "exec", "-i", PG_CONTAINER, "psql", "-U", "postgres",
-         "-d", db, "-v", "ON_ERROR_STOP=1", "-tAqc", sql],
-        check=True, capture_output=True, text=True,
+        [
+            "docker",
+            "exec",
+            "-i",
+            PG_CONTAINER,
+            "psql",
+            "-U",
+            "postgres",
+            "-d",
+            db,
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-tAqc",
+            sql,
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 
@@ -268,7 +331,9 @@ def _redis_admin(*redis_args: str) -> str:
     script = 'REDISCLI_AUTH="$REDIS_ADMIN_PASSWORD" exec redis-cli --user nukadmin "$@"'
     return subprocess.run(
         ["docker", "exec", REDIS_CONTAINER, "sh", "-c", script, "_", *redis_args],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
 
 
@@ -280,8 +345,10 @@ def ensure_postgres(app: str, prev_url: str | None, driver: str | None = None) -
     if driver and not re.fullmatch(r"[a-z][a-z0-9]*", driver):
         sys.exit(f"nuk: invalid postgres driver {driver!r}")
     pw = _pw_from_url(prev_url) or secrets.token_urlsafe(24)
-    _psql(f'DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {_lit(app)}) '
-          f'THEN CREATE ROLE "{app}" LOGIN; END IF; END $$;')
+    _psql(
+        f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {_lit(app)}) "
+        f'THEN CREATE ROLE "{app}" LOGIN; END IF; END $$;'
+    )
     _psql(f'ALTER ROLE "{app}" WITH LOGIN PASSWORD {_lit(pw)};')
     if _psql(f"SELECT 1 FROM pg_database WHERE datname = {_lit(app)};") != "1":
         _psql(f'CREATE DATABASE "{app}" OWNER "{app}";')
@@ -298,8 +365,18 @@ def ensure_redis(app: str, prev_url: str | None) -> str:
     prefix + channels, with dangerous commands removed (no FLUSHALL on the shared
     instance). Persist to the aclfile. Return a REDIS_URL."""
     pw = _pw_from_url(prev_url) or secrets.token_urlsafe(24)
-    _redis_admin("ACL", "SETUSER", app, "reset", "on", f">{pw}",
-                 f"~{app}:*", f"&{app}:*", "+@all", "-@dangerous")
+    _redis_admin(
+        "ACL",
+        "SETUSER",
+        app,
+        "reset",
+        "on",
+        f">{pw}",
+        f"~{app}:*",
+        f"&{app}:*",
+        "+@all",
+        "-@dangerous",
+    )
     _redis_admin("ACL", "SAVE")
     return f"redis://{app}:{pw}@{REDIS_CONTAINER}:6379/0"
 
@@ -330,8 +407,10 @@ def purge_databases(app: str) -> None:
     _safe_ident(app)
     env = read_db_env(app)
     if "DATABASE_URL" in env:
-        _psql(f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
-              f"WHERE datname = {_lit(app)} AND pid <> pg_backend_pid();")
+        _psql(
+            f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+            f"WHERE datname = {_lit(app)} AND pid <> pg_backend_pid();"
+        )
         _psql(f'DROP DATABASE IF EXISTS "{app}";')
         _psql(f'DROP ROLE IF EXISTS "{app}";')
     if "REDIS_URL" in env:
@@ -352,7 +431,15 @@ def cmd_apply(args) -> None:
     if args.repo_path:
         # Workflow-managed: caller already has a checkout; mirror it in place.
         # rsync -a --delete keeps repo/ identical to the source tree.
-        sh("rsync", "-a", "--delete", "--exclude", ".git", f"{Path(args.repo_path).resolve()}/", str(repo) + "/")
+        sh(
+            "rsync",
+            "-a",
+            "--delete",
+            "--exclude",
+            ".git",
+            f"{Path(args.repo_path).resolve()}/",
+            str(repo) + "/",
+        )
     elif "repo" in src:
         branch = src.get("branch", "main")
         if not (repo / ".git").exists():
@@ -367,15 +454,19 @@ def cmd_apply(args) -> None:
     ingress = spec["spec"].get("ingress", []) or []
     db_env = provision_databases(name, spec["spec"].get("databases") or {})
     if db_env and not ingress:
-        print(f"{name}: databases provisioned but no ingress service to attach "
-              f"them to — DATABASE_URL/REDIS_URL won't be injected. Add an ingress entry.")
+        print(
+            f"{name}: databases provisioned but no ingress service to attach "
+            f"them to — DATABASE_URL/REDIS_URL won't be injected. Add an ingress entry."
+        )
     env_from = resolve_env_from(spec["spec"])
     if env_from and not ingress:
-        print(f"{name}: spec.envFrom secrets resolved but no ingress service to "
-              f"attach them to — they won't be injected. Add an ingress entry.")
+        print(
+            f"{name}: spec.envFrom secrets resolved but no ingress service to "
+            f"attach them to — they won't be injected. Add an ingress entry."
+        )
     write_override(name, ingress, db_env, env_from)
     write_ingress(name, ingress)
-    shutil.copy(args.manifest, pdir / "manifest.yml")
+    persist_manifest(spec, Path(args.manifest), pdir / "manifest.yml", args.repo_path)
     # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
     # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
     # whose image id changed.
@@ -391,16 +482,21 @@ def cmd_get(_args) -> None:
             continue
         spec = load(manifest)
         hosts = ",".join(i["host"] for i in spec["spec"].get("ingress", []) or [])
-        ps = subprocess.run(
-            ["docker", "compose", "-p", pdir.name, "ps", "--format", "{{.State}}"],
-            capture_output=True, text=True,
-        ).stdout.strip().replace("\n", ",") or "-"
+        ps = (
+            subprocess.run(
+                ["docker", "compose", "-p", pdir.name, "ps", "--format", "{{.State}}"],
+                capture_output=True,
+                text=True,
+            )
+            .stdout.strip()
+            .replace("\n", ",")
+            or "-"
+        )
         print(f"{pdir.name:24} {ps:32} {hosts}")
 
 
 def cmd_logs(args) -> None:
-    sh(*compose_args(args.name, load(project_dir(args.name) / "manifest.yml")),
-       "logs", "-f")
+    sh(*compose_args(args.name, load(project_dir(args.name) / "manifest.yml")), "logs", "-f")
 
 
 def cmd_rollout(args) -> None:
@@ -426,8 +522,10 @@ def cmd_delete(args) -> None:
     if getattr(args, "purge", False):
         purge_databases(args.name)
     elif (SECRETS / f"{args.name}-db.env").exists():
-        print(f"{args.name}: database retained. `nuk db ls` to view, "
-              f"`nuk db purge {args.name}` to drop it.")
+        print(
+            f"{args.name}: database retained. `nuk db ls` to view, "
+            f"`nuk db purge {args.name}` to drop it."
+        )
 
 
 def cmd_db_ls(_args) -> None:
@@ -436,11 +534,17 @@ def cmd_db_ls(_args) -> None:
     for f in sorted(SECRETS.glob("*-db.env")):
         app = f.name[: -len("-db.env")]
         env = read_db_env(app)
-        kinds = ",".join(
-            k for k, present in
-            (("postgres", "DATABASE_URL" in env), ("redis", "REDIS_URL" in env))
-            if present
-        ) or "-"
+        kinds = (
+            ",".join(
+                k
+                for k, present in (
+                    ("postgres", "DATABASE_URL" in env),
+                    ("redis", "REDIS_URL" in env),
+                )
+                if present
+            )
+            or "-"
+        )
         live = (DEPLOYS / app / "manifest.yml").exists()
         status = "deployed" if live else "RETAINED (no deployment — nuk db purge to drop)"
         print(f"{app:24} {kinds:16} {status}")
@@ -452,7 +556,9 @@ def cmd_db_purge(args) -> None:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(prog="nuk", formatter_class=argparse.RawDescriptionHelpFormatter,
+    p = argparse.ArgumentParser(
+        prog="nuk",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
         Manifest (apiVersion: nuk/v1, kind: Deployment):
           metadata.name, spec.source.{repo,branch}, spec.compose.file,
@@ -466,7 +572,8 @@ def main() -> None:
           spec.databases: {postgres: true, redis: true} -> per-app DB on the
             shared data stack; injects DATABASE_URL / REDIS_URL into the
             ingress service(s).
-        """))
+        """),
+    )
     p.add_argument("--version", action="version", version=f"nuk {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="list deployments (alias: get, ls)").set_defaults(fn=cmd_get)
@@ -474,25 +581,36 @@ def main() -> None:
     sub.add_parser("ls", help="alias for list").set_defaults(fn=cmd_get)
     ap = sub.add_parser("apply", help="create or update a deployment from a manifest")
     ap.add_argument("manifest")
-    ap.add_argument("--repo-path", default=None,
-                    help="local path to use instead of cloning spec.source.repo "
-                         "(for workflow-driven deploys where the runner already has a checkout)")
+    ap.add_argument(
+        "--repo-path",
+        default=None,
+        help="local path to use instead of cloning spec.source.repo "
+        "(for workflow-driven deploys where the runner already has a checkout)",
+    )
     ap.set_defaults(fn=cmd_apply)
     for name, fn, helptext in [
         ("logs", cmd_logs, "follow compose logs for a deployment"),
         ("rollout", cmd_rollout, "git pull + compose pull + up -d"),
     ]:
-        s = sub.add_parser(name, help=helptext); s.add_argument("name"); s.set_defaults(fn=fn)
+        s = sub.add_parser(name, help=helptext)
+        s.add_argument("name")
+        s.set_defaults(fn=fn)
     dl = sub.add_parser("delete", help="tear down a deployment (keeps its database)")
     dl.add_argument("name")
-    dl.add_argument("--purge", action="store_true",
-                    help="also drop the app's postgres db/role + redis user (DESTROYS DATA)")
+    dl.add_argument(
+        "--purge",
+        action="store_true",
+        help="also drop the app's postgres db/role + redis user (DESTROYS DATA)",
+    )
     dl.set_defaults(fn=cmd_delete)
     dbp = sub.add_parser("db", help="inspect/manage app databases (shared postgres/redis)")
     dbsub = dbp.add_subparsers(dest="dbcmd", required=True)
-    dbsub.add_parser("ls", help="list managed databases; flags retained ones with no deployment").set_defaults(fn=cmd_db_ls)
+    dbsub.add_parser(
+        "ls", help="list managed databases; flags retained ones with no deployment"
+    ).set_defaults(fn=cmd_db_ls)
     dbpurge = dbsub.add_parser("purge", help="drop a retained app's database + creds")
-    dbpurge.add_argument("name"); dbpurge.set_defaults(fn=cmd_db_purge)
+    dbpurge.add_argument("name")
+    dbpurge.set_defaults(fn=cmd_db_purge)
     args = p.parse_args()
     if not ROOT.exists():
         sys.exit(
