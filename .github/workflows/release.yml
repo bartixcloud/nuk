@@ -16,6 +16,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # The git tag is the single source of truth for the version. Stamp it into
+      # nuk.py's __version__ (what `nuk --version` prints) and pyproject.toml at
+      # build time, so a release can never disagree with its tag — no manual bump,
+      # no drift. The repo keeps a dev-placeholder __version__; only releases are
+      # authoritative.
+      - name: Stamp version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          python3 - "$VERSION" <<'PY'
+          import re, sys, pathlib
+          v = sys.argv[1]
+          nuk = pathlib.Path("nuk.py"); s = nuk.read_text()
+          s, n = re.subn(r'^__version__ = ".*"$', f'__version__ = "{v}"', s, flags=re.M)
+          assert n == 1, f"nuk.py: expected 1 __version__ line, patched {n}"
+          nuk.write_text(s)
+          pp = pathlib.Path("pyproject.toml"); t = pp.read_text()
+          t, n = re.subn(r'^version = ".*"$', f'version = "{v}"', t, count=1, flags=re.M)
+          assert n == 1, f"pyproject.toml: expected 1 version line, patched {n}"
+          pp.write_text(t)
+          print(f"stamped version {v}")
+          PY
+
       - name: Build nuk.pyz
         run: |
           mkdir -p build/src
@@ -25,6 +48,10 @@ jobs:
         run: |
           python3 -m pip install --quiet pyyaml
           python3 nuk.pyz --help
+          # The built artifact must report exactly its tag — proves the stamp took.
+          got="$(python3 nuk.pyz --version)"
+          want="nuk ${GITHUB_REF_NAME#v}"
+          [ "$got" = "$want" ] || { echo "::error::version mismatch: got '$got', want '$want'"; exit 1; }
       - name: Publish to release
         env:
           GH_TOKEN: ${{ github.token }}
