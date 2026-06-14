@@ -7,3 +7,9 @@ dist/
 .pytest_cache/
 .ruff_cache/
 nuk.pyz
+
+# external / generated trees that must never be committed
+node_modules/
+.serena/
+.opencode/
+nukview/

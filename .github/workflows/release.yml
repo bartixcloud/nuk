@@ -1,61 +1,63 @@
 name: release
 
-# Push a vX.Y.Z tag -> build the nuk.pyz zipapp and attach it to a GitHub
-# release. PyYAML is intentionally NOT bundled: the nuklaut controller host and
-# the CI runner image both ship python3 + python3-yaml, so the zipapp stays a
-# tiny single file. The controller pins a release via NUK_VERSION.
+# release-please drives versioning from conventional commits on main: it opens a
+# release PR (bumping nuk.py's __version__, pyproject.toml, and CHANGELOG) that
+# auto-merges once `ci` is green, then creates the tag + GitHub release.
+#
+# When a release is created, we build the nuk.pyz zipapp in the SAME run and
+# attach it to that release, then dispatch the controller deploy. Folding the
+# build into the release_created path (rather than a separate `on: push: tags`
+# workflow) sidesteps the GITHUB_TOKEN recursion guard — a release created by the
+# built-in token does not emit a tag/release event that would trigger other
+# workflows. PyYAML is intentionally NOT bundled (the controller + runner ship
+# python3-yaml), so the zipapp stays a tiny single file.
+
 on:
   push:
-    tags: ["v*"]
+    branches: [main]
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
-  zipapp:
+  release-please:
+    uses: astrojones/.github/.github/workflows/release-please.yml@main
+    secrets: inherit
+
+  build:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.release-please.outputs.tag_name }}
     steps:
       - uses: actions/checkout@v4
-
-      # The git tag is the single source of truth for the version. Stamp it into
-      # nuk.py's __version__ (what `nuk --version` prints) and pyproject.toml at
-      # build time, so a release can never disagree with its tag — no manual bump,
-      # no drift. The repo keeps a dev-placeholder __version__; only releases are
-      # authoritative.
-      - name: Stamp version from tag
-        run: |
-          VERSION="${GITHUB_REF_NAME#v}"
-          python3 - "$VERSION" <<'PY'
-          import re, sys, pathlib
-          v = sys.argv[1]
-          nuk = pathlib.Path("nuk.py"); s = nuk.read_text()
-          s, n = re.subn(r'^(__version__ = )"[^"]*"', rf'\g<1>"{v}"', s, flags=re.M)
-          assert n == 1, f"nuk.py: expected 1 __version__ line, patched {n}"
-          nuk.write_text(s)
-          pp = pathlib.Path("pyproject.toml"); t = pp.read_text()
-          t, n = re.subn(r'^version = ".*"$', f'version = "{v}"', t, count=1, flags=re.M)
-          assert n == 1, f"pyproject.toml: expected 1 version line, patched {n}"
-          pp.write_text(t)
-          print(f"stamped version {v}")
-          PY
 
       - name: Build nuk.pyz
         run: |
           mkdir -p build/src
           cp nuk.py build/src/
           python3 -m zipapp build/src -m "nuk:main" -p "/usr/bin/env python3" -o nuk.pyz
+
       - name: Smoke test (PyYAML available, mirrors the controller)
         run: |
           python3 -m pip install --quiet pyyaml
           python3 nuk.pyz --help
-          # The built artifact must report exactly its tag — proves the stamp took.
+          # release-please set nuk.py's __version__ and the tag together, so the
+          # built artifact must report exactly its tag.
           got="$(python3 nuk.pyz --version)"
-          want="nuk ${GITHUB_REF_NAME#v}"
+          want="nuk ${TAG#v}"
           [ "$got" = "$want" ] || { echo "::error::version mismatch: got '$got', want '$want'"; exit 1; }
-      - name: Publish to release
+
+      - name: Attach nuk.pyz to the release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release create "$GITHUB_REF_NAME" nuk.pyz \
-            --title "$GITHUB_REF_NAME" --generate-notes \
-          || gh release upload "$GITHUB_REF_NAME" nuk.pyz --clobber
+        run: gh release upload "$TAG" nuk.pyz --clobber
+
+      - name: Deploy to the controller
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run deploy.yml -f tag="$TAG"

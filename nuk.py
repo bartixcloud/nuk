@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 import yaml
 
-__version__ = "0.0.0+dev"  # releases stamp the real version from the git tag (see .github/workflows/release.yml)
+__version__ = "0.3.5"  # x-release-please-version
 
 ROOT = Path("/opt/nuklaut")
 DEPLOYS = ROOT / "deployments"

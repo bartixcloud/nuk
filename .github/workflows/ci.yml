@@ -5,16 +5,8 @@ on:
     branches: [main]
   pull_request:
 
-permissions:
-  contents: read
-
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - name: Lint
-        run: uv run --group dev ruff check
-      - name: Test
-        run: uv run --group dev pytest
+  ci:
+    uses: astrojones/.github/.github/workflows/ci.yml@main
+    with:
+      language: python
