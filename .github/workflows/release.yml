@@ -29,7 +29,7 @@ jobs:
           import re, sys, pathlib
           v = sys.argv[1]
           nuk = pathlib.Path("nuk.py"); s = nuk.read_text()
-          s, n = re.subn(r'^__version__ = ".*"$', f'__version__ = "{v}"', s, flags=re.M)
+          s, n = re.subn(r'^(__version__ = )"[^"]*"', rf'\g<1>"{v}"', s, flags=re.M)
           assert n == 1, f"nuk.py: expected 1 __version__ line, patched {n}"
           nuk.write_text(s)
           pp = pathlib.Path("pyproject.toml"); t = pp.read_text()
