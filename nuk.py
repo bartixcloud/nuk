@@ -11,6 +11,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 import yaml
 
+__version__ = "0.1.0"
+
 ROOT = Path("/opt/nuklaut")
 DEPLOYS = ROOT / "deployments"
 DYNAMIC = ROOT / "traefik" / "dynamic"
@@ -465,6 +467,7 @@ def main() -> None:
             shared data stack; injects DATABASE_URL / REDIS_URL into the
             ingress service(s).
         """))
+    p.add_argument("--version", action="version", version=f"nuk {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True)
     sub.add_parser("list", help="list deployments (alias: get, ls)").set_defaults(fn=cmd_get)
     sub.add_parser("get", help="alias for list").set_defaults(fn=cmd_get)

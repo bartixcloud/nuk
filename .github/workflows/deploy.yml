@@ -1,0 +1,104 @@
+name: deploy
+
+# Continuous deployment of nuk onto the nuklaut controller.
+#
+# When a GitHub Release is published (the `release.yml` workflow builds the
+# `nuk.pyz` zipapp and attaches it on a `v*` tag push), this workflow runs on the
+# controller's own self-hosted runner and swaps the live binary — no SSH, no
+# workstation, no NUK_VERSION bump, no runner-image rebuild.
+#
+# Mechanism: nuk lives at the single canonical path /opt/nuklaut/bin/nuk on the
+# controller. The host CLI (/usr/local/bin/nuk) and the in-container deploy nuk
+# (the reusable nuk-deploy/nuk-apply/nuk-preview workflows) BOTH resolve to that
+# path via symlink, and /opt/nuklaut is bind-mounted into the runner — so writing
+# one file updates every consumer at once. We install the new zipapp as
+# nuk-<tag> and atomically flip the `nuk` symlink to it (trivial rollback: flip
+# it back to a previous nuk-<tag>).
+#
+# Trigger on `release: published` so the asset is guaranteed to exist; manual
+# `workflow_dispatch` (with a tag input) re-deploys or rolls back on demand.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to deploy (e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nuk-deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, nuklaut]
+    env:
+      BIN_DIR: /opt/nuklaut/bin
+      KEEP: 5     # how many nuk-<tag> copies to retain for rollback
+    steps:
+      - name: Resolve tag
+        id: tag
+        env:
+          EVENT_TAG: ${{ github.event.release.tag_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          TAG="${INPUT_TAG:-$EVENT_TAG}"
+          [ -n "$TAG" ] || { echo "::error::no tag to deploy"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      # Pull the released nuk.pyz asset for this tag. Same-repo read needs only
+      # the automatic GITHUB_TOKEN; python3 (present in the runner image, since
+      # nuk needs it to run) parses the asset id — no gh/jq dependency.
+      - name: Download nuk.pyz for ${{ steps.tag.outputs.tag }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/${REPO}"
+          asset_id="$(curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${api}/releases/tags/${TAG}" \
+            | python3 -c "import sys,json; r=json.load(sys.stdin); print(next(a['id'] for a in r['assets'] if a['name']=='nuk.pyz'))")"
+          curl -fsSL \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            "${api}/releases/assets/${asset_id}" -o /tmp/nuk.pyz
+          test -s /tmp/nuk.pyz
+
+      # Install as nuk-<tag>, then atomically flip the `nuk` symlink (symlink +
+      # `mv -T` is an atomic rename, so concurrent readers never see a partial
+      # file). /opt/nuklaut is bind-mounted, so this lands on the host.
+      - name: Install and activate
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          install -d -m 0755 "$BIN_DIR"
+          install -m 0755 /tmp/nuk.pyz "${BIN_DIR}/nuk-${TAG}"
+          ln -s "nuk-${TAG}" "${BIN_DIR}/nuk.new"
+          mv -T "${BIN_DIR}/nuk.new" "${BIN_DIR}/nuk"
+
+      - name: Smoke test the live binary
+        run: |
+          set -euo pipefail
+          "${BIN_DIR}/nuk" --version
+          "${BIN_DIR}/nuk" --help >/dev/null
+          # Prove it runs against the real controller state (lists deployments).
+          "${BIN_DIR}/nuk" list
+
+      # Keep the last $KEEP nuk-<tag> copies (newest by mtime) for rollback;
+      # prune older ones. Never touches the active `nuk` symlink.
+      - name: Prune old versions
+        run: |
+          set -euo pipefail
+          ls -1dt "${BIN_DIR}"/nuk-* 2>/dev/null | tail -n +$((KEEP + 1)) | xargs -r rm -f
+          echo "Active: $(readlink -f "${BIN_DIR}/nuk")"
