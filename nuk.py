@@ -51,18 +51,43 @@ def compose_args(name: str, spec: dict) -> list[str]:
     return args
 
 
-def build_override(name: str, ingress: list[dict], db_env: str | None = None) -> dict | None:
+def resolve_env_from(spec: dict) -> list[str]:
+    """Resolve `spec.envFrom[].secretRef` entries to existing file paths (same
+    resolution `compose_args` uses for `--env-file`): an entry may be a dict
+    with key `secretRef` or a bare string; only existing paths are kept."""
+    refs = []
+    for envfile in spec.get("envFrom", []):
+        ref = envfile.get("secretRef") if isinstance(envfile, dict) else envfile
+        if ref and Path(ref).exists():
+            refs.append(ref)
+    return refs
+
+
+def build_override(name: str, ingress: list[dict], db_env: str | None = None,
+                    env_from: list[str] | None = None) -> dict | None:
     """Compose override joining each ingress service to the shared edge network
-    (Traefik ingress). When the deployment requested a database, those same
-    services also join the private `data` network and load the per-app
-    DATABASE_URL / REDIS_URL via env_file — the 600 creds file, so its secret
-    values never enter this (deploy-readable) override."""
+    (Traefik ingress). Each ingress service also gets an `env_file` list so its
+    container actually receives the requested secrets — `docker compose
+    --env-file` only feeds ${VAR} interpolation in the compose file, it does NOT
+    set container env, so this override is the only thing that does.
+
+    `env_file` entries (in order) are: any `spec.envFrom[].secretRef` paths
+    (env_from), then — when the deployment requested a database — the per-app
+    creds file (db_env) last, so its generated DATABASE_URL / REDIS_URL win on
+    key collisions. db_env is the 600 creds file, so its secret values never
+    enter this (deploy-readable) override.
+
+    The `data` network join remains gated on db_env only (unrelated to
+    env_from). Note: env_file is only attached to INGRESS services, same as the
+    existing db_env behaviour — acceptable for v1 / single-service apps."""
+    env_from = env_from or []
     nets = ["edge", "data"] if db_env else ["edge"]
+    env_files = [*env_from, *([db_env] if db_env else [])]
     services = {}
     for ing in ingress:
         svc: dict = {"networks": list(nets)}
-        if db_env:
-            svc["env_file"] = [db_env]
+        if env_files:
+            svc["env_file"] = list(env_files)
         services[ing["service"]] = svc
     if not services:
         return None
@@ -72,8 +97,9 @@ def build_override(name: str, ingress: list[dict], db_env: str | None = None) ->
     return {"services": services, "networks": networks}
 
 
-def write_override(name: str, ingress: list[dict], db_env: str | None = None) -> None:
-    doc = build_override(name, ingress, db_env)
+def write_override(name: str, ingress: list[dict], db_env: str | None = None,
+                    env_from: list[str] | None = None) -> None:
+    doc = build_override(name, ingress, db_env, env_from)
     if doc is None:
         return
     (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc))
@@ -341,7 +367,11 @@ def cmd_apply(args) -> None:
     if db_env and not ingress:
         print(f"{name}: databases provisioned but no ingress service to attach "
               f"them to — DATABASE_URL/REDIS_URL won't be injected. Add an ingress entry.")
-    write_override(name, ingress, db_env)
+    env_from = resolve_env_from(spec["spec"])
+    if env_from and not ingress:
+        print(f"{name}: spec.envFrom secrets resolved but no ingress service to "
+              f"attach them to — they won't be injected. Add an ingress entry.")
+    write_override(name, ingress, db_env, env_from)
     write_ingress(name, ingress)
     shutil.copy(args.manifest, pdir / "manifest.yml")
     # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
@@ -428,6 +458,9 @@ def main() -> None:
           spec.ingress[] also takes optional: path (PathPrefix), stripPrefix,
             priority, www (301 www.<host> -> <host>; apex domains only),
             auth ("oauth" -> GitHub oauth2-proxy gate)
+          spec.envFrom[].secretRef -> existing env files injected into each
+            ingress service's container env via the compose override (and also
+            passed to `docker compose --env-file` for ${VAR} interpolation).
           spec.databases: {postgres: true, redis: true} -> per-app DB on the
             shared data stack; injects DATABASE_URL / REDIS_URL into the
             ingress service(s).

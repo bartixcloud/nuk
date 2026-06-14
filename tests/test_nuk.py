@@ -8,6 +8,7 @@ These need only pyyaml — no /opt/nuklaut, no docker, no controller.
 from __future__ import annotations
 
 import pytest
+import yaml
 
 import nuk
 
@@ -252,6 +253,95 @@ def test_override_with_db_joins_data_and_env_file():
         "edge": {"external": True},
         "data": {"external": True},
     }
+
+
+# --- override: spec.envFrom secretRefs injected via env_file ------------------
+
+
+def test_resolve_env_from_filters_to_existing_paths(tmp_path):
+    present = tmp_path / "present.env"
+    present.write_text("FOO=bar\n")
+    spec = {
+        "envFrom": [
+            {"secretRef": str(present)},
+            {"secretRef": str(tmp_path / "missing.env")},
+            str(tmp_path / "also-missing.env"),
+        ]
+    }
+    assert nuk.resolve_env_from(spec) == [str(present)]
+
+
+def test_override_env_from_injected_into_ingress_service(tmp_path):
+    """spec.envFrom secretRefs must land in the ingress service's env_file —
+    that's the only way values reach the container (--env-file only feeds
+    ${VAR} interpolation in the compose file, not the container env)."""
+    secret = tmp_path / "app.env"
+    secret.write_text("API_KEY=shh\n")
+    ov = nuk.build_override(
+        "kolbe",
+        [{"host": "kolbe.astrojones.de", "service": "backend", "port": 8000}],
+        env_from=[str(secret)],
+    )
+    assert ov["services"] == {
+        "backend": {
+            "networks": ["edge"],
+            "env_file": [str(secret)],
+        }
+    }
+    assert ov["networks"] == {"edge": {"external": True}}
+
+
+def test_override_env_from_and_db_env_both_present_db_env_last(tmp_path):
+    """When both spec.envFrom and a provisioned database are present, both must
+    appear in env_file, with db_env last so DATABASE_URL/REDIS_URL win on any
+    key collisions."""
+    secret = tmp_path / "app.env"
+    secret.write_text("API_KEY=shh\n")
+    db_env = "/opt/nuklaut/secrets/nukview-db.env"
+    ov = nuk.build_override(
+        "nukview",
+        [{"host": "nuk.astrojones.de", "service": "nukview", "port": 3000}],
+        db_env=db_env,
+        env_from=[str(secret)],
+    )
+    assert ov["services"] == {
+        "nukview": {
+            "networks": ["edge", "data"],
+            "env_file": [str(secret), db_env],
+        }
+    }
+    assert ov["networks"] == {
+        "edge": {"external": True},
+        "data": {"external": True},
+    }
+
+
+def test_override_without_env_from_or_db_env_has_no_env_file():
+    ov = nuk.build_override(
+        "bartix", [{"host": "bartix.de", "service": "web", "port": 8080}]
+    )
+    assert ov["services"] == {"web": {"networks": ["edge"]}}
+    assert "env_file" not in ov["services"]["web"]
+
+
+def test_write_override_includes_env_from(tmp_path, monkeypatch):
+    """End-to-end through write_override: the rendered compose.override.yml for
+    an ingress service includes the resolved envFrom secretRef paths."""
+    deploys = tmp_path / "deployments"
+    deploys.mkdir()
+    monkeypatch.setattr(nuk, "DEPLOYS", deploys)
+    (deploys / "kolbe").mkdir()
+
+    secret = tmp_path / "app.env"
+    secret.write_text("API_KEY=shh\n")
+
+    nuk.write_override(
+        "kolbe",
+        [{"host": "kolbe.astrojones.de", "service": "backend", "port": 8000}],
+        env_from=[str(secret)],
+    )
+    doc = yaml.safe_load((deploys / "kolbe" / "compose.override.yml").read_text())
+    assert doc["services"]["backend"]["env_file"] == [str(secret)]
 
 
 # --- database identifier / literal guards -------------------------------------
