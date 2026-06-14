@@ -88,9 +88,16 @@ jobs:
           mv -T "${BIN_DIR}/nuk.new" "${BIN_DIR}/nuk"
 
       - name: Smoke test the live binary
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
         run: |
           set -euo pipefail
-          "${BIN_DIR}/nuk" --version
+          # release.yml stamps the version from the tag, so the deployed binary
+          # must report exactly its tag — a mismatch means a stale/mis-stamped
+          # artifact; fail the deploy rather than silently ship the wrong version.
+          got="$("${BIN_DIR}/nuk" --version)"
+          want="nuk ${TAG#v}"
+          [ "$got" = "$want" ] || { echo "::error::version mismatch: got '$got', want '$want'"; exit 1; }
           "${BIN_DIR}/nuk" --help >/dev/null
           # Prove it runs against the real controller state (lists deployments).
           "${BIN_DIR}/nuk" list
