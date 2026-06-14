@@ -129,3 +129,4 @@ nuk is operated by the **nuklaut** controller. Org repos deploy themselves via t
 `astrojones/.github` reusable `nuk-deploy.yml` workflow on the org self-hosted runner
 (label `nuklaut`): the manifest lives at `.nuklaut/deployment.yml`, the image goes to
 `ghcr.io/<owner>/<repo>`, and per-app secrets live at `/opt/nuklaut/secrets/<repo>.env`.
+ 
