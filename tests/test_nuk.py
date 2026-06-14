@@ -445,3 +445,19 @@ def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
 
     nuk.provision_databases("app", {"postgres": True})
     assert seen == ["asyncpg", None]
+
+
+# --- version flag (used by the controller CD smoke check) ---------------------
+
+
+def test_version_flag_prints_version_and_exits_zero(capsys, monkeypatch):
+    """`nuk --version` exits 0 and prints `nuk <__version__>` — the CD deploy
+    workflow smoke-tests the freshly installed binary with it. argparse's
+    version action runs during parse, before the /opt/nuklaut host check, so it
+    works on any machine."""
+    assert isinstance(nuk.__version__, str) and nuk.__version__
+    monkeypatch.setattr(nuk.sys, "argv", ["nuk", "--version"])
+    with pytest.raises(SystemExit) as exc:
+        nuk.main()
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.strip() == f"nuk {nuk.__version__}"
