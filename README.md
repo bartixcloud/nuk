@@ -8,9 +8,10 @@ controller host.
 
 It runs on the **nuklaut controller** (a single Hetzner VPS behind Traefik), not on
 your workstation (it refuses to run if `/opt/nuklaut` is absent). nuk ships as a
-versioned `nuk.pyz` zipapp; the controller installs a pinned release. Its only
-runtime dependencies are **PyYAML** (already present on the host and in the CI
-runner image) and the `docker` CLI.
+versioned `nuk.pyz`; the controller installs a pinned release. The CLI is built with
+**typer** and validates manifests with **pydantic**, but those (plus PyYAML) are
+**bundled into the `nuk.pyz` by shiv** at release time — so the controller still needs
+only **python3** and the `docker` CLI on the host, nothing else installed.
 
 ## Manifest (`nuk/v1`)
 
@@ -109,19 +110,23 @@ destroys data.
 
 ```bash
 uv run pytest          # unit tests for the pure render + db-helper functions (no controller)
-uv run ruff check
+uv run ruff check      # lint
+uv run ty check        # type-check
 ```
 
 Tests exercise `build_ingress` / `build_override` and the database helpers entirely
-in-process; they need only PyYAML.
+in-process; they need no controller. The render functions stay dict-in/dict-out (their
+YAML output is a Traefik/compose wire contract); pydantic validates only at the
+manifest `load()` boundary and in the command layer.
 
 ## Releasing
 
-Push a `vX.Y.Z` tag. CI (`.github/workflows/release.yml`) builds a `nuk.pyz` zipapp
-(`python -m zipapp`, system PyYAML) and attaches it to the GitHub release. The
-**nuklaut** infra repo pins a release via `NUK_VERSION` and installs that artifact to
-`/usr/local/bin/nuk` (host) and bakes it into the GitHub Actions runner image during
-`bootstrap.sh`.
+Push a `vX.Y.Z` tag. CI (`.github/workflows/release.yml`) builds a self-contained
+`nuk.pyz` with **shiv** (under python 3.11, to match the controller ABI), bundling the
+project plus its runtime deps — pydantic, typer, PyYAML — into the single artifact, and
+attaches it to the GitHub release. The **nuklaut** infra repo pins a release via
+`NUK_VERSION` and installs that artifact to `/usr/local/bin/nuk` (host) and bakes it into
+the GitHub Actions runner image during `bootstrap.sh`.
 
 ## Deployment
 

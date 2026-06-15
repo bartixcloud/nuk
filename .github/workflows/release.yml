@@ -9,8 +9,10 @@ name: release
 # build into the release_created path (rather than a separate `on: push: tags`
 # workflow) sidesteps the GITHUB_TOKEN recursion guard — a release created by the
 # built-in token does not emit a tag/release event that would trigger other
-# workflows. PyYAML is intentionally NOT bundled (the controller + runner ship
-# python3-yaml), so the zipapp stays a tiny single file.
+# workflows. The artifact is built with shiv, which bundles nuk's runtime deps
+# (pydantic/typer/pyyaml) into the pyz — pydantic-core is a native wheel a plain
+# `python -m zipapp` can't load. Build under python 3.13 to match the controller
+# ABI (pydantic-core ships per-ABI wheels).
 
 on:
   push:
@@ -37,15 +39,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
       - name: Build nuk.pyz
         run: |
-          mkdir -p build/src
-          cp nuk.py build/src/
-          python3 -m zipapp build/src -m "nuk:main" -p "/usr/bin/env python3" -o nuk.pyz
+          python3 -m pip install --quiet shiv
+          shiv -c nuk -o nuk.pyz . -p "/usr/bin/env python3"
 
-      - name: Smoke test (PyYAML available, mirrors the controller)
+      - name: Smoke test (self-contained; no deps installed alongside)
         run: |
-          python3 -m pip install --quiet pyyaml
+          # No `pip install`: shiv bundled every runtime dep into the pyz.
           python3 nuk.pyz --help
           # release-please set nuk.py's __version__ and the tag together, so the
           # built artifact must report exactly its tag.

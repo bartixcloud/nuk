@@ -3,33 +3,110 @@ name = "nuk"
 version = "0.4.0"
 description = "Minimal Kubernetes-shaped Docker Compose deployer (nuklaut controller CLI)"
 readme = "README.md"
-requires-python = ">=3.11"
-dependencies = ["pyyaml>=6"]
+requires-python = ">=3.13"
+dependencies = ["pydantic>=2.9", "typer>=0.15", "pyyaml>=6"]
 
 [project.scripts]
 nuk = "nuk:main"
 
 [build-system]
-requires = ["setuptools>=68"]
-build-backend = "setuptools.build_meta"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.setuptools]
-py-modules = ["nuk"]
+# nuk stays a single top-level module (NOT a src/ package): release-please bumps
+# __version__ via the x-release-please-version marker, the script/shiv entry is
+# nuk:main, and tests `import nuk` with pythonpath=["."]. Point hatchling at the
+# lone module.
+[tool.hatch.build.targets.wheel]
+only-include = ["nuk.py"]
+
+[tool.hatch.build.targets.sdist]
+include = ["nuk.py", "tests", "README.md"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.11"]
+dev = ["ty", "pytest", "pytest-cov", "pytest-asyncio", "ruff", "pre-commit"]
 
-[tool.pytest.ini_options]
-pythonpath = ["."]
-testpaths = ["tests"]
-
-# Lint is tuned to PASS the existing terse stdlib CLI without rewriting it
-# (deliberate bare-dict return types, single-line stdlib import). High-value
-# rules only: pyflakes (F), bugbear (B), pyupgrade (UP). Tightening toward the
-# org canon (import sorting, strict typing) is deferred to the "generalize" step.
 [tool.ruff]
-line-length = 100
-target-version = "py311"
+line-length = 100                 # VARIANT: lean project, code wrapped at 100
+target-version = "py313"
+src = ["src", "tests"]
+exclude = [".git", ".venv", "build", "dist", "__pycache__"]
 
 [tool.ruff.lint]
-select = ["F", "B", "UP"]
+preview = true
+select = [
+    "E","W","F","I","TID","TCH","BLE","TRY","EM","RSE","N","UP","B","A","C4",
+    "C901","SIM","RUF","PL","PIE","PERF","FURB","RET","DTZ","ANN401","FIX",
+    "ERA","T10","PTH","LOG","G","PT","D","S","FLY","ARG","PGH003","PGH004",
+]
+ignore = [
+    "PLC0415", # import-outside-top-level — needed for circular-import workarounds, lazy loading
+    "RUF100",  # unused-noqa — false positives across plugin versions
+]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-args = 5
+max-positional-args = 5
+max-statements = 50
+max-branches = 12
+max-returns = 6
+max-nested-blocks = 5
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = [
+    # D205: existing terse test docstrings use a one-line summary directly
+    # followed by detail (no blank line) — test-only formatting, not worth
+    # reflowing the unmodified regression docstrings.
+    "S101","TID251","PLR2004","PLR6301","D100","D102","D103","D104","D205","S","ARG",
+    "ERA001","PLC","SIM","TRY","RET","RUF029","PT",
+]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-pytest-style]
+raises-extend-require-match-for = [
+    "pydantic.ValidationError",
+    "pydantic_core._pydantic_core.ValidationError",
+    "AttributeError",
+    "FileNotFoundError",
+    "asyncio.CancelledError",
+]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ty.environment]
+python-version = "3.11"
+
+# Type-check the product module, not the tests: the frozen wire-contract tests
+# deliberately pass None / subscript dict|None returns (patterns we may not edit,
+# and we may not widen the wire signatures to satisfy). Mirrors the wholesale
+# looser ruff regime already applied to tests/** via per-file-ignores.
+[tool.ty.src]
+exclude = ["tests/**"]
+
+[tool.ty.rules]
+unresolved-import = "error"
+unresolved-reference = "error"
+invalid-assignment = "error"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+pythonpath = ["."]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = ["-v","--strict-markers","--cov=nuk","--cov-report=term-missing"]
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.coverage.run]
+source = ["nuk"]
+omit = ["*/tests/*", "*/migrations/*"]
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+skip_covered = false

@@ -7,11 +7,9 @@ These need only pyyaml — no /opt/nuklaut, no docker, no controller.
 
 from __future__ import annotations
 
+import nuk
 import pytest
 import yaml
-
-import nuk
-
 
 # --- regression: legacy {host,service,port} must render exactly as before -----
 
@@ -88,7 +86,8 @@ def test_kolbe_pathprefix_split():
 
 def test_path_without_strip_has_no_local_middleware():
     """PathPrefix without stripPrefix defines no app-local middleware; the router
-    still inherits the maintenance-errors reference."""
+    still inherits the maintenance-errors reference.
+    """
     doc = nuk.build_ingress("a", [{"host": "h", "path": "/x", "service": "s", "port": 1}])
     assert doc["http"]["routers"]["a-0"]["rule"] == "Host(`h`) && PathPrefix(`/x`)"
     assert doc["http"]["routers"]["a-0"]["middlewares"] == ["maintenance-errors@file"]
@@ -111,7 +110,8 @@ def test_auth_oauth_prepends_forwardauth_chain():
     """auth: oauth gates a router via the shared oauth2-proxy GitHub chain,
     ordered errors-then-auth like the Traefik dashboard, ahead of the inherited
     maintenance-errors reference. All three are cross-file (@file) references, so
-    no app-local middleware definitions are emitted."""
+    no app-local middleware definitions are emitted.
+    """
     doc = nuk.build_ingress(
         "nukview",
         [
@@ -133,7 +133,8 @@ def test_auth_oauth_prepends_forwardauth_chain():
 
 def test_auth_oauth_with_pathprefix_orders_oauth_then_strip():
     """When a path is stripped too, the oauth chain stays outermost, then strip,
-    then the maintenance reference."""
+    then the maintenance reference.
+    """
     doc = nuk.build_ingress(
         "api",
         [
@@ -257,7 +258,8 @@ def test_resolve_env_from_filters_to_existing_paths(tmp_path):
 def test_override_env_from_injected_into_ingress_service(tmp_path):
     """spec.envFrom secretRefs must land in the ingress service's env_file —
     that's the only way values reach the container (--env-file only feeds
-    ${VAR} interpolation in the compose file, not the container env)."""
+    ${VAR} interpolation in the compose file, not the container env).
+    """
     secret = tmp_path / "app.env"
     secret.write_text("API_KEY=shh\n")
     ov = nuk.build_override(
@@ -277,7 +279,8 @@ def test_override_env_from_injected_into_ingress_service(tmp_path):
 def test_override_env_from_and_db_env_both_present_db_env_last(tmp_path):
     """When both spec.envFrom and a provisioned database are present, both must
     appear in env_file, with db_env last so DATABASE_URL/REDIS_URL win on any
-    key collisions."""
+    key collisions.
+    """
     secret = tmp_path / "app.env"
     secret.write_text("API_KEY=shh\n")
     db_env = "/opt/nuklaut/secrets/nukview-db.env"
@@ -307,7 +310,8 @@ def test_override_without_env_from_or_db_env_has_no_env_file():
 
 def test_write_override_includes_env_from(tmp_path, monkeypatch):
     """End-to-end through write_override: the rendered compose.override.yml for
-    an ingress service includes the resolved envFrom secretRef paths."""
+    an ingress service includes the resolved envFrom secretRef paths.
+    """
     deploys = tmp_path / "deployments"
     deploys.mkdir()
     monkeypatch.setattr(nuk, "DEPLOYS", deploys)
@@ -409,7 +413,8 @@ def test_pw_from_url_handles_driver_scheme():
 
 def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
     """`postgres: {driver: asyncpg}` passes the driver through; `postgres: true`
-    passes None (the backward-compatible bare-URL path nukview relies on)."""
+    passes None (the backward-compatible bare-URL path nukview relies on).
+    """
     monkeypatch.setattr(nuk, "SECRETS", tmp_path)
     seen: list[str | None] = []
 
@@ -453,7 +458,8 @@ def test_github_url_rejects_non_github(remote):
 
 def test_persist_manifest_stamps_source_repo_from_origin(tmp_path, monkeypatch):
     """--repo-path apply: a manifest without spec.source.repo gets one stamped
-    from the checkout's git origin, so nukview can link the app to its repo."""
+    from the checkout's git origin, so nukview can link the app to its repo.
+    """
     monkeypatch.setattr(nuk, "git_origin", lambda p: "https://github.com/astrojones/kolbe")
     spec = {
         "apiVersion": "nuk/v1",
@@ -471,7 +477,8 @@ def test_persist_manifest_stamps_source_repo_from_origin(tmp_path, monkeypatch):
 
 def test_persist_manifest_preserves_declared_source_repo(tmp_path, monkeypatch):
     """A manifest that already declares spec.source.repo is copied verbatim; the
-    declared source wins over the git origin and the file is left untouched."""
+    declared source wins over the git origin and the file is left untouched.
+    """
     monkeypatch.setattr(nuk, "git_origin", lambda p: "https://github.com/astrojones/OTHER")
     spec = {
         "apiVersion": "nuk/v1",
@@ -504,7 +511,8 @@ def test_version_flag_prints_version_and_exits_zero(capsys, monkeypatch):
     """`nuk --version` exits 0 and prints `nuk <__version__>` — the CD deploy
     workflow smoke-tests the freshly installed binary with it. argparse's
     version action runs during parse, before the /opt/nuklaut host check, so it
-    works on any machine."""
+    works on any machine.
+    """
     assert isinstance(nuk.__version__, str) and nuk.__version__
     monkeypatch.setattr(nuk.sys, "argv", ["nuk", "--version"])
     with pytest.raises(SystemExit) as exc:
