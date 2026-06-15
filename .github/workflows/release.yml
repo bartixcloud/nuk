@@ -1,15 +1,12 @@
 name: release
 
-# release-please drives versioning from conventional commits on main: it opens a
-# release PR (bumping nuk.py's __version__, pyproject.toml, and CHANGELOG) that
-# auto-merges once `ci` is green, then creates the tag + GitHub release.
+# No-PR release: on push to main, the shared workflow derives the next version
+# from conventional commits, stamps it into nuk.py + pyproject.toml, commits that
+# to main ([skip ci]), and creates the tag + GitHub release — no PR. Then, in the
+# same run, we build the nuk.pyz from the tagged (already-stamped) source and
+# dispatch the controller deploy.
 #
-# When a release is created, we build the nuk.pyz zipapp in the SAME run and
-# attach it to that release, then dispatch the controller deploy. Folding the
-# build into the release_created path (rather than a separate `on: push: tags`
-# workflow) sidesteps the GITHUB_TOKEN recursion guard — a release created by the
-# built-in token does not emit a tag/release event that would trigger other
-# workflows. The artifact is built with shiv, which bundles nuk's runtime deps
+# The artifact is built with shiv, which bundles nuk's runtime deps
 # (pydantic/typer/pyyaml) into the pyz — pydantic-core is a native wheel a plain
 # `python -m zipapp` can't load. Build under python 3.13 to match the controller
 # ABI (pydantic-core ships per-ABI wheels).
@@ -20,24 +17,31 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
 
 jobs:
-  release-please:
-    uses: astrojones/.github/.github/workflows/release-please.yml@main
+  release:
+    uses: astrojones/.github/.github/workflows/release.yml@main
     secrets: inherit
+    with:
+      version-files: |
+        nuk.py
+        pyproject.toml
 
   build:
-    needs: release-please
-    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    needs: release
+    if: ${{ needs.release.outputs.released == 'true' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
       actions: write   # dispatch deploy.yml
     env:
-      TAG: ${{ needs.release-please.outputs.tag_name }}
+      TAG: ${{ needs.release.outputs.tag }}
     steps:
+      # Check out the tag the release job just created — its tree already carries
+      # the stamped __version__, so no build-time stamping is needed.
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.release.outputs.tag }}
 
       - uses: actions/setup-python@v5
         with:
@@ -52,8 +56,6 @@ jobs:
         run: |
           # No `pip install`: shiv bundled every runtime dep into the pyz.
           python3 nuk.pyz --help
-          # release-please set nuk.py's __version__ and the tag together, so the
-          # built artifact must report exactly its tag.
           got="$(python3 nuk.pyz --version)"
           want="nuk ${TAG#v}"
           [ "$got" = "$want" ] || { echo "::error::version mismatch: got '$got', want '$want'"; exit 1; }
