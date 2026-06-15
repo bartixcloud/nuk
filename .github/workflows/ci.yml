@@ -10,3 +10,4 @@ jobs:
     uses: astrojones/.github/.github/workflows/ci.yml@main
     with:
       language: python
+      python-version: "3.13"   # controller + shiv release ABI; matches requires-python>=3.13
