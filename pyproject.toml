@@ -100,6 +100,9 @@ pythonpath = ["."]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 addopts = ["-v","--strict-markers","--cov=nuk","--cov-report=term-missing"]
+markers = [
+    "integration: real-container postgres+redis provisioning/purge tier; opt in with NUK_INTEGRATION=1 (needs docker). Skipped by the default unit run.",
+]
 filterwarnings = ["error::DeprecationWarning"]
 
 [tool.coverage.run]

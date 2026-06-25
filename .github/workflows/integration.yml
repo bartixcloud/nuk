@@ -1,0 +1,46 @@
+name: integration
+
+# DB-integration tier (issue #9): exercises the real SQL / redis-CLI execution
+# behind provision_databases / purge_databases against a throwaway copy of the
+# vendored shared data stack (files/docker-compose.data.yml), including issue
+# #10's preflight and issue #8's non-ingress injection.
+#
+# Modelled on the org's migration-shadow-check / ephemeral-runner pattern (a CI
+# job with real Docker that brings DBs up and tears them down on exit), but runs
+# on a GitHub-hosted runner ON PURPOSE: the stack uses the FIXED container names
+# nuk-postgres / nuk-redis, which would collide with — and could disrupt — the
+# controller's LIVE data stack if run on the [self-hosted, nuklaut] runner. A
+# hosted runner gives the same real Docker in full isolation. The data stack is
+# torn down by the test fixture's finally block (docker compose down -v).
+#
+# The default reusable CI (ci.yml) runs the fast unit suite only; this tier is
+# opt-in via NUK_INTEGRATION (tests/conftest.py skips it otherwise).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+
+      - name: DB integration tier (real postgres + redis)
+        env:
+          NUK_INTEGRATION: "1"
+          POSTGRES_PASSWORD: ci-postgres
+          REDIS_ADMIN_PASSWORD: ci-redis
+        run: |
+          set -euo pipefail
+          uv sync --all-extras --dev
+          uv run pytest -m integration
