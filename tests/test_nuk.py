@@ -881,15 +881,18 @@ def test_status_handles_no_databases_and_workflow_managed_revision(tmp_path, mon
 
 
 def test_completion_options_exposed():
-    """add_completion is on, so the controller gets --install/--show-completion."""
-    from typer.testing import CliRunner
+    """add_completion is on, so the controller gets --install/--show-completion.
 
-    # prog_name pins the program typer renders completion install for; without it
-    # some typer/Python combos omit the options (the runner can't infer a name).
-    result = CliRunner().invoke(nuk.app, ["--help"], prog_name="nuk")
-    assert result.exit_code == 0
-    assert "--install-completion" in result.output
-    assert "--show-completion" in result.output
+    Introspect the built click command instead of asserting on the Rich-rendered
+    --help: with no TTY (CI) Rich falls back to a narrow width and truncates the
+    option name to `--install-complet…`, so a substring check on the help text is
+    width-dependent. The params themselves are what `add_completion=True` adds.
+    """
+    import typer.main
+
+    params = {p.name for p in typer.main.get_command(nuk.app).params}
+    assert "install_completion" in params
+    assert "show_completion" in params
 
 
 def test_known_deployments_enumerates_manifest_dirs(tmp_path, monkeypatch):
