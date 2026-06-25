@@ -329,6 +329,120 @@ def test_write_override_includes_env_from(tmp_path, monkeypatch):
     assert doc["services"]["backend"]["env_file"] == [str(secret)]
 
 
+# --- inject DB creds into non-ingress services (issue #8) ---------------------
+
+
+def test_databases_parses_attach_selectors():
+    """spec.databases gains attachAll / attachTo selectors (aliases preserved)."""
+    spec = nuk.Spec.model_validate(
+        {"databases": {"postgres": True, "redis": True, "attachAll": True}}
+    )
+    assert spec.databases.attach_all is True
+    assert spec.databases.attach_to == []
+    spec2 = nuk.Spec.model_validate(
+        {"databases": {"postgres": True, "attachTo": ["web", "worker"]}}
+    )
+    assert spec2.databases.attach_to == ["web", "worker"]
+    assert spec2.databases.attach_all is False
+
+
+def test_override_db_services_default_is_ingress_backcompat():
+    """db_services=None keeps the legacy behaviour: ingress services get the db."""
+    db_env = "/opt/nuklaut/secrets/app-db.env"
+    ov = nuk.build_override(
+        "app", [{"host": "app.de", "service": "web", "port": 8080}], db_env=db_env
+    )
+    assert ov["services"]["web"] == {"networks": ["edge", "data"], "env_file": [db_env]}
+    assert ov["networks"] == {"edge": {"external": True}, "data": {"external": True}}
+
+
+def test_override_attaches_db_to_explicit_non_ingress_service():
+    """An attachTo list extends the db creds + data network onto a worker service
+    that has no ingress, while the ingress service keeps edge + db.
+    """
+    db_env = "/opt/nuklaut/secrets/app-db.env"
+    ov = nuk.build_override(
+        "app",
+        [{"host": "app.de", "service": "web", "port": 8080}],
+        db_env=db_env,
+        db_services=["web", "worker"],
+    )
+    assert ov["services"]["web"] == {"networks": ["edge", "data"], "env_file": [db_env]}
+    assert ov["services"]["worker"] == {"networks": ["data"], "env_file": [db_env]}
+    assert ov["networks"] == {"edge": {"external": True}, "data": {"external": True}}
+
+
+def test_override_worker_only_app_receives_db_url_without_edge():
+    """A DB-only / worker-only app (no ingress) still gets DATABASE_URL: the
+    worker joins the data network and gets the creds env_file, and edge — which
+    nothing uses — is omitted entirely.
+    """
+    db_env = "/opt/nuklaut/secrets/batch-db.env"
+    ov = nuk.build_override("batch", [], db_env=db_env, db_services=["worker"])
+    assert ov["services"] == {"worker": {"networks": ["data"], "env_file": [db_env]}}
+    assert ov["networks"] == {"data": {"external": True}}
+
+
+def test_override_attach_to_excluding_ingress_keeps_secrets_but_not_db(tmp_path):
+    """When attachTo lists only a worker, the ingress web service keeps its edge
+    network + envFrom secrets but is NOT given the db creds/data network.
+    """
+    secret = tmp_path / "app.env"
+    secret.write_text("API_KEY=shh\n")
+    db_env = "/opt/nuklaut/secrets/app-db.env"
+    ov = nuk.build_override(
+        "app",
+        [{"host": "app.de", "service": "web", "port": 8080}],
+        db_env=db_env,
+        env_from=[str(secret)],
+        db_services=["worker"],
+    )
+    assert ov["services"]["web"] == {"networks": ["edge"], "env_file": [str(secret)]}
+    assert ov["services"]["worker"] == {"networks": ["data"], "env_file": [str(secret), db_env]}
+
+
+def test_compose_service_names_reads_repo_compose(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    repo = tmp_path / "app" / "repo"
+    repo.mkdir(parents=True)
+    (repo / "docker-compose.yml").write_text(
+        yaml.safe_dump({"services": {"web": {"image": "x"}, "worker": {"image": "y"}}})
+    )
+    raw = {"spec": {}}
+    assert sorted(nuk.compose_service_names("app", raw)) == ["web", "worker"]
+
+
+def test_resolve_db_services_empty_without_db_env():
+    raw = {"spec": {"ingress": [{"host": "a", "service": "web", "port": 80}]}}
+    assert nuk.resolve_db_services("app", raw, None) == []
+
+
+def test_resolve_db_services_defaults_to_ingress():
+    raw = {"spec": {"ingress": [{"host": "a", "service": "web", "port": 80}]}}
+    assert nuk.resolve_db_services("app", raw, "/x/app-db.env") == ["web"]
+
+
+def test_resolve_db_services_attach_to_wins():
+    raw = {
+        "spec": {
+            "ingress": [{"host": "a", "service": "web", "port": 80}],
+            "databases": {"postgres": True, "attachTo": ["web", "worker"]},
+        }
+    }
+    assert nuk.resolve_db_services("app", raw, "/x/app-db.env") == ["web", "worker"]
+
+
+def test_resolve_db_services_attach_all_enumerates_compose(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    repo = tmp_path / "batch" / "repo"
+    repo.mkdir(parents=True)
+    (repo / "docker-compose.yml").write_text(
+        yaml.safe_dump({"services": {"worker": {"image": "x"}, "beat": {"image": "y"}}})
+    )
+    raw = {"spec": {"databases": {"postgres": True, "attachAll": True}}}
+    assert sorted(nuk.resolve_db_services("batch", raw, "/x/batch-db.env")) == ["beat", "worker"]
+
+
 # --- database identifier / literal guards -------------------------------------
 
 
