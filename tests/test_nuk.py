@@ -771,3 +771,167 @@ def test_version_flag_prints_version_and_exits_zero(capsys, monkeypatch):
         nuk.main()
     assert exc.value.code == 0
     assert capsys.readouterr().out.strip() == f"nuk {nuk.__version__}"
+
+
+# --- status <name> (issue #11): single-app health + redacted DB URLs ----------
+
+
+def test_redact_db_url_masks_password_keeps_scheme_host_db():
+    """The password is replaced with ***; scheme, user, host:port and db survive."""
+    red = nuk._redact_db_url("postgresql+asyncpg://app:s3cr3t-pw@nuk-postgres:5432/app")
+    assert red == "postgresql+asyncpg://app:***@nuk-postgres:5432/app"
+    assert "s3cr3t-pw" not in red
+
+
+def test_redact_db_url_handles_redis_and_passwordless_and_none():
+    assert nuk._redact_db_url("redis://app:tok@nuk-redis:6379/0") == "redis://app:***@nuk-redis:6379/0"
+    # no password -> returned unchanged (nothing to mask)
+    assert nuk._redact_db_url("postgresql://host:5432/db") == "postgresql://host:5432/db"
+    assert nuk._redact_db_url(None) is None
+
+
+def _write_deployment(tmp_path, monkeypatch, *, name="app", with_git=True, manifest=None):
+    """Stand up a fake /opt/nuklaut layout for one deployment and patch the roots."""
+    deploys = tmp_path / "deployments"
+    secrets = tmp_path / "secrets"
+    secrets.mkdir(parents=True)
+    monkeypatch.setattr(nuk, "DEPLOYS", deploys)
+    monkeypatch.setattr(nuk, "SECRETS", secrets)
+    pdir = deploys / name
+    pdir.mkdir(parents=True)
+    if manifest is None:
+        manifest = {
+            "apiVersion": "nuk/v1",
+            "kind": "Deployment",
+            "metadata": {"name": name},
+            "spec": {
+                "source": {"repo": "https://github.com/astrojones/app", "branch": "main"},
+                "ingress": [{"host": "app.astrojones.de", "service": "web", "port": 8080}],
+            },
+        }
+    (pdir / "manifest.yml").write_text(yaml.safe_dump(manifest), encoding="utf-8")
+    if with_git:
+        (pdir / "repo" / ".git").mkdir(parents=True)
+    return pdir, secrets
+
+
+def test_status_unknown_deployment_exits(tmp_path, monkeypatch):
+    """`nuk status <missing>` aborts (no manifest on the controller)."""
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deployments")
+    with pytest.raises(SystemExit, match="nope"):
+        nuk.cmd_status("nope")
+
+
+def test_status_reports_health_ingress_dbs_and_source(tmp_path, monkeypatch, capsys):
+    """The full single-app view: container state, ingress + router health, redacted
+    DB URLs (read back from the creds file), and source repo/branch/revision.
+    """
+    _, secrets = _write_deployment(tmp_path, monkeypatch)
+    (secrets / "app-db.env").write_text(
+        "DATABASE_URL=postgresql://app:PG-SECRET@nuk-postgres:5432/app\n"
+        "REDIS_URL=redis://app:REDIS-SECRET@nuk-redis:6379/0\n"
+    )
+    monkeypatch.setattr(nuk, "_container_state", lambda c: (True, True))
+
+    def fake_run(cmd, *a, **k):
+        if cmd[:2] == ["docker", "compose"]:
+            return nuk.subprocess.CompletedProcess(cmd, 0, stdout="web running\n", stderr="")
+        if cmd[0] == "git":  # rev-parse --short HEAD
+            return nuk.subprocess.CompletedProcess(cmd, 0, stdout="abc1234\n", stderr="")
+        return nuk.subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(nuk.subprocess, "run", fake_run)
+    nuk.cmd_status("app")
+    out = capsys.readouterr().out
+
+    # raw passwords must never be surfaced
+    assert "PG-SECRET" not in out
+    assert "REDIS-SECRET" not in out
+    # redacted URLs present
+    assert "postgresql://app:***@nuk-postgres:5432/app" in out
+    assert "redis://app:***@nuk-redis:6379/0" in out
+    # ingress host + router health
+    assert "app.astrojones.de" in out
+    assert "healthy" in out
+    # source provenance
+    assert "https://github.com/astrojones/app" in out
+    assert "main" in out
+    assert "abc1234" in out
+
+
+def test_status_handles_no_databases_and_workflow_managed_revision(tmp_path, monkeypatch, capsys):
+    """No creds file => no DB lines; a workflow-managed deploy (no repo/.git) => the
+    revision is reported as unknown rather than crashing.
+    """
+    _write_deployment(tmp_path, monkeypatch, with_git=False)
+    monkeypatch.setattr(nuk, "_container_state", lambda c: (False, False))
+    monkeypatch.setattr(
+        nuk.subprocess,
+        "run",
+        lambda cmd, *a, **k: nuk.subprocess.CompletedProcess(cmd, 0, stdout="", stderr=""),
+    )
+    nuk.cmd_status("app")
+    out = capsys.readouterr().out
+    assert "none provisioned" in out
+    # no .git -> git is never shelled out to; revision shown as unknown
+    assert "-" in out
+
+
+# --- shell completion (issue #12): enable + dynamic deployment-name completer --
+
+
+def test_completion_options_exposed():
+    """add_completion is on, so the controller gets --install/--show-completion.
+
+    Introspect the built click command instead of asserting on the Rich-rendered
+    --help: with no TTY (CI) Rich falls back to a narrow width and truncates the
+    option name to `--install-complet…`, so a substring check on the help text is
+    width-dependent. The params themselves are what `add_completion=True` adds.
+    """
+    import typer.main
+
+    params = {p.name for p in typer.main.get_command(nuk.app).params}
+    assert "install_completion" in params
+    assert "show_completion" in params
+
+
+def test_known_deployments_enumerates_manifest_dirs(tmp_path, monkeypatch):
+    """The completer source mirrors cmd_get: only dirs carrying a manifest.yml."""
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    for n in ("alpha", "beta"):
+        (tmp_path / n).mkdir()
+        (tmp_path / n / "manifest.yml").write_text("x")
+    (tmp_path / "no-manifest").mkdir()  # a stray dir without a manifest is ignored
+    assert nuk._known_deployments() == ["alpha", "beta"]
+
+
+def test_known_deployments_empty_when_root_absent(tmp_path, monkeypatch):
+    """Off-controller (no /opt/nuklaut), completion degrades to empty, never raises."""
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "missing")
+    assert nuk._known_deployments() == []
+
+
+def test_complete_deployment_name_prefix_filters(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    for n in ("alpha", "apex", "beta"):
+        (tmp_path / n).mkdir()
+        (tmp_path / n / "manifest.yml").write_text("x")
+    assert nuk.complete_deployment_name("a") == ["alpha", "apex"]
+
+
+@pytest.mark.parametrize("command", ["logs", "rollout", "delete", "status"])
+def test_deployment_name_arg_completes_real_apps(command, tmp_path, monkeypatch):
+    """Each deployment-name argument resolves real app names through click's public
+    shell-completion path — so `nuk <command> <TAB>` suggests live deployments.
+    Includes the new `status` command (issue #11 ∩ #12).
+    """
+    import typer.main
+    from typer.main import _click as click  # typer 0.26 bundles its own click
+
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    (tmp_path / "kolbe").mkdir()
+    (tmp_path / "kolbe" / "manifest.yml").write_text("x")
+    cmd = typer.main.get_command(nuk.app).commands[command]
+    param = next(p for p in cmd.params if p.name == "name")
+    completions = param.shell_complete(click.Context(cmd), "")
+    assert "kolbe" in [c.value for c in completions]
