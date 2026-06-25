@@ -548,6 +548,30 @@ def _pw_from_url(url: str | None) -> str | None:
     return urlparse(url).password if url else None
 
 
+def _redact_db_url(url: str | None) -> str | None:
+    """Mask the password in a DB URL, preserving scheme/user/host:port/db.
+
+    `nuk status` surfaces the provisioned DATABASE_URL/REDIS_URL so an operator
+    can see *what* was injected without exposing the secret — the raw creds file
+    (600, in SECRETS) is never printed. A URL with no password is returned as-is.
+
+    Args:
+        url: A connection URL (e.g. postgresql://app:pw@host:5432/app), or None.
+
+    Returns:
+        The URL with any password replaced by ``***``, or None for a None input.
+    """
+    if not url:
+        return None
+    parts = urlparse(url)
+    if parts.password is None:
+        return url
+    host = parts.hostname or ""
+    port = f":{parts.port}" if parts.port else ""
+    userinfo = f"{parts.username}:***@" if parts.username else "***@"
+    return f"{parts.scheme}://{userinfo}{host}{port}{parts.path}"
+
+
 def _chown_deploy(path: Path) -> None:
     """Make a freshly written secret deploy-owned so compose can read it.
 
@@ -920,6 +944,80 @@ def cmd_get() -> None:
         print(f"{pdir.name:24} {ps:32} {hosts}")
 
 
+def _applied_revision(name: str) -> str:
+    """Return the short git revision of an app's checkout, or `-` if unknown.
+
+    Workflow-managed deploys mirror their tree with rsync (no `.git`), so they
+    have no local revision to report; `-` is returned rather than shelling out.
+    """
+    repo = project_dir(name) / "repo"
+    if not (repo / ".git").exists():
+        return "-"
+    proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
+        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],  # noqa: S607  # git on PATH
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.stdout.strip() or "-" if proc.returncode == 0 else "-"
+
+
+def cmd_status(name: str) -> None:
+    """Show one deployment's health, ingress, databases, and source provenance.
+
+    Surfaces, for a single app: container/service state (`docker compose ps`),
+    each ingress host with its upstream router health, the provisioned
+    postgres/redis with **password-redacted** connection URLs (read back from the
+    600 creds file via `read_db_env`, never the raw secret), and the source
+    repo/branch plus the last applied git revision.
+    """
+    manifest_file = project_dir(name) / "manifest.yml"
+    if not manifest_file.exists():
+        sys.exit(f"nuk: {name}: no such deployment ({manifest_file} not found)")
+    manifest = load(manifest_file)
+    source = manifest.spec.source
+
+    ps = (
+        subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["docker", "compose", "-p", name, "ps", "--format", "{{.Service}}: {{.State}}"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        .stdout.strip()
+        .splitlines()
+    )
+    print(f"deployment: {name}")
+    print("containers:")
+    for line in ps or ["(none running)"]:
+        print(f"  {line}")
+
+    print("ingress:")
+    for ing in manifest.spec.ingress or []:
+        exists, healthy = _container_state(f"{name}-{ing.service}-1")
+        health = "healthy" if healthy else "unhealthy" if exists else "down"
+        print(f"  https://{ing.host} -> {ing.service}:{ing.port} [{health}]")
+    if not manifest.spec.ingress:
+        print("  (none)")
+
+    print("databases:")
+    env = read_db_env(name)
+    db_urls = [
+        (kind, _redact_db_url(env.get(key)))
+        for kind, key in (("postgres", "DATABASE_URL"), ("redis", "REDIS_URL"))
+    ]
+    shown = [(kind, url) for kind, url in db_urls if url]
+    for kind, url in shown:
+        print(f"  {kind}: {url}")
+    if not shown:
+        print("  (none provisioned)")
+
+    print("source:")
+    print(f"  repo: {source.repo or '-'}")
+    print(f"  branch: {source.branch}")
+    print(f"  revision: {_applied_revision(name)}")
+
+
 def cmd_logs(name: str) -> None:
     """Follow compose logs for a deployment."""
     manifest = load(project_dir(name) / "manifest.yml")
@@ -983,6 +1081,39 @@ def cmd_db_purge(name: str) -> None:
     print(f"{name}: database purged.")
 
 
+# --- shell completion ---------------------------------------------------------
+
+
+def _known_deployments() -> list[str]:
+    """List deployment names — the same source `cmd_get` enumerates.
+
+    Returns empty (never raises) off the controller, where DEPLOYS is absent, so
+    shell completion degrades gracefully.
+    """
+    if not DEPLOYS.exists():
+        return []
+    return sorted(
+        p.name for p in DEPLOYS.iterdir() if p.is_dir() and (p / "manifest.yml").exists()
+    )
+
+
+def complete_deployment_name(incomplete: str) -> list[str]:
+    """Dynamic shell completion for deployment-name arguments (logs/rollout/...)."""
+    return [n for n in _known_deployments() if n.startswith(incomplete)]
+
+
+def complete_db_name(incomplete: str) -> list[str]:
+    """Dynamic shell completion for `db purge` — retained DB creds in SECRETS.
+
+    Purge targets a database by its creds file, which outlives the deployment
+    (see `cmd_db_ls`), so this enumerates SECRETS rather than live deployments.
+    """
+    if not SECRETS.exists():
+        return []
+    names = sorted(f.name[: -len("-db.env")] for f in SECRETS.glob("*-db.env"))
+    return [n for n in names if n.startswith(incomplete)]
+
+
 # --- typer CLI ----------------------------------------------------------------
 
 _EPILOG = """\
@@ -1006,7 +1137,7 @@ app = typer.Typer(
     name="nuk",
     help="Minimal Kubernetes-shaped Docker Compose deployer.",
     epilog=_EPILOG,
-    add_completion=False,
+    add_completion=True,
     no_args_is_help=True,
 )
 
@@ -1079,21 +1210,41 @@ def _apply(
     cmd_apply(manifest, repo_path)
 
 
+@app.command("status")
+def _status(
+    name: Annotated[
+        str, typer.Argument(help="deployment name", autocompletion=complete_deployment_name)
+    ],
+) -> None:
+    """Show one app's health, ingress, databases (redacted URLs), and source."""
+    cmd_status(name)
+
+
 @app.command("logs")
-def _logs(name: Annotated[str, typer.Argument(help="deployment name")]) -> None:
+def _logs(
+    name: Annotated[
+        str, typer.Argument(help="deployment name", autocompletion=complete_deployment_name)
+    ],
+) -> None:
     """Follow compose logs for a deployment."""
     cmd_logs(name)
 
 
 @app.command("rollout")
-def _rollout(name: Annotated[str, typer.Argument(help="deployment name")]) -> None:
+def _rollout(
+    name: Annotated[
+        str, typer.Argument(help="deployment name", autocompletion=complete_deployment_name)
+    ],
+) -> None:
     """Git pull + compose pull + up -d."""
     cmd_rollout(name)
 
 
 @app.command("delete")
 def _delete(
-    name: Annotated[str, typer.Argument(help="deployment name")],
+    name: Annotated[
+        str, typer.Argument(help="deployment name", autocompletion=complete_deployment_name)
+    ],
     purge: Annotated[
         bool,
         typer.Option(
@@ -1118,7 +1269,11 @@ def _db_ls() -> None:
 
 
 @db_app.command("purge")
-def _db_purge(name: Annotated[str, typer.Argument(help="deployment name")]) -> None:
+def _db_purge(
+    name: Annotated[
+        str, typer.Argument(help="deployment name", autocompletion=complete_db_name)
+    ],
+) -> None:
     """Drop a retained app's database + creds."""
     cmd_db_purge(name)
 

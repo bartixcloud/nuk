@@ -57,6 +57,8 @@ This shape maps 1:1 to Kubernetes (the intended migration path):
 ```bash
 nuk apply <manifest>          # create / update (provisions any requested databases)
 nuk list                      # deployments, container state, ingress hosts (aliases: get, ls)
+nuk status <name>             # one app: container state, ingress + router health,
+                              #   redacted DB URLs, source repo/branch/revision
 nuk logs <name>               # docker compose logs -f
 nuk rollout <name>            # git pull + compose pull + up -d
 nuk delete <name>             # tear down; KEEPS the database
@@ -64,6 +66,19 @@ nuk delete <name> --purge     # also drop the app's postgres db/role + redis use
 nuk db ls                     # list managed databases; flags retained ones with no deployment
 nuk db purge <name>           # drop a retained app's database + creds
 ```
+
+## Shell completion
+
+The packaged `nuk.pyz` ships tab-completion for subcommands, flags, and **live
+deployment names** (`nuk status <TAB>`, `nuk logs <TAB>`, `nuk db purge <TAB>` enumerate
+the apps under `/opt/nuklaut/`). Install it once, in your shell:
+
+```bash
+nuk --install-completion        # detects your shell, writes the hook to its rc file
+```
+
+Then start a new shell (or `source` the rc file). `nuk --show-completion` prints the
+script to stdout instead, to inspect or install by hand.
 
 ## What `nuk apply` does
 
