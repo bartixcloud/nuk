@@ -39,11 +39,11 @@ jobs:
     steps:
       # Check out the tag the release job just created — its tree already carries
       # the stamped __version__, so no build-time stamping is needed.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ needs.release.outputs.tag }}
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
