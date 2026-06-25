@@ -1,0 +1,70 @@
+# Shared data stack for nuklaut apps — the canonical, owned source for the
+# nuk-postgres and nuk-redis containers that `nuk apply` provisions per-app
+# Postgres roles/databases and Redis ACL users against (see nuk.py:
+# provision_databases / ensure_postgres / ensure_redis / preflight_data_stack).
+#
+# Bring it up ONCE on the controller (and in CI for the integration tier):
+#
+#   POSTGRES_PASSWORD=… REDIS_ADMIN_PASSWORD=… \
+#     docker compose -f files/docker-compose.data.yml up -d
+#
+# nuk never passes a DB password on a host arg line: it execs `psql` inside
+# nuk-postgres (local-socket trust) and `redis-cli --user nukadmin` inside
+# nuk-redis (password read from the container's own env). App containers reach
+# the databases by container name over the external `data` network.
+
+name: nuk-data
+
+services:
+  postgres:
+    # postgres 16 + the `vector` extension nuk enables per-app (CREATE EXTENSION
+    # vector). preflight_data_stack refuses to provision against an image lacking
+    # pgvector, so this image choice is load-bearing.
+    image: pgvector/pgvector:pg16
+    container_name: nuk-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+    networks: [data]
+    volumes:
+      - nuk-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: nuk-redis
+    restart: unless-stopped
+    environment:
+      REDIS_ADMIN_PASSWORD: ${REDIS_ADMIN_PASSWORD:?set REDIS_ADMIN_PASSWORD}
+    # Build an aclfile from the admin password at start so nuk can authenticate
+    # as `nukadmin` (full admin — it creates the per-app ACL users). The default
+    # user is disabled so nothing reaches the shared instance anonymously.
+    # ($$ escapes compose interpolation so the container shell expands the var.)
+    command:
+      - sh
+      - -c
+      - |
+        set -eu
+        printf 'user default off\nuser nukadmin on >%s ~* &* +@all\n' \
+          "$$REDIS_ADMIN_PASSWORD" > /tmp/nuk-users.acl
+        exec redis-server --aclfile /tmp/nuk-users.acl --appendonly yes
+    networks: [data]
+    volumes:
+      - nuk-redis-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", 'redis-cli -a "$$REDIS_ADMIN_PASSWORD" --user nukadmin ping | grep -q PONG']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+networks:
+  data:
+    name: data
+
+volumes:
+  nuk-postgres-data:
+  nuk-redis-data:

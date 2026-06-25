@@ -416,6 +416,7 @@ def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
     passes None (the backward-compatible bare-URL path nukview relies on).
     """
     monkeypatch.setattr(nuk, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk, "preflight_data_stack", lambda *a, **k: None)
     seen: list[str | None] = []
 
     def fake_pg(app, prev, driver=None):
@@ -429,6 +430,143 @@ def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
 
     nuk.provision_databases("app", {"postgres": True})
     assert seen == ["asyncpg", None]
+
+
+# --- data-stack preflight (issue #10): own the stack, fail fast & actionably ---
+
+
+def test_container_state_absent_when_inspect_fails(monkeypatch):
+    """A missing container (docker inspect non-zero) reports (exists, healthy)=(False, False)."""
+
+    def fake_run(cmd, *a, **k):
+        return nuk.subprocess.CompletedProcess(cmd, 1, stdout="", stderr="No such object")
+
+    monkeypatch.setattr(nuk.subprocess, "run", fake_run)
+    assert nuk._container_state("nuk-postgres") == (False, False)
+
+
+def test_container_state_running_without_healthcheck_is_healthy(monkeypatch):
+    """A running container with no healthcheck block is treated as healthy."""
+
+    def fake_run(cmd, *a, **k):
+        return nuk.subprocess.CompletedProcess(cmd, 0, stdout="true none\n", stderr="")
+
+    monkeypatch.setattr(nuk.subprocess, "run", fake_run)
+    assert nuk._container_state("nuk-postgres") == (True, True)
+
+
+def test_container_state_unhealthy_when_health_reports_unhealthy(monkeypatch):
+    def fake_run(cmd, *a, **k):
+        return nuk.subprocess.CompletedProcess(cmd, 0, stdout="true unhealthy\n", stderr="")
+
+    monkeypatch.setattr(nuk.subprocess, "run", fake_run)
+    assert nuk._container_state("nuk-redis") == (True, False)
+
+
+def test_container_state_healthy_when_health_reports_healthy(monkeypatch):
+    def fake_run(cmd, *a, **k):
+        return nuk.subprocess.CompletedProcess(cmd, 0, stdout="true healthy\n", stderr="")
+
+    monkeypatch.setattr(nuk.subprocess, "run", fake_run)
+    assert nuk._container_state("nuk-postgres") == (True, True)
+
+
+def _stub_admin_paths(monkeypatch, *, pgvector="1", whoami="nukadmin"):
+    """Stub the docker-exec admin helpers so preflight runs without a daemon."""
+    monkeypatch.setattr(nuk, "_psql", lambda *a, **k: pgvector)
+    monkeypatch.setattr(nuk, "_redis_admin", lambda *a, **k: whoami)
+
+
+def test_preflight_missing_postgres_is_actionable(monkeypatch):
+    """A down postgres aborts with a message naming the container + the owned compose."""
+    monkeypatch.setattr(nuk, "_container_state", lambda name: (False, False))
+    _stub_admin_paths(monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        nuk.preflight_data_stack(want_pg=True, want_redis=False)
+    msg = str(exc.value)
+    assert nuk.PG_CONTAINER in msg
+    assert "docker-compose.data.yml" in msg
+
+
+def test_preflight_unhealthy_redis_is_actionable(monkeypatch):
+    monkeypatch.setattr(nuk, "_container_state", lambda name: (True, False))
+    _stub_admin_paths(monkeypatch)
+    with pytest.raises(SystemExit) as exc:
+        nuk.preflight_data_stack(want_pg=False, want_redis=True)
+    assert nuk.REDIS_CONTAINER in str(exc.value)
+    assert "healthy" in str(exc.value)
+
+
+def test_preflight_missing_pgvector_is_actionable(monkeypatch):
+    """A healthy postgres without the `vector` extension available still aborts."""
+    monkeypatch.setattr(nuk, "_container_state", lambda name: (True, True))
+    _stub_admin_paths(monkeypatch, pgvector="")
+    with pytest.raises(SystemExit, match="pgvector"):
+        nuk.preflight_data_stack(want_pg=True, want_redis=False)
+
+
+def test_preflight_missing_nukadmin_is_actionable(monkeypatch):
+    """A redis where authenticating as nukadmin fails aborts actionably."""
+    monkeypatch.setattr(nuk, "_container_state", lambda name: (True, True))
+    monkeypatch.setattr(nuk, "_psql", lambda *a, **k: "1")
+
+    def boom(*a, **k):
+        raise nuk.subprocess.CalledProcessError(1, ["docker", "exec"])
+
+    monkeypatch.setattr(nuk, "_redis_admin", boom)
+    with pytest.raises(SystemExit, match="nukadmin"):
+        nuk.preflight_data_stack(want_pg=False, want_redis=True)
+
+
+def test_preflight_passes_when_stack_healthy(monkeypatch):
+    monkeypatch.setattr(nuk, "_container_state", lambda name: (True, True))
+    _stub_admin_paths(monkeypatch)
+    assert nuk.preflight_data_stack(want_pg=True, want_redis=True) is None
+
+
+def test_preflight_skips_unrequested_engines(monkeypatch):
+    """redis-only provisioning must not inspect/require postgres."""
+    seen: list[str] = []
+    monkeypatch.setattr(nuk, "_container_state", lambda name: (seen.append(name), (True, True))[1])
+    _stub_admin_paths(monkeypatch)
+    nuk.preflight_data_stack(want_pg=False, want_redis=True)
+    assert seen == [nuk.REDIS_CONTAINER]
+
+
+def test_provision_databases_runs_preflight_before_exec(tmp_path, monkeypatch):
+    """provision_databases preflights before any ensure_* exec and aborts when the
+    stack is down — ensure_postgres must never run against an absent container.
+    """
+    monkeypatch.setattr(nuk, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk, "_container_state", lambda name: (False, False))
+
+    def fail(*a, **k):
+        pytest.fail("ensure_postgres must not run when preflight fails")
+
+    monkeypatch.setattr(nuk, "ensure_postgres", fail)
+    with pytest.raises(SystemExit):
+        nuk.provision_databases("app", {"postgres": True})
+
+
+# --- vendored data stack (issue #10): the owned, reproducible source ----------
+
+
+def test_data_stack_compose_is_vendored_and_well_formed():
+    """files/docker-compose.data.yml is the owned source for the shared stack: it
+    must define the nuk-postgres (pgvector) + nuk-redis containers nuk targets and
+    the external `data` network apps join.
+    """
+    from pathlib import Path
+
+    path = Path(nuk.__file__).parent / "files" / "docker-compose.data.yml"
+    doc = yaml.safe_load(path.read_text())
+    svcs = doc["services"]
+    cnames = {s.get("container_name") for s in svcs.values()}
+    assert nuk.PG_CONTAINER in cnames
+    assert nuk.REDIS_CONTAINER in cnames
+    pg = next(s for s in svcs.values() if s.get("container_name") == nuk.PG_CONTAINER)
+    assert "pgvector" in pg["image"]
+    assert doc["networks"]["data"]["name"] == "data"
 
 
 # --- source provenance: github_url + manifest stamping ------------------------

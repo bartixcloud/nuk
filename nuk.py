@@ -36,8 +36,10 @@ DEPLOYS = ROOT / "deployments"
 DYNAMIC = ROOT / "traefik" / "dynamic"
 SECRETS = ROOT / "secrets"
 
-# Shared data stack (files/docker-compose.data.yml). Apps reach these by their
-# container names over the private `data` network.
+# Shared data stack — owned, reproducible source vendored at
+# files/docker-compose.data.yml (bring it up once on the controller). Apps reach
+# these by their container names over the private `data` network. provision_*
+# preflights both containers (see preflight_data_stack) before any docker exec.
 PG_CONTAINER = "nuk-postgres"
 REDIS_CONTAINER = "nuk-redis"
 
@@ -552,6 +554,90 @@ def _redis_admin(*redis_args: str) -> str:
     ).stdout.strip()
 
 
+_DATA_STACK_HINT = (
+    "bring the shared data stack up with "
+    "`docker compose -f files/docker-compose.data.yml up -d` (vendored in this repo)"
+)
+
+
+def _container_state(name: str) -> tuple[bool, bool]:
+    """Return `(exists, healthy)` for a container via `docker inspect`.
+
+    `healthy` is True when the container is running and either declares no
+    healthcheck or reports a healthy one. An absent container (inspect exits
+    non-zero) is `(False, False)`.
+
+    Args:
+        name: The container name to inspect.
+
+    Returns:
+        A `(exists, healthy)` pair.
+    """
+    proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
+        [  # noqa: S607  # docker on PATH
+            "docker",
+            "inspect",
+            "-f",
+            "{{.State.Running}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+            name,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return (False, False)
+    parts = proc.stdout.strip().split()
+    running = bool(parts) and parts[0] == "true"
+    health = parts[1] if len(parts) > 1 else "none"
+    return (True, running and health in {"healthy", "none"})
+
+
+def preflight_data_stack(want_pg: bool, want_redis: bool) -> None:
+    """Verify the shared data stack is provisionable before any `docker exec`.
+
+    Each requested engine's container must exist and be healthy, and the
+    capability provisioning relies on must be present (pgvector available for
+    postgres; the `nukadmin` admin user reachable for redis). Failing fast here
+    turns an opaque mid-provision `docker exec` error into one actionable line.
+
+    Args:
+        want_pg: Whether postgres provisioning was requested.
+        want_redis: Whether redis provisioning was requested.
+
+    Raises:
+        SystemExit: When a required container is missing/unhealthy, pgvector is
+            unavailable, or the redis `nukadmin` user cannot be reached.
+    """
+    if want_pg:
+        _require_container(PG_CONTAINER, "postgres")
+        if _psql("SELECT 1 FROM pg_available_extensions WHERE name = 'vector';") != "1":
+            sys.exit(
+                f"nuk: pgvector not available in {PG_CONTAINER!r} — the data stack image "
+                f"must provide the 'vector' extension (use pgvector/pgvector)"
+            )
+    if want_redis:
+        _require_container(REDIS_CONTAINER, "redis")
+        try:
+            whoami = _redis_admin("ACL", "WHOAMI")
+        except subprocess.CalledProcessError:
+            whoami = ""
+        if whoami != "nukadmin":
+            sys.exit(
+                f"nuk: redis 'nukadmin' admin user not reachable in "
+                f"{REDIS_CONTAINER!r} — {_DATA_STACK_HINT}"
+            )
+
+
+def _require_container(container: str, label: str) -> None:
+    """Abort with an actionable message unless `container` exists and is healthy."""
+    exists, healthy = _container_state(container)
+    if not exists:
+        sys.exit(f"nuk: shared {label} container {container!r} not found — {_DATA_STACK_HINT}")
+    if not healthy:
+        sys.exit(f"nuk: shared {label} container {container!r} not healthy — {_DATA_STACK_HINT}")
+
+
 def ensure_postgres(app: str, prev_url: str | None, driver: str | None = None) -> str:
     """Idempotently create role + database (pgvector enabled) for `app`.
 
@@ -636,6 +722,7 @@ def provision_databases(app: str, databases: dict) -> str | None:
     if not (want_pg or want_redis):
         return None
     _safe_ident(app)
+    preflight_data_stack(want_pg, want_redis)
     prev = read_db_env(app)
     env: dict[str, str] = {}
     if want_pg:
