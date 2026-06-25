@@ -884,7 +884,9 @@ def test_completion_options_exposed():
     """add_completion is on, so the controller gets --install/--show-completion."""
     from typer.testing import CliRunner
 
-    result = CliRunner().invoke(nuk.app, ["--help"])
+    # prog_name pins the program typer renders completion install for; without it
+    # some typer/Python combos omit the options (the runner can't infer a name).
+    result = CliRunner().invoke(nuk.app, ["--help"], prog_name="nuk")
     assert result.exit_code == 0
     assert "--install-completion" in result.output
     assert "--show-completion" in result.output
