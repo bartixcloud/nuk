@@ -113,10 +113,19 @@ class Postgres(BaseModel):
 
 
 class Databases(_NullTolerant):
-    """`spec.databases` — opt-in per-app postgres/redis on the shared stack."""
+    """`spec.databases` — opt-in per-app postgres/redis on the shared stack.
+
+    By default the generated DATABASE_URL / REDIS_URL are injected into the
+    ingress service(s). `attachTo` overrides that target list (e.g. to reach a
+    worker that has no ingress); `attachAll` injects into every compose service.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
 
     postgres: bool | Postgres = False
     redis: bool = False
+    attach_to: list[str] = Field(default=[], alias="attachTo")
+    attach_all: bool = Field(default=False, alias="attachAll")
 
 
 class Spec(_NullTolerant):
@@ -279,58 +288,125 @@ def build_override(
     ingress: list[dict],
     db_env: str | None = None,
     env_from: list[str] | None = None,
+    db_services: list[str] | None = None,
 ) -> dict | None:
-    """Compose override joining each ingress service to the shared edge network.
+    """Compose override wiring services to the shared edge/data networks + secrets.
 
-    Each ingress service also gets an `env_file` list so its container actually
-    receives the requested secrets — `docker compose --env-file` only feeds
-    ${VAR} interpolation in the compose file, it does NOT set container env, so
-    this override is the only thing that does.
+    Each service gets an `env_file` list so its container actually receives the
+    requested secrets — `docker compose --env-file` only feeds ${VAR}
+    interpolation in the compose file, it does NOT set container env, so this
+    override is the only thing that does.
 
-    `env_file` entries (in order) are: any `spec.envFrom[].secretRef` paths
-    (env_from), then — when the deployment requested a database — the per-app
-    creds file (db_env) last, so its generated DATABASE_URL / REDIS_URL win on
-    key collisions. db_env is the 600 creds file, so its secret values never
-    enter this (deploy-readable) override.
+    Two overlapping roles a service can have:
+      * INGRESS service (`spec.ingress[].service`) — joins the `edge` network.
+      * DB service (`db_services`) — joins the `data` network and gets the
+        per-app creds file (db_env) appended to its env_file, so DATABASE_URL /
+        REDIS_URL reach it. `db_services` defaults to the ingress services
+        (backward-compatible), but `databases.attachTo` / `attachAll` can route
+        the creds to a worker that has no ingress (see resolve_db_services).
 
-    The `data` network join remains gated on db_env only (unrelated to
-    env_from). Note: env_file is only attached to INGRESS services, same as the
-    existing db_env behaviour — acceptable for v1 / single-service apps.
+    `env_file` entries (in order) are the `spec.envFrom[].secretRef` paths
+    (env_from), then — for a DB service — the per-app creds file (db_env) last,
+    so its generated URLs win on key collisions. db_env is the 600 creds file,
+    so its secret values never enter this (deploy-readable) override.
 
     Args:
         name: The deployment name (unused; kept for signature stability).
         ingress: The raw `spec.ingress[]` entries.
         db_env: Path to the per-app creds env-file, if a database was requested.
         env_from: Resolved `spec.envFrom` secret-file paths.
+        db_services: Services that should receive the db creds + data network;
+            None means "the ingress services" (the legacy default).
 
     Returns:
-        The override doc, or None when there are no ingress services.
+        The override doc, or None when no service needs any wiring.
     """
     env_from = env_from or []
-    nets = ["edge", "data"] if db_env else ["edge"]
-    env_files = [*env_from, *([db_env] if db_env else [])]
-    services = {}
-    for ing in ingress:
-        svc: dict = {"networks": list(nets)}
+    ingress_services = [ing["service"] for ing in ingress]
+    db_targets = (list(ingress_services) if db_env else []) if db_services is None else db_services
+    db_set = set(db_targets) if db_env else set()
+    # Ingress order first, then any db-only (non-ingress) services, deduped.
+    ordered = list(dict.fromkeys([*ingress_services, *db_targets]))
+    services: dict = {}
+    for svc_name in ordered:
+        is_ingress = svc_name in ingress_services
+        is_db = svc_name in db_set
+        nets = (["edge"] if is_ingress else []) + (["data"] if is_db else [])
+        env_files = [*env_from, *([db_env] if is_db else [])]
+        svc: dict = {"networks": nets}
         if env_files:
-            svc["env_file"] = list(env_files)
-        services[ing["service"]] = svc
+            svc["env_file"] = env_files
+        services[svc_name] = svc
     if not services:
         return None
-    networks: dict = {"edge": {"external": True}}
-    if db_env:
+    networks: dict = {}
+    if any(s in ingress_services for s in services):
+        networks["edge"] = {"external": True}
+    if any(s in db_set for s in services):
         networks["data"] = {"external": True}
     return {"services": services, "networks": networks}
 
 
 def write_override(
-    name: str, ingress: list[dict], db_env: str | None = None, env_from: list[str] | None = None
+    name: str,
+    ingress: list[dict],
+    db_env: str | None = None,
+    env_from: list[str] | None = None,
+    db_services: list[str] | None = None,
 ) -> None:
     """Render and write `compose.override.yml` for an app (no-op when empty)."""
-    doc = build_override(name, ingress, db_env, env_from)
+    doc = build_override(name, ingress, db_env, env_from, db_services)
     if doc is None:
         return
     (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc))
+
+
+def compose_service_names(name: str, raw: dict) -> list[str]:
+    """Return the service names declared in an app's checked-out compose file.
+
+    Used by `attachAll` to enumerate every service that should receive the DB
+    creds. Returns an empty list when the compose file is absent or has no
+    services (the caller then injects nowhere rather than failing the apply).
+
+    Args:
+        name: The deployment name (locates `<project_dir>/repo`).
+        raw: The raw manifest dict (for `spec.compose.file`).
+
+    Returns:
+        The compose `services` keys, in file order.
+    """
+    cf = raw["spec"].get("compose", {}).get("file", "docker-compose.yml")
+    path = project_dir(name) / "repo" / cf
+    if not path.exists():
+        return []
+    doc = yaml.safe_load(path.read_text()) or {}
+    return list((doc.get("services") or {}).keys())
+
+
+def resolve_db_services(name: str, raw: dict, db_env: str | None) -> list[str]:
+    """Resolve which compose services the provisioned DB creds attach to.
+
+    Precedence: `attachAll` (every compose service) > `attachTo` (explicit list)
+    > the ingress services (legacy default). Empty when no database was
+    provisioned.
+
+    Args:
+        name: The deployment name.
+        raw: The raw manifest dict.
+        db_env: The provisioned creds path, or None when no DB was requested.
+
+    Returns:
+        The service names to inject DATABASE_URL / REDIS_URL into.
+    """
+    if not db_env:
+        return []
+    databases = raw["spec"].get("databases") or {}
+    if databases.get("attachAll"):
+        return compose_service_names(name, raw)
+    attach_to = databases.get("attachTo")
+    if attach_to:
+        return list(attach_to)
+    return [ing["service"] for ing in raw["spec"].get("ingress", []) or []]
 
 
 def _rule(ing: dict) -> str:
@@ -798,10 +874,12 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
         sys.exit(f"{manifest_path}: spec.source.repo is required unless --repo-path is given")
     ingress = raw["spec"].get("ingress", []) or []
     db_env = provision_databases(name, raw["spec"].get("databases") or {})
-    if db_env and not ingress:
+    db_services = resolve_db_services(name, raw, db_env)
+    if db_env and not db_services:
         print(
-            f"{name}: databases provisioned but no ingress service to attach "
-            f"them to — DATABASE_URL/REDIS_URL won't be injected. Add an ingress entry."
+            f"{name}: databases provisioned but no service to attach them to — "
+            f"DATABASE_URL/REDIS_URL won't be injected. Add an ingress entry, or set "
+            f"spec.databases.attachTo / attachAll to target a worker."
         )
     env_from = resolve_env_from(raw["spec"])
     if env_from and not ingress:
@@ -809,7 +887,7 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
             f"{name}: spec.envFrom secrets resolved but no ingress service to "
             f"attach them to — they won't be injected. Add an ingress entry."
         )
-    write_override(name, ingress, db_env, env_from)
+    write_override(name, ingress, db_env, env_from, db_services)
     write_ingress(name, ingress)
     persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
     # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
@@ -919,7 +997,9 @@ Manifest (apiVersion: nuk/v1, kind: Deployment):
     passed to `docker compose --env-file` for ${VAR} interpolation).
   spec.databases: {postgres: true, redis: true} -> per-app DB on the
     shared data stack; injects DATABASE_URL / REDIS_URL into the
-    ingress service(s).
+    ingress service(s). Override the injection target with
+    databases.attachTo: [web, worker] (explicit services, e.g. a worker
+    with no ingress) or databases.attachAll: true (every compose service).
 """
 
 app = typer.Typer(
