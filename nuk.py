@@ -427,6 +427,7 @@ def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901,
       www         also answer www.<host> with a 301 to <host> (opt-in; apex only)
       auth        "oauth" -> gate via the oauth2-proxy GitHub forwardAuth chain
                   (needs an oauth2-proxy /oauth2/ route for <host>)
+                  "basic" -> HTTP Basic Auth (auth@file middleware from global.yml)
 
     Args:
         name: The deployment name, used to prefix router/service ids.
@@ -454,6 +455,8 @@ def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901,
         # needs an oauth2-proxy /oauth2/ route (see docker-compose.traefik.yml).
         if ing.get("auth") == "oauth":
             mw += ["oauth-errors@file", "oauth-auth@file"]
+        elif ing.get("auth") == "basic":
+            mw += ["auth@file"]
         if ing.get("path") and ing.get("stripPrefix"):
             sid = f"{rid}-strip"
             middlewares[sid] = {"stripPrefix": {"prefixes": [ing["path"]]}}
@@ -1122,7 +1125,7 @@ Manifest (apiVersion: nuk/v1, kind: Deployment):
   spec.ingress[].{host,service,port}, spec.envFrom[].secretRef
   spec.ingress[] also takes optional: path (PathPrefix), stripPrefix,
     priority, www (301 www.<host> -> <host>; apex domains only),
-    auth ("oauth" -> GitHub oauth2-proxy gate)
+    auth ("oauth" -> GitHub oauth2-proxy gate, "basic" -> HTTP Basic Auth)
   spec.envFrom[].secretRef -> existing env files injected into each
     ingress service's container env via the compose override (and also
     passed to `docker compose --env-file` for ${VAR} interpolation).
