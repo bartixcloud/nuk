@@ -8,12 +8,14 @@ compose project, optional ingress hosts, and env files. State lives entirely in
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import secrets
 import shutil
 import subprocess  # noqa: S404  # all calls use fixed argv, no shell (see per-call S603/S607)
 import sys
+import urllib.request
 from pathlib import Path
 from typing import Annotated, Literal, cast
 from urllib.parse import urlparse
@@ -42,6 +44,12 @@ SECRETS = ROOT / "secrets"
 # preflights both containers (see preflight_data_stack) before any docker exec.
 PG_CONTAINER = "nuk-postgres"
 REDIS_CONTAINER = "nuk-redis"
+
+# nuk distributes as a normal Python package: run ephemerally with
+#   uvx --from git+https://github.com/astrojones/nuk@<ref> nuk ...
+# or install/upgrade a pinned copy with `nuk update` (→ uv tool install --from …).
+NUK_REPO = "astrojones/nuk"
+NUK_GIT = f"git+https://github.com/{NUK_REPO}"
 
 
 # --- manifest models ----------------------------------------------------------
@@ -1323,10 +1331,10 @@ def _root(
 
     Raises:
         SystemExit: When `/opt/nuklaut` is absent (nuk runs on the controller).
-            The `org` subcommands are exempt — they read the org manifest off the
-            controller (operator workstation, CI, the deploy plugin).
+            The `org` and `update` subcommands are exempt — they run off the
+            controller too (operator workstation, CI, the deploy plugin).
     """
-    if ctx.invoked_subcommand == "org":
+    if ctx.invoked_subcommand in {"org", "update"}:
         return
     if not ROOT.exists():
         sys.exit(
@@ -1427,6 +1435,91 @@ def _db_purge(
     cmd_db_purge(name)
 
 
+def norm_ver(tag: str) -> tuple[int, ...]:
+    """Numeric version tuple from a tag, for comparison.
+
+    'v0.10.0' -> (0, 10, 0); stops at the first non-numeric part.
+
+    Args:
+        tag: A version tag, with or without a leading `v`.
+
+    Returns:
+        The leading numeric components as a tuple.
+    """
+    out: list[int] = []
+    for part in tag.lstrip("v").split("."):
+        m = re.match(r"\d+", part)
+        if not m:
+            break
+        out.append(int(m.group()))
+    return tuple(out)
+
+
+def latest_release_tag(repo: str = NUK_REPO) -> str | None:
+    """Latest release tag for `repo` (e.g. `v0.10.0`), or None if unavailable.
+
+    Prefers `gh` (authenticated — nuk's repo is private, so the anonymous API
+    404s), falling back to the public GitHub API when gh is absent.
+
+    Args:
+        repo: The `owner/name` GitHub repo.
+
+    Returns:
+        The latest release's tag, or None on any error.
+    """
+    try:
+        out = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["gh", "release", "view", "--repo", repo, "--json", "tagName", "-q", ".tagName"],  # noqa: S607  # gh on PATH
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        out = ""
+    if out:
+        return out
+    url = f"https://api.github.com/repos/{repo}/releases/latest"
+    try:
+        with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310  # fixed https github api URL
+            data = json.load(resp)
+    except (OSError, ValueError):
+        return None
+    tag = data.get("tag_name") if isinstance(data, dict) else None
+    return tag if isinstance(tag, str) else None
+
+
+def cmd_update(to: str | None, check: bool) -> None:
+    """Install the latest nuk release (or an explicit ref) via `uv tool install`.
+
+    Args:
+        to: Explicit ref/tag to install (bypasses the up-to-date check, so it also
+            supports pinning/downgrade); None installs the latest release.
+        check: Only report installed-vs-latest; install nothing.
+
+    Raises:
+        SystemExit: If the latest release cannot be resolved, or the uv install fails.
+    """
+    current = __version__
+    target = to or latest_release_tag()
+    if not target:
+        sys.exit("nuk update: could not resolve the latest release (network?). Pass --to <ref>.")
+    if check:
+        print(f"nuk {current} installed - latest is {target}")
+        return
+    if to is None and norm_ver(target) and norm_ver(target) <= norm_ver(current):
+        print(f"nuk {current} is already up to date ({target})")
+        return
+    print(f"updating nuk {current} -> {target} via uv tool install...")
+    try:
+        sh("uv", "tool", "install", "--force", "--from", f"{NUK_GIT}@{target}", "nuk")
+    except (subprocess.SubprocessError, OSError) as e:
+        sys.exit(
+            f"nuk update: uv install failed ({e}). Is uv installed? "
+            f"Manual: uv tool install --from {NUK_GIT}@{target} nuk"
+        )
+    print(f"nuk updated to {target} - run `nuk --version` to confirm")
+
+
 def _emit(value: object) -> str:
     """Render an org value for the shell: bools lowercased, blocks as YAML, else str."""
     if isinstance(value, bool):
@@ -1481,6 +1574,19 @@ def _org_show(
 ) -> None:
     """Print the validated Org manifest as normalized YAML."""
     print(yaml.safe_dump(load_org(path).model_dump(by_alias=True), sort_keys=False), end="")
+
+
+@app.command("update")
+def _update(
+    to: Annotated[
+        str | None, typer.Option("--to", help="ref/tag to install (default: latest release)")
+    ] = None,
+    check: Annotated[
+        bool, typer.Option("--check", help="report installed vs latest; install nothing")
+    ] = False,
+) -> None:
+    """Update the installed nuk to the latest release (or --to <ref>) via uv."""
+    cmd_update(to, check)
 
 
 def main() -> None:
