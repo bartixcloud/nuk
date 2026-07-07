@@ -15,7 +15,7 @@ import shutil
 import subprocess  # noqa: S404  # all calls use fixed argv, no shell (see per-call S603/S607)
 import sys
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 from urllib.parse import urlparse
 
 import typer
@@ -169,6 +169,83 @@ class Manifest(_NullTolerant):
         return self._raw
 
 
+# --- org capability manifest (nukorg/v1) --------------------------------------
+# One org's declarative facility choices, read by BOTH the core bootstrap (to
+# BUILD the platform) and the deploy plugin (to OPERATE it). Kept flat (not
+# spec-nested like nuk/v1) because it is human-edited and read key-by-key by
+# shell (`nuk org get facilities.auth`); dotted paths use the YAML alias names.
+
+
+class OrgData(BaseModel):
+    """`facilities.data` — which shared data services this org runs."""
+
+    postgres: bool = True
+    redis: bool = True
+
+
+class Facilities(BaseModel):
+    """`facilities` — this org's variant of each pluggable platform capability."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    dns: Literal["wildcard", "manual"]
+    tls: Literal["dns01", "http01"]
+    dns_provider: str | None = Field(default=None, alias="dnsProvider")
+    secrets: Literal["sops", "generate", "ci-inject"]
+    auth: Literal["basic", "oauth2-proxy", "authentik"]
+    runners: Literal["ephemeral", "persistent"]
+    data: OrgData = OrgData()
+
+    @model_validator(mode="after")
+    def _check_dns_tls(self) -> Facilities:
+        """Enforce the DNS/TLS coupling that wildcard certs + DNS-01 require.
+
+        Raises:
+            ValueError: If wildcard DNS is paired with a non-DNS-01 challenge, or
+                a DNS-01 challenge omits its provider.
+        """
+        if self.dns == "wildcard" and self.tls != "dns01":
+            msg = "facilities.dns=wildcard requires facilities.tls=dns01 (wildcard needs DNS-01)"
+            raise ValueError(msg)
+        if self.tls == "dns01" and not self.dns_provider:
+            msg = "facilities.tls=dns01 requires facilities.dnsProvider"
+            raise ValueError(msg)
+        return self
+
+
+class Controller(BaseModel):
+    """`controller` — how this org's controller host is provisioned + reached."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    hostname: str
+    provisioner: Literal["terraform", "manual", "ansible"]
+    deploy_mode: Literal["ssh", "local"] = Field(default="ssh", alias="deployMode")
+
+
+class Pins(BaseModel):
+    """`pins` — pinned generic-core + nuk versions this org runs (owner/repo@ref)."""
+
+    core: str
+    nuk: str | None = None
+
+
+class Org(BaseModel):
+    """A validated nukorg/v1 Org manifest (`<org>/infra/nuklaut.org.yml`)."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    api_version: Literal["nukorg/v1"] = Field(alias="apiVersion")
+    kind: Literal["Org"]
+    metadata: Metadata
+    domain: str
+    acme_email: str = Field(alias="acmeEmail")
+    controller: Controller
+    facilities: Facilities
+    overlays: list[str] = []
+    pins: Pins
+
+
 def sh(*cmd: str, cwd: Path | None = None) -> None:
     """Run a command, raising on non-zero exit."""
     subprocess.run(cmd, cwd=cwd, check=True)  # noqa: S603  # fixed argv, no shell
@@ -194,6 +271,52 @@ def load(path: Path) -> Manifest:
         sys.exit(f"{path}: not a nuk/v1 Deployment")
     manifest._raw = raw  # noqa: SLF001  # stash wire-contract input on its own model
     return manifest
+
+
+def load_org(path: Path) -> Org:
+    """Parse and validate a nukorg/v1 Org manifest file.
+
+    Args:
+        path: Path to the org manifest YAML (`nuklaut.org.yml`).
+
+    Returns:
+        The validated Org.
+
+    Raises:
+        SystemExit: If the file is unreadable or not a valid nukorg/v1 Org.
+    """
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        sys.exit(f"{path}: {e}")
+    try:
+        return Org.model_validate(raw)
+    except ValidationError as e:
+        sys.exit(f"{path}: invalid nukorg/v1 Org\n{e}")
+
+
+def org_get(org: Org, dotted: str) -> object:
+    """Return a value from an Org by dotted alias path (e.g. `facilities.auth`).
+
+    Args:
+        org: The validated Org.
+        dotted: Dot-separated key path using the manifest's YAML (alias) names.
+
+    Returns:
+        The value at that path (scalar, list, or dict).
+
+    Raises:
+        SystemExit: If any path segment is missing.
+    """
+    node: object = org.model_dump(by_alias=True)
+    for part in dotted.split("."):
+        if not isinstance(node, dict):
+            sys.exit(f"nuk org get: no such key: {dotted}")
+        current = cast("dict[str, object]", node)
+        if part not in current:
+            sys.exit(f"nuk org get: no such key: {dotted}")
+        node = current[part]
+    return node
 
 
 def project_dir(name: str) -> Path:
@@ -222,6 +345,25 @@ def git_origin(repo_path: str) -> str | None:
     except (subprocess.SubprocessError, OSError):
         return None
     return github_url(out)
+
+
+def origin_org(repo_path: str = ".") -> str | None:
+    """The GitHub owner (org) of repo_path's origin remote, or None.
+
+    The org's config lives at `<owner>/infra`; the deploy plugin resolves which
+    org to operate on from the app repo it is invoked in.
+
+    Args:
+        repo_path: Path to the git checkout (default: cwd).
+
+    Returns:
+        The GitHub owner, or None if there is no github origin.
+    """
+    url = git_origin(repo_path)
+    if not url:
+        return None
+    m = re.match(r"https://github\.com/([^/]+)/", f"{url}/")
+    return m.group(1) if m else None
 
 
 def persist_manifest(spec: dict, src_path: Path, dest: Path, repo_path: str | None) -> None:
@@ -1181,7 +1323,11 @@ def _root(
 
     Raises:
         SystemExit: When `/opt/nuklaut` is absent (nuk runs on the controller).
+            The `org` subcommands are exempt — they read the org manifest off the
+            controller (operator workstation, CI, the deploy plugin).
     """
+    if ctx.invoked_subcommand == "org":
+        return
     if not ROOT.exists():
         sys.exit(
             f"nuk: {ROOT} does not exist — nuk runs on the controller, "
@@ -1279,6 +1425,62 @@ def _db_purge(
 ) -> None:
     """Drop a retained app's database + creds."""
     cmd_db_purge(name)
+
+
+def _emit(value: object) -> str:
+    """Render an org value for the shell: bools lowercased, blocks as YAML, else str."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (dict, list)):
+        return yaml.safe_dump(value, sort_keys=False).rstrip()
+    return str(value)
+
+
+org_app = typer.Typer(
+    name="org",
+    help="resolve + read the org capability manifest (nukorg/v1) — runs off-controller",
+    no_args_is_help=True,
+)
+app.add_typer(org_app)
+
+
+@org_app.command("resolve")
+def _org_resolve(
+    repo_path: Annotated[
+        str, typer.Option("--repo-path", help="git checkout to read origin from")
+    ] = ".",
+) -> None:
+    """Print the GitHub org of a repo's origin (its `<org>/infra` holds the manifest)."""
+    org = origin_org(repo_path)
+    if not org:
+        sys.exit("nuk org resolve: no github origin remote found")
+    print(org)
+
+
+@org_app.command("validate")
+def _org_validate(
+    path: Annotated[Path, typer.Argument(help="path to nuklaut.org.yml")],
+) -> None:
+    """Validate a nukorg/v1 Org manifest; exit nonzero if invalid."""
+    org = load_org(path)
+    print(f"OK: {path} is a valid nukorg/v1 Org ({org.metadata.name})")
+
+
+@org_app.command("get")
+def _org_get(
+    path: Annotated[Path, typer.Argument(help="path to nuklaut.org.yml")],
+    key: Annotated[str, typer.Argument(help="dotted key, e.g. facilities.auth")],
+) -> None:
+    """Print one value from an Org manifest by dotted key (for bootstrap + plugin)."""
+    print(_emit(org_get(load_org(path), key)))
+
+
+@org_app.command("show")
+def _org_show(
+    path: Annotated[Path, typer.Argument(help="path to nuklaut.org.yml")],
+) -> None:
+    """Print the validated Org manifest as normalized YAML."""
+    print(yaml.safe_dump(load_org(path).model_dump(by_alias=True), sort_keys=False), end="")
 
 
 def main() -> None:

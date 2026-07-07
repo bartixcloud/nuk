@@ -67,6 +67,22 @@ nuk db ls                     # list managed databases; flags retained ones with
 nuk db purge <name>           # drop a retained app's database + creds
 ```
 
+## Org capability manifest (`nukorg/v1`)
+
+`nuk org` reads an org's `<org>/infra/nuklaut.org.yml` — the one declarative source
+of an org's facility choices (domain, DNS/TLS, secrets, auth, runners, provisioner),
+consumed by *both* the core bootstrap (to build the platform) and the deploy plugin
+(to operate it). Unlike the other subcommands, `nuk org` runs **off** the controller
+(operator workstation, CI, the plugin), so it is exempt from the `/opt/nuklaut` host
+guard. See [`examples/nuklaut.org.yml`](examples/nuklaut.org.yml).
+
+```bash
+nuk org resolve [--repo-path .]   # print the GitHub org of a repo's origin (its <org>/infra)
+nuk org validate <path>           # validate a nukorg/v1 Org manifest; nonzero exit if invalid
+nuk org get <path> <dotted.key>   # one value for scripts, e.g. `facilities.auth` → oauth2-proxy
+nuk org show <path>               # the validated manifest as normalized YAML
+```
+
 ## Shell completion
 
 The packaged `nuk.pyz` ships tab-completion for subcommands, flags, and **live
