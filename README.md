@@ -52,6 +52,29 @@ This shape maps 1:1 to Kubernetes (the intended migration path):
 | `spec.envFrom[].secretRef`     | `envFrom: [{ secretRef: { name: ... } }]`         |
 | `spec.databases`               | per-app DB/role + Secret on a shared instance     |
 
+## Install / run
+
+nuk is a normal Python package (hatchling, entry point `nuk:main`). Run it ephemerally
+with uv — no install:
+
+```bash
+uvx --from git+https://github.com/astrojones/nuk@v0.10.0 nuk --version
+```
+
+Or install a pinned copy (what the controller does) and upgrade it in place:
+
+```bash
+uv tool install --from git+https://github.com/astrojones/nuk@v0.10.0 nuk
+nuk update                 # -> latest release; `nuk update --to <ref>` to pin/downgrade
+nuk update --check         # report installed vs latest, change nothing
+```
+
+The repo is **private**, so the `git+https://…` source needs git credentials for the
+`astrojones` org — run `gh auth setup-git` once (the controller + CI already have this).
+`nuk update` resolves the latest release via `gh` (authenticated), falling back to the
+public API. A bare `uvx nuk` would require first publishing nuk to PyPI (i.e. making it
+public); the name is currently free.
+
 ## Subcommands
 
 ```bash
@@ -65,6 +88,8 @@ nuk delete <name>             # tear down; KEEPS the database
 nuk delete <name> --purge     # also drop the app's postgres db/role + redis user (DESTROYS DATA)
 nuk db ls                     # list managed databases; flags retained ones with no deployment
 nuk db purge <name>           # drop a retained app's database + creds
+
+nuk update                    # upgrade to the latest release (or --to <ref>) via uv; --check previews
 ```
 
 ## Org capability manifest (`nukorg/v1`)
