@@ -281,6 +281,21 @@ def load(path: Path) -> Manifest:
     return manifest
 
 
+def resolve_manifest(path: Path) -> Path:
+    """Back-compat manifest lookup: fall back to the legacy `.nuklaut/<name>`.
+
+    The nuk manifest moved from `.nuklaut/deployment.yml` to a repo-root
+    `deployment.yml`. Apps not yet migrated still keep it under `.nuklaut/`, so
+    when `path` is absent, fall back to `<path.parent>/.nuklaut/<path.name>`;
+    otherwise return `path` unchanged (its own not-found error still fires).
+    """
+    if not path.exists():
+        legacy = path.parent / ".nuklaut" / path.name
+        if legacy.exists():
+            return legacy
+    return path
+
+
 def load_org(path: Path) -> Org:
     """Parse and validate a nukorg/v1 Org manifest file.
 
@@ -1017,6 +1032,7 @@ def purge_databases(app: str) -> None:
 
 def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901, PLR0912  # linear apply pipeline; splitting it would scatter the reconcile order
     """Create or update a deployment from a manifest."""
+    manifest_path = resolve_manifest(manifest_path)
     DYNAMIC.mkdir(parents=True, exist_ok=True)
     DEPLOYS.mkdir(parents=True, exist_ok=True)
     manifest = load(manifest_path)

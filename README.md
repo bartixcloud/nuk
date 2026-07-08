@@ -188,6 +188,7 @@ the GitHub Actions runner image during `bootstrap.sh`.
 
 nuk is operated by the **nuklaut** controller. Org repos deploy themselves via the
 `astrojones/.github` reusable `nuk-deploy.yml` workflow on the org self-hosted runner
-(label `nuklaut`): the manifest lives at `deployment.yml` (repo root), the image goes to
+(label `nuklaut`): the manifest lives at `deployment.yml` (repo root — `apply` falls back
+to a legacy `.nuklaut/deployment.yml` if absent), the image goes to
 `ghcr.io/<owner>/<repo>`, and per-app secrets live at `/opt/nuklaut/secrets/<repo>.env`.
  

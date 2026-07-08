@@ -935,3 +935,26 @@ def test_deployment_name_arg_completes_real_apps(command, tmp_path, monkeypatch)
     param = next(p for p in cmd.params if p.name == "name")
     completions = param.shell_complete(click.Context(cmd), "")
     assert "kolbe" in [c.value for c in completions]
+
+
+# --- manifest path back-compat (root deployment.yml -> legacy .nuklaut/) -------
+
+
+def test_resolve_manifest_prefers_root(tmp_path):
+    root = tmp_path / "deployment.yml"
+    root.write_text("x")
+    (tmp_path / ".nuklaut").mkdir()
+    (tmp_path / ".nuklaut" / "deployment.yml").write_text("y")
+    assert nuk.resolve_manifest(root) == root
+
+
+def test_resolve_manifest_falls_back_to_legacy(tmp_path):
+    legacy = tmp_path / ".nuklaut" / "deployment.yml"
+    legacy.parent.mkdir()
+    legacy.write_text("x")
+    assert nuk.resolve_manifest(tmp_path / "deployment.yml") == legacy
+
+
+def test_resolve_manifest_returns_original_when_neither_exists(tmp_path):
+    missing = tmp_path / "deployment.yml"
+    assert nuk.resolve_manifest(missing) == missing
