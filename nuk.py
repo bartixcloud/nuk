@@ -16,6 +16,7 @@ import secrets
 import shutil
 import subprocess  # noqa: S404  # all calls use fixed argv, no shell (see per-call S603/S607)
 import sys
+import urllib.error
 import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1262,6 +1263,318 @@ def _resolve_image_digest(name: str, raw: dict) -> str | None:
     return digest or None
 
 
+# --- status overview (nukview data-layer port) ---------------------------------
+# Ported from nukview's server-only data layer (buildOverview/readApp/driftFor in
+# nukview's $lib/server/nuk.ts) so the overview logic lives in ONE place; nukview
+# becomes a thin renderer over this JSON. Field names mirror nukview's types.ts
+# by key so the renderer needs no remap. Every field degrades on a missing
+# source — this never throws out of build_overview().
+
+
+def _read_yaml_safe(path: Path) -> dict | list | None:
+    """Best-effort YAML read: None on any I/O or parse error, never raises."""
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+
+
+def _git_provenance(repo_dir: Path) -> dict:
+    """Full commit sha + committer date + github web URL for `repo_dir`'s HEAD.
+
+    Returns {} when there is no checkout / no commit — the caller degrades that
+    field rather than failing.
+    """
+    try:
+        out = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["git", "-C", str(repo_dir), "log", "-1", "--format=%H%x09%cI"],  # noqa: S607  # git on PATH
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=4,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return {}
+    if not out:
+        return {}
+    full_commit, _, date = out.partition("\t")
+    return {
+        "full_commit": full_commit,
+        "last_commit": date or None,
+        "repo_url": git_origin(str(repo_dir)),
+    }
+
+
+_VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
+def _read_version(repo_dir: Path) -> str | None:
+    """Best-effort app version: pyproject.toml > package.json > `git describe`.
+
+    Mirrors nukview's readVersion — the controller checkout has no tags, so
+    version files win; `git describe` is the floor and degrades to a short sha.
+    """
+    pyproject = repo_dir / "pyproject.toml"
+    if pyproject.exists():
+        m = _VERSION_RE.search(pyproject.read_text(encoding="utf-8"))
+        if m:
+            return m.group(1)
+    package_json = repo_dir / "package.json"
+    if package_json.exists():
+        try:
+            data = json.loads(package_json.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        version = data.get("version") if isinstance(data, dict) else None
+        if isinstance(version, str):
+            return version
+    try:
+        out = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["git", "-C", str(repo_dir), "describe", "--tags", "--always", "--abbrev=7"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=4,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return out or None
+
+
+def _list_workflows(repo_dir: Path) -> list[dict]:
+    """GitHub Actions workflows in `repo_dir`, with normalised trigger events."""
+    wf_dir = repo_dir / ".github" / "workflows"
+    if not wf_dir.is_dir():
+        return []
+    out = []
+    for f in sorted(wf_dir.iterdir()):
+        if f.suffix not in {".yml", ".yaml"}:
+            continue
+        doc = _read_yaml_safe(f)
+        doc = doc if isinstance(doc, dict) else {}
+        # YAML 1.1 parses the bare key `on:` as the boolean True — PyYAML follows
+        # that resolver, so a GitHub Actions workflow's trigger key lands under
+        # `True`, not the string "on". Check both.
+        on = doc.get("on", doc.get(True))
+        if isinstance(on, str):
+            triggers = [on]
+        elif isinstance(on, list):
+            triggers = on
+        elif isinstance(on, dict):
+            triggers = list(on.keys())
+        else:
+            triggers = []
+        name = doc.get("name")
+        wf_name = name if isinstance(name, str) else f.name
+        out.append({"file": f.name, "name": wf_name, "triggers": triggers})
+    return out
+
+
+def _dynamic_routers(name: str) -> list[dict] | None:
+    """Router id/rule pairs nuk rendered into the Traefik file provider for `name`."""
+    doc = _read_yaml_safe(DYNAMIC / f"{name}.yml")
+    http = doc.get("http") if isinstance(doc, dict) else None
+    routers = http.get("routers") if isinstance(http, dict) else None
+    if not routers:
+        return None
+    return [
+        {"id": rid, "rule": (r or {}).get("rule", ""), "live": None} for rid, r in routers.items()
+    ]
+
+
+def _probe(host: str, timeout: float = 2.5) -> str | None:
+    """Black-box "is it serving?" — outbound HTTPS HEAD, never Docker.
+
+    Any HTTP answer (incl. 3xx/4xx) means Traefik routed to a live backend;
+    >=500 means the backend is down / showing the maintenance page. An
+    unreachable host (DNS, TLS, timeout, connection refused) is unknown (None),
+    not "missing" — nuk cannot tell "no DNS" from "not my problem" from here.
+    """
+    req = urllib.request.Request(f"https://{host}/", method="HEAD")  # noqa: S310  # fixed https scheme
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # fixed https scheme
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return None
+    return "missing" if status >= 500 else "enabled"  # noqa: PLR2004  # HTTP status code, not a magic number
+
+
+def _annotate_routers(routers: list[dict] | None, hosts: list[str]) -> list[dict]:
+    """Attach a best-effort live probe to each router, matched by its rule's host."""
+    live_by_host = {h: _probe(h) for h in hosts}
+    out = []
+    for r in routers or []:
+        host = next((h for h in hosts if f"`{h}`" in r.get("rule", "")), None)
+        out.append({**r, "live": live_by_host.get(host) if host else None})
+    return out
+
+
+def _drift_for(hosts: list[str], routers: list[dict] | None) -> str:
+    """Two-file consistency check between the manifest's hosts and Traefik's routers.
+
+    Does every manifest ingress host appear in a router nuk actually rendered?
+    Compares two files nuk itself wrote — never re-renders. Returns "unknown"
+    when there are no hosts to check, "drift" when the dynamic file is missing
+    or a host is absent from it, else "in-sync".
+    """
+    if not hosts:
+        return "unknown"
+    if routers is None:
+        return "drift"
+    blob = " ".join(r.get("rule", "") for r in routers)
+    return "in-sync" if all(f"`{h}`" in blob for h in hosts) else "drift"
+
+
+def _overview_ingress_fields(spec: dict) -> tuple[list[str], list[dict]]:
+    """Deduped host list + full ingress view list from a manifest's `spec.ingress`."""
+    entries = [i for i in (spec.get("ingress") or []) if isinstance(i, dict) and i.get("host")]
+    hosts = list(dict.fromkeys(i["host"] for i in entries))
+    ingress = [
+        {
+            "host": i["host"],
+            "service": i.get("service"),
+            "port": i.get("port"),
+            "path": i.get("path"),
+            "auth": i.get("auth"),
+        }
+        for i in entries
+    ]
+    return hosts, ingress
+
+
+def _overview_features(spec: dict) -> dict:
+    """`spec.databases` -> the declared-backing-services view."""
+    databases = spec.get("databases")
+    databases = databases if isinstance(databases, dict) else {}
+    pg = databases.get("postgres")
+    return {
+        "postgres": bool(pg),
+        "redis": bool(databases.get("redis")),
+        "postgresDriver": pg.get("driver") if isinstance(pg, dict) else None,
+    }
+
+
+def _overview_provenance(
+    name: str, source_raw: dict | None
+) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+    """commit/commitUrl/repoUrl/lastCommit/imageDigest, provenance.json-first.
+
+    Returns:
+        (commit, commit_url, repo_url, last_commit, image_digest) — each None
+        when its source is unavailable.
+    """
+    repo_dir = project_dir(name) / "repo"
+    provenance = read_provenance(name)
+    git_prov = _git_provenance(repo_dir)
+
+    full_commit = (provenance or {}).get("commit") or git_prov.get("full_commit")
+    commit = full_commit[:12] if full_commit else None
+
+    web = git_prov.get("repo_url")
+    commit_url = f"{web}/commit/{full_commit}" if web and full_commit else None
+    declared_repo_url = (
+        github_url(source_raw["repo"]) if source_raw and source_raw.get("repo") else None
+    )
+    return (
+        commit,
+        commit_url,
+        declared_repo_url or web,
+        git_prov.get("last_commit"),
+        (provenance or {}).get("imageDigest"),
+    )
+
+
+def _read_app_overview(name: str, *, probe_enabled: bool = False) -> dict:
+    """Build one app's Overview entry from on-disk state. Degrades; never raises."""
+    notes: list[str] = []
+    manifest_raw = _read_yaml_safe(project_dir(name) / "manifest.yml")
+    if manifest_raw is None:
+        notes.append("manifest.yml unreadable")
+    spec = manifest_raw.get("spec") if isinstance(manifest_raw, dict) else None
+    spec = spec if isinstance(spec, dict) else {}
+
+    hosts, ingress = _overview_ingress_fields(spec)
+    source_raw = spec.get("source") if isinstance(spec.get("source"), dict) else None
+    source = (
+        {"repo": source_raw.get("repo"), "branch": source_raw.get("branch")} if source_raw else None
+    )
+
+    commit, commit_url, repo_url, last_commit, image_digest = _overview_provenance(name, source_raw)
+    if not commit:
+        notes.append("no git checkout / commit unavailable")
+
+    repo_dir = project_dir(name) / "repo"
+    routers = _dynamic_routers(name)
+    routers_out = _annotate_routers(routers, hosts) if probe_enabled else (routers or [])
+
+    return {
+        "name": name,
+        "hosts": hosts,
+        "source": source,
+        "repoUrl": repo_url,
+        "commit": commit,
+        "commitUrl": commit_url,
+        "lastCommit": last_commit,
+        "version": _read_version(repo_dir),
+        "routers": routers_out,
+        "drift": _drift_for(hosts, routers),
+        "features": _overview_features(spec),
+        "workflows": _list_workflows(repo_dir),
+        "ingress": ingress,
+        "notes": notes,
+        "imageDigest": image_digest,
+    }
+
+
+def build_overview(*, probe_enabled: bool = False) -> dict:
+    """Walk DEPLOYS/*/ and build the org-wide status Overview. Degrades; never raises."""
+    errors: list[str] = []
+    names: list[str] = []
+    if DEPLOYS.exists():
+        names = sorted(p.name for p in DEPLOYS.iterdir() if p.is_dir())
+    else:
+        errors.append(f"cannot read {DEPLOYS} — is /opt/nuklaut mounted?")
+    return {
+        "apps": [_read_app_overview(n, probe_enabled=probe_enabled) for n in names],
+        "liveRoutingAvailable": False,  # Traefik api@internal integration is a later chapter
+        "nukRoot": str(ROOT),
+        "generatedAt": _iso_utc_now(),
+        "errors": errors,
+    }
+
+
+def _soll_vs_ist(overview: dict, org_file: Path | None) -> dict:
+    """`--all`: declared org hosts (soll) vs this command's local observation (ist).
+
+    Args:
+        overview: The already-built Overview dict (read for its observed app count).
+        org_file: Path to the org manifest (`nuklaut.org.yml`); required.
+
+    Returns:
+        The extra top-level keys `status --all` adds to the Overview.
+
+    Raises:
+        SystemExit: When `org_file` is not given, or is not a valid Org manifest.
+    """
+    if org_file is None:
+        sys.exit("nuk status --all: --org-file PATH is required (path to nuklaut.org.yml)")
+    org = load_org(org_file)
+    return {
+        "hosts": [h.model_dump(by_alias=True) for h in org.hosts],
+        "sollVsIst": {
+            "declaredHosts": len(org.hosts),
+            # TODO(K2.5): per-host observed via DOCKER_HOST fan-out (ssh per host,  # noqa: FIX002
+            # one nuk status per host, merge). Kapitel 1 is single-host, so
+            # "observed" is just this controller — the one this command runs on.
+            "observedHosts": 1,
+            "declaredApps": None,  # nukorg/v1 does not declare apps (yet)
+            "observedApps": len(overview["apps"]),
+        },
+    }
+
+
 # --- command layer ------------------------------------------------------------
 # Commands read typed scalars off the validated Manifest but pass its raw dict
 # (manifest.raw / manifest.raw["spec"]) to the wire-contract render functions.
@@ -1435,6 +1748,23 @@ def cmd_status(name: str) -> None:
     print(f"  repo: {source.repo or '-'}")
     print(f"  branch: {source.branch}")
     print(f"  revision: {_applied_revision(name)}")
+
+
+def cmd_status_overview(
+    *, pretty: bool, show_all: bool, org_file: Path | None, probe: bool
+) -> None:
+    """Print the org-wide status Overview as JSON (walks DEPLOYS/*/; see build_overview).
+
+    Args:
+        pretty: Indent the JSON for human scanning; compact (single-line) otherwise.
+        show_all: Also emit the `--all` soll-vs-ist block (needs `org_file`).
+        org_file: Path to `nuklaut.org.yml`, required when `show_all` is set.
+        probe: Best-effort outbound HTTPS probe per ingress host (off by default).
+    """
+    overview = build_overview(probe_enabled=probe)
+    if show_all:
+        overview.update(_soll_vs_ist(overview, org_file))
+    print(json.dumps(overview, indent=2 if pretty else None))
 
 
 def cmd_logs(name: str) -> None:
@@ -1634,11 +1964,42 @@ def _apply(
 @app.command("status")
 def _status(
     name: Annotated[
-        str, typer.Argument(help="deployment name", autocompletion=complete_deployment_name)
-    ],
+        str | None,
+        typer.Argument(
+            help="deployment name; omit for the org-wide overview",
+            autocompletion=complete_deployment_name,
+        ),
+    ] = None,
+    pretty: Annotated[
+        bool,
+        typer.Option(
+            "--json", help="pretty-print the org-wide overview (always JSON either way)"
+        ),
+    ] = False,
+    show_all: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="org-wide: also compare against the declared org manifest (needs --org-file)",
+        ),
+    ] = False,
+    org_file: Annotated[
+        Path | None,
+        typer.Option("--org-file", help="path to nuklaut.org.yml (required with --all)"),
+    ] = None,
+    probe: Annotated[
+        bool,
+        typer.Option(
+            "--probe",
+            help="org-wide: best-effort outbound HTTPS probe per ingress host (off by default)",
+        ),
+    ] = False,
 ) -> None:
-    """Show one app's health, ingress, databases (redacted URLs), and source."""
-    cmd_status(name)
+    """Show one app's health/ingress/databases/source (NAME), or the org-wide overview as JSON."""
+    if name is not None:
+        cmd_status(name)
+        return
+    cmd_status_overview(pretty=pretty, show_all=show_all, org_file=org_file, probe=probe)
 
 
 @app.command("logs")
