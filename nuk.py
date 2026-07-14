@@ -17,6 +17,7 @@ import shutil
 import subprocess  # noqa: S404  # all calls use fixed argv, no shell (see per-call S603/S607)
 import sys
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal, cast
 from urllib.parse import urlparse
@@ -1146,6 +1147,121 @@ def purge_databases(app: str) -> None:
     (SECRETS / f"{app}-db.env").unlink(missing_ok=True)
 
 
+# --- provenance-on-apply -------------------------------------------------------
+# `nuk apply` stamps DEPLOYS/<name>/provenance.json with the exact commit/image
+# it deployed, so `status` has a trustworthy source even for rsync-mirrored
+# (.git-less) workflow deploys. Best-effort by design: see the try/except around
+# its only call site in cmd_apply.
+
+
+def _iso_utc_now() -> str:
+    """Current time as an ISO-8601 UTC timestamp with a `Z` suffix."""
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _provenance_path(name: str) -> Path:
+    """On-disk path of an app's provenance record."""
+    return project_dir(name) / "provenance.json"
+
+
+def read_provenance(name: str) -> dict | None:
+    """Read an app's provenance.json, or None if absent/unreadable/malformed."""
+    path = _provenance_path(name)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_provenance(
+    name: str, *, repo: str | None, branch: str, commit: str | None, image_digest: str | None
+) -> None:
+    """Write DEPLOYS/<name>/provenance.json — the trustworthy source `status` prefers.
+
+    Raises on write failure; the caller (`cmd_apply`) treats this as best-effort
+    and must not fail the deploy over it.
+
+    Args:
+        name: The deployment name.
+        repo: The declared source repo, if any.
+        branch: The declared source branch.
+        commit: The full deployed commit sha, if resolvable.
+        image_digest: The deployed image's digest, if resolvable.
+    """
+    payload = {
+        "repo": repo,
+        "branch": branch,
+        "commit": commit,
+        "imageDigest": image_digest,
+        "appliedAt": _iso_utc_now(),
+    }
+    _provenance_path(name).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _full_commit_sha(repo_dir: Path) -> str | None:
+    """Full HEAD sha of `repo_dir`'s checkout, or None if unavailable."""
+    try:
+        out = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],  # noqa: S607  # git on PATH
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=4,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return out or None
+
+
+def _parse_compose_images_json(text: str) -> list[dict]:
+    """Parse `docker compose images --format json` output (one array or JSON-lines)."""
+    text = text.strip()
+    if not text:
+        return []
+    try:
+        if text.startswith("["):
+            data = json.loads(text)
+            return data if isinstance(data, list) else []
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    except (ValueError, json.JSONDecodeError):
+        return []
+
+
+def _resolve_image_digest(name: str, raw: dict) -> str | None:
+    """Best-effort digest of the app's first compose image, or None if unresolvable."""
+    try:
+        proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            [*compose_args(name, raw), "images", "--format", "json"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    rows = _parse_compose_images_json(proc.stdout)
+    if not rows:
+        return None
+    repository = rows[0].get("Repository")
+    if not repository:
+        return None
+    tag = rows[0].get("Tag") or "latest"
+    try:
+        digest = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["docker", "inspect", "--format", "{{index .RepoDigests 0}}", f"{repository}:{tag}"],  # noqa: S607  # docker on PATH
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return digest or None
+
+
 # --- command layer ------------------------------------------------------------
 # Commands read typed scalars off the validated Manifest but pass its raw dict
 # (manifest.raw / manifest.raw["spec"]) to the wire-contract render functions.
@@ -1208,6 +1324,19 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
     # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
     # whose image id changed.
     sh(*compose_args(name, raw), "up", "-d")
+    # Provenance is best-effort: `status` prefers it over the live repo/ checkout
+    # (trustworthy even for rsync-mirrored, .git-less workflow deploys), but a
+    # write failure here must never fail an otherwise-successful apply.
+    try:
+        write_provenance(
+            name,
+            repo=source.repo,
+            branch=source.branch,
+            commit=_full_commit_sha(repo) if (repo / ".git").exists() else None,
+            image_digest=_resolve_image_digest(name, raw),
+        )
+    except OSError as e:
+        print(f"{name}: provenance not recorded ({e})")
 
 
 def cmd_get() -> None:
