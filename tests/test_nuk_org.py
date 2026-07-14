@@ -11,23 +11,82 @@ import nuk
 import pytest
 import yaml
 
+# A valid multi-host org: one edge entry-point, a bare-metal hypervisor, and a
+# libvirt VM on it. Exercises every topology invariant at once.
 ORG_DOC = {
     "apiVersion": "nukorg/v1",
     "kind": "Org",
-    "metadata": {"name": "ekd-akd"},
-    "domain": "test.a-kd.net",
-    "acmeEmail": "ops@a-kd.net",
-    "controller": {"hostname": "akd-controller", "provisioner": "manual", "deployMode": "local"},
-    "facilities": {
-        "dns": "manual",
-        "tls": "http01",
-        "secrets": "generate",
-        "auth": "authentik",
-        "runners": "persistent",
-        "data": {"postgres": True, "redis": True},
+    "metadata": {"name": "astrojones"},
+    "domains": ["astrojones.guru", "bitcoinalchemist.com"],
+    "platformDomain": "astrojones.guru",
+    "acmeEmail": "admin@astrojones.guru",
+    "network": {
+        "cidr": "10.10.0.0/16",
+        "cloudSubnet": "10.10.1.0/24",
+        "vswitchSubnet": "10.10.2.0/24",
+        "vswitchVlan": 4001,
     },
-    "overlays": ["strongswan-vpn"],
-    "pins": {"core": "astrojones/nuklaut@v1.5.0", "nuk": "astrojones/nuk@v1.2.0"},
+    "hosts": [
+        {
+            "name": "hcbase",
+            "provider": "hcloud",
+            "type": "cx23",
+            "role": "edge",
+            "privateIp": "10.10.1.2",
+        },
+        {
+            "name": "nuroot-metal",
+            "provider": "manual",
+            "ip": "1.2.3.4",
+            "role": "hypervisor",
+            "privateIp": "10.10.2.2",
+        },
+        {
+            "name": "nuroot-db",
+            "provider": "libvirt",
+            "metal": "nuroot-metal",
+            "role": "data",
+            "privateIp": "10.10.2.3",
+        },
+    ],
+    "facilities": {
+        "dns": "wildcard",
+        "tls": "dns01",
+        "dnsProvider": "hetzner",
+        "secrets": "sops",
+        "auth": "authentik",
+        "runners": "ephemeral",
+    },
+    "mesh": "tailscale",
+    "overlays": ["host-tooling-claude"],
+}
+
+# The single-host all-in-one shape (Kapitel 1): no private network, mesh may be none.
+ONE_HOST_DOC = {
+    "apiVersion": "nukorg/v1",
+    "kind": "Org",
+    "metadata": {"name": "astrojones"},
+    "domains": ["astrojones.guru", "bitcoinalchemist.com"],
+    "platformDomain": "astrojones.guru",
+    "acmeEmail": "admin@astrojones.guru",
+    "hosts": [
+        {
+            "name": "hcbase",
+            "provider": "hcloud",
+            "type": "cx23",
+            "role": "all-in-one",
+            "privateIp": "10.10.1.2",
+        },
+    ],
+    "facilities": {
+        "dns": "wildcard",
+        "tls": "dns01",
+        "dnsProvider": "hetzner",
+        "secrets": "sops",
+        "auth": "authentik",
+        "runners": "ephemeral",
+    },
+    "mesh": "none",
 }
 
 
@@ -36,18 +95,31 @@ def _facilities(**over: object) -> dict:
     return {**ORG_DOC, "facilities": {**ORG_DOC["facilities"], **over}}
 
 
+def _hosts(hosts: list[dict], **over: object) -> dict:
+    """ORG_DOC with a replaced hosts[] (and optional top-level overrides)."""
+    return {**ORG_DOC, "hosts": hosts, **over}
+
+
 # --- schema ------------------------------------------------------------------
 
 
 def test_org_parses_full_manifest():
     org = nuk.Org.model_validate(ORG_DOC)
-    assert org.metadata.name == "ekd-akd"
-    assert org.domain == "test.a-kd.net"
-    assert org.acme_email == "ops@a-kd.net"
-    assert org.controller.provisioner == "manual"
-    assert org.controller.deploy_mode == "local"
+    assert org.metadata.name == "astrojones"
+    assert org.domains == ["astrojones.guru", "bitcoinalchemist.com"]
+    assert org.platform_domain == "astrojones.guru"
+    assert org.acme_email == "admin@astrojones.guru"
+    assert org.network.vswitch_vlan == 4001
+    assert [h.name for h in org.hosts] == ["hcbase", "nuroot-metal", "nuroot-db"]
     assert org.facilities.auth == "authentik"
-    assert org.facilities.data.postgres is True
+    assert org.mesh == "tailscale"
+
+
+def test_org_one_host_all_in_one_no_network():
+    org = nuk.Org.model_validate(ONE_HOST_DOC)
+    assert org.network is None
+    assert org.mesh == "none"
+    assert org.hosts[0].role == "all-in-one"
 
 
 def test_org_rejects_unknown_enum():
@@ -55,10 +127,13 @@ def test_org_rejects_unknown_enum():
         nuk.Org.model_validate(_facilities(auth="ldap"))
 
 
-def test_org_rejects_bad_provisioner():
-    doc = {**ORG_DOC, "controller": {**ORG_DOC["controller"], "provisioner": "pulumi"}}
+def test_org_rejects_bad_provider():
+    bad = [{**ORG_DOC["hosts"][0], "provider": "pulumi"}]
     with pytest.raises(nuk.ValidationError):
-        nuk.Org.model_validate(doc)
+        nuk.Org.model_validate(_hosts(bad, mesh="none"))
+
+
+# --- facilities coupling -----------------------------------------------------
 
 
 def test_org_wildcard_requires_dns01():
@@ -68,12 +143,118 @@ def test_org_wildcard_requires_dns01():
 
 def test_org_dns01_requires_provider():
     with pytest.raises(nuk.ValidationError):
-        nuk.Org.model_validate(_facilities(dns="wildcard", tls="dns01"))
+        nuk.Org.model_validate(_facilities(dns="wildcard", tls="dns01", dnsProvider=None))
 
 
-def test_org_dns01_with_provider_ok():
-    org = nuk.Org.model_validate(_facilities(dns="wildcard", tls="dns01", dnsProvider="hetzner"))
-    assert org.facilities.dns_provider == "hetzner"
+def test_org_manual_requires_http01():
+    with pytest.raises(nuk.ValidationError):
+        nuk.Org.model_validate(_facilities(dns="manual", tls="dns01", dnsProvider="hetzner"))
+
+
+def test_org_manual_http01_ok():
+    org = nuk.Org.model_validate(_facilities(dns="manual", tls="http01", dnsProvider=None))
+    assert org.facilities.dns == "manual"
+
+
+# --- topology invariants -----------------------------------------------------
+
+
+def test_org_platform_domain_must_be_in_domains():
+    with pytest.raises(nuk.ValidationError):
+        nuk.Org.model_validate({**ORG_DOC, "platformDomain": "not-managed.example"})
+
+
+def test_org_requires_exactly_one_entry_point():
+    two_edges = [
+        {"name": "a", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
+        {"name": "b", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.3"},
+    ]
+    with pytest.raises(nuk.ValidationError):
+        nuk.Org.model_validate(_hosts(two_edges))
+
+
+def test_org_rejects_zero_entry_points():
+    no_edge = [{"name": "w", "provider": "hcloud", "role": "worker", "privateIp": "10.10.1.2"}]
+    with pytest.raises(nuk.ValidationError):
+        nuk.Org.model_validate(_hosts(no_edge, mesh="none"))
+
+
+def test_org_mesh_none_only_single_host():
+    with pytest.raises(nuk.ValidationError):
+        nuk.Org.model_validate({**ORG_DOC, "mesh": "none"})
+
+
+def test_org_libvirt_requires_metal():
+    hosts = [
+        {"name": "hcbase", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
+        {"name": "vm", "provider": "libvirt", "role": "worker", "privateIp": "10.10.2.3"},
+    ]
+    with pytest.raises(nuk.ValidationError):
+        nuk.Org.model_validate(_hosts(hosts))
+
+
+def test_org_libvirt_metal_must_be_hypervisor():
+    hosts = [
+        {"name": "hcbase", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
+        {
+            "name": "vm",
+            "provider": "libvirt",
+            "metal": "hcbase",
+            "role": "worker",
+            "privateIp": "10.10.2.3",
+        },
+    ]
+    with pytest.raises(nuk.ValidationError):
+        nuk.Org.model_validate(_hosts(hosts))
+
+
+def test_org_private_ip_must_be_unique():
+    dup = [
+        {"name": "a", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
+        {"name": "b", "provider": "hcloud", "role": "worker", "privateIp": "10.10.1.2"},
+    ]
+    with pytest.raises(nuk.ValidationError):
+        nuk.Org.model_validate(_hosts(dup))
+
+
+def test_org_private_ip_must_match_subnet():
+    # hcloud host addressed out of the cloudSubnet (into the vswitchSubnet) → reject.
+    wrong = [
+        {"name": "hcbase", "provider": "hcloud", "role": "edge", "privateIp": "10.10.2.9"},
+        {
+            "name": "nuroot-metal",
+            "provider": "manual",
+            "role": "hypervisor",
+            "privateIp": "10.10.2.2",
+        },
+    ]
+    with pytest.raises(nuk.ValidationError):
+        nuk.Org.model_validate(_hosts(wrong))
+
+
+# --- ingress-host coverage ---------------------------------------------------
+
+
+def _manifest(host: str) -> nuk.Manifest:
+    return nuk.Manifest.model_validate(
+        {
+            "apiVersion": "nuk/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "app"},
+            "spec": {"ingress": [{"host": host, "service": "web", "port": 80}]},
+        }
+    )
+
+
+def test_validate_ingress_hosts_accepts_managed_domain():
+    org = nuk.Org.model_validate(ORG_DOC)
+    nuk.validate_ingress_hosts(org, _manifest("cognee.bitcoinalchemist.com"))  # no raise
+
+
+def test_validate_ingress_hosts_rejects_foreign_domain():
+    org = nuk.Org.model_validate(ORG_DOC)
+    with pytest.raises(SystemExit):
+        nuk.validate_ingress_hosts(org, _manifest("cognee.example.org"))
 
 
 # --- loader / accessor -------------------------------------------------------
@@ -82,7 +263,7 @@ def test_org_dns01_with_provider_ok():
 def test_load_org_roundtrip(tmp_path):
     p = tmp_path / "nuklaut.org.yml"
     p.write_text(yaml.safe_dump(ORG_DOC), encoding="utf-8")
-    assert nuk.load_org(p).metadata.name == "ekd-akd"
+    assert nuk.load_org(p).metadata.name == "astrojones"
 
 
 def test_load_org_invalid_exits(tmp_path):
@@ -95,8 +276,8 @@ def test_load_org_invalid_exits(tmp_path):
 def test_org_get_dotted_by_alias():
     org = nuk.Org.model_validate(ORG_DOC)
     assert nuk.org_get(org, "facilities.auth") == "authentik"
-    assert nuk.org_get(org, "controller.deployMode") == "local"
-    assert nuk.org_get(org, "metadata.name") == "ekd-akd"
+    assert nuk.org_get(org, "platformDomain") == "astrojones.guru"
+    assert nuk.org_get(org, "metadata.name") == "astrojones"
 
 
 def test_org_get_missing_key_exits():

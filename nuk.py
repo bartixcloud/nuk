@@ -8,6 +8,7 @@ compose project, optional ingress hosts, and env files. State lives entirely in
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -218,24 +219,110 @@ class Facilities(BaseModel):
         if self.tls == "dns01" and not self.dns_provider:
             msg = "facilities.tls=dns01 requires facilities.dnsProvider"
             raise ValueError(msg)
+        if self.dns == "manual" and self.tls != "http01":
+            # Manual DNS cannot answer the DNS-01 challenge automatically; the only
+            # operated pairing for manual records is the HTTP-01 challenge.
+            msg = "facilities.dns=manual requires facilities.tls=http01"
+            raise ValueError(msg)
         return self
 
 
-class Controller(BaseModel):
-    """`controller` — how this org's controller host is provisioned + reached."""
+class Network(BaseModel):
+    """`network` — the private-network plan (Hetzner Cloud-Network + vSwitch).
+
+    Declared from the start but only wired up from the multi-host chapter on; a
+    single-host org may omit it entirely (then no subnet checks run).
+    """
 
     model_config = ConfigDict(populate_by_name=True)
 
-    hostname: str
-    provisioner: Literal["terraform", "manual", "ansible"]
-    deploy_mode: Literal["ssh", "local"] = Field(default="ssh", alias="deployMode")
+    cidr: str
+    cloud_subnet: str = Field(alias="cloudSubnet")
+    vswitch_subnet: str = Field(alias="vswitchSubnet")
+    vswitch_vlan: int = Field(alias="vswitchVlan")
+    vswitch_name: str | None = Field(default=None, alias="vswitchName")
 
 
-class Pins(BaseModel):
-    """`pins` — pinned generic-core + nuk versions this org runs (owner/repo@ref)."""
+class Host(BaseModel):
+    """`hosts[]` — one machine or VM the org runs, addressed by its private IP."""
 
-    core: str
-    nuk: str | None = None
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str
+    provider: Literal["hcloud", "libvirt", "metal", "manual"]
+    role: Literal["edge", "data", "worker", "hypervisor", "all-in-one"]
+    private_ip: str = Field(alias="privateIp")
+    type: str | None = None  # hcloud server type, e.g. cx23
+    ip: str | None = None  # public IP for manual/metal hosts
+    metal: str | None = None  # libvirt: the hypervisor host it runs on
+    vcpu: int | None = None
+    memory: str | None = None
+
+
+def _ip_in_cidr(ip: str, cidr: str) -> bool:
+    """Return whether `ip` falls inside the `cidr` block (False if either won't parse)."""
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return False
+
+
+_ENTRY_ROLES = frozenset({"edge", "all-in-one"})
+
+
+def _check_domains(platform_domain: str, domains: list[str]) -> None:
+    """Raise unless the platform domain is one of the managed domains."""
+    if platform_domain not in domains:
+        msg = f"platformDomain {platform_domain!r} must be one of domains {domains}"
+        raise ValueError(msg)
+
+
+def _check_unique(hosts: list[Host]) -> None:
+    """Raise if any host name or private IP is duplicated."""
+    names = [h.name for h in hosts]
+    if len(names) != len(set(names)):
+        msg = "hosts[].name must be unique"
+        raise ValueError(msg)
+    ips = [h.private_ip for h in hosts]
+    if len(ips) != len(set(ips)):
+        msg = "hosts[].privateIp must be unique"
+        raise ValueError(msg)
+
+
+def _check_entry_and_mesh(hosts: list[Host], mesh: str) -> None:
+    """Raise unless there is exactly one entry-point host and mesh fits the count."""
+    entry = [h for h in hosts if h.role in _ENTRY_ROLES]
+    if len(entry) != 1:
+        msg = "exactly one host must have role 'edge' or 'all-in-one'"
+        raise ValueError(msg)
+    if mesh == "none" and len(hosts) != 1:
+        msg = "mesh: none is only valid with a single host"
+        raise ValueError(msg)
+
+
+def _check_libvirt(hosts: list[Host]) -> None:
+    """Raise unless every libvirt host names an existing hypervisor host in `metal`."""
+    hypervisors = {h.name for h in hosts if h.role == "hypervisor"}
+    for h in hosts:
+        if h.provider != "libvirt":
+            continue
+        if not h.metal:
+            msg = f"host {h.name}: provider libvirt requires 'metal' (its hypervisor host)"
+            raise ValueError(msg)
+        if h.metal not in hypervisors:
+            msg = f"host {h.name}: metal {h.metal!r} is not a hypervisor host in this org"
+            raise ValueError(msg)
+
+
+def _check_subnets(hosts: list[Host], network: Network) -> None:
+    """Raise unless every host's private IP sits in its provider's declared subnet."""
+    for h in hosts:
+        cloud = h.provider == "hcloud"
+        subnet = network.cloud_subnet if cloud else network.vswitch_subnet
+        if not _ip_in_cidr(h.private_ip, subnet):
+            field = "cloudSubnet" if cloud else "vswitchSubnet"
+            msg = f"host {h.name}: privateIp {h.private_ip} is not in {field} {subnet}"
+            raise ValueError(msg)
 
 
 class Org(BaseModel):
@@ -246,12 +333,46 @@ class Org(BaseModel):
     api_version: Literal["nukorg/v1"] = Field(alias="apiVersion")
     kind: Literal["Org"]
     metadata: Metadata
-    domain: str
+    domains: list[str]
+    platform_domain: str = Field(alias="platformDomain")
     acme_email: str = Field(alias="acmeEmail")
-    controller: Controller
+    network: Network | None = None
+    hosts: list[Host]
     facilities: Facilities
+    mesh: Literal["tailscale", "none"] = "none"
     overlays: list[str] = []
-    pins: Pins
+
+    @model_validator(mode="after")
+    def _check_topology(self) -> Org:
+        """Enforce the host-topology invariants the platform relies on.
+
+        Raises:
+            ValueError: On any violated invariant (unique names/IPs, exactly one
+                entry-point host, mesh/host-count coupling, libvirt→hypervisor,
+                platformDomain membership, and private-IP subnet placement).
+        """
+        _check_domains(self.platform_domain, self.domains)
+        _check_unique(self.hosts)
+        _check_entry_and_mesh(self.hosts, self.mesh)
+        _check_libvirt(self.hosts)
+        if self.network is not None:
+            _check_subnets(self.hosts, self.network)
+        return self
+
+
+def validate_ingress_hosts(org: Org, manifest: Manifest) -> None:
+    """Assert every ingress host in `manifest` ends on one of the org's domains.
+
+    Args:
+        org: The validated Org (its `domains` are the managed set).
+        manifest: A deployment manifest whose ingress hosts must be covered.
+
+    Raises:
+        SystemExit: If any ingress host is not under a managed domain.
+    """
+    for ing in manifest.spec.ingress:
+        if not any(ing.host == d or ing.host.endswith(f".{d}") for d in org.domains):
+            sys.exit(f"nuk: ingress host {ing.host!r} is not under a managed domain {org.domains}")
 
 
 def sh(*cmd: str, cwd: Path | None = None) -> None:
@@ -1261,9 +1382,7 @@ def _known_deployments() -> list[str]:
     """
     if not DEPLOYS.exists():
         return []
-    return sorted(
-        p.name for p in DEPLOYS.iterdir() if p.is_dir() and (p / "manifest.yml").exists()
-    )
+    return sorted(p.name for p in DEPLOYS.iterdir() if p.is_dir() and (p / "manifest.yml").exists())
 
 
 def complete_deployment_name(incomplete: str) -> list[str]:
@@ -1443,9 +1562,7 @@ def _db_ls() -> None:
 
 @db_app.command("purge")
 def _db_purge(
-    name: Annotated[
-        str, typer.Argument(help="deployment name", autocompletion=complete_db_name)
-    ],
+    name: Annotated[str, typer.Argument(help="deployment name", autocompletion=complete_db_name)],
 ) -> None:
     """Drop a retained app's database + creds."""
     cmd_db_purge(name)
