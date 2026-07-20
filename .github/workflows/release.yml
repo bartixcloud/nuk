@@ -30,7 +30,7 @@ jobs:
   build:
     needs: release
     if: ${{ needs.release.outputs.released == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, nuklaut]
     permissions:
       contents: write
       actions: write   # dispatch deploy.yml
