@@ -100,13 +100,32 @@ class Ingress(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     host: str
-    service: str
-    port: int
+    service: str | None = None
+    port: int | None = None
+    # "<ip>:<port>" backend outside this host's docker "edge" network — e.g. a
+    # libvirt VM on a separate hypervisor host, reached over the private
+    # vswitch/cloud-network. Mutually exclusive with service/port.
+    address: str | None = None
     path: str | None = None
     strip_prefix: bool = Field(default=False, alias="stripPrefix")
     priority: int | None = None
     www: bool = False
     auth: str | None = None
+
+    @model_validator(mode="after")
+    def _check_backend(self) -> Ingress:
+        """Exactly one backend: `address` (remote) or `service`+`port` (local).
+
+        Raises:
+            ValueError: If both or neither backend forms are given.
+        """
+        if self.address and (self.service is not None or self.port is not None):
+            msg = "ingress: set either `address` or `service`+`port`, not both"
+            raise ValueError(msg)
+        if not self.address and (self.service is None or self.port is None):
+            msg = "ingress: `service` and `port` are required unless `address` is set"
+            raise ValueError(msg)
+        return self
 
 
 class EnvFrom(BaseModel):
@@ -708,7 +727,10 @@ def _rule(ing: dict) -> str:
 def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901, PLR0912  # one router-build loop; clean extraction would obscure the per-field ordering
     """Render the Traefik file-provider doc, or None to remove the dynamic file.
 
-    Each entry needs host/service/port. Optional, all backward-compatible:
+    Each entry needs host + (service/port, a local docker "edge"-network
+    container) or (address, a remote "<ip>:<port>" backend — e.g. a libvirt VM
+    on another host, reached over the private vswitch/cloud-network). Optional,
+    all backward-compatible:
       path        adds PathPrefix(`<path>`) to the router rule
       stripPrefix strip `path` before proxying (needs path)
       priority    explicit router priority (Traefik else ranks by rule length)
@@ -757,11 +779,13 @@ def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901,
         if "priority" in ing:
             router["priority"] = ing["priority"]
         routers[rid] = router
-        services[rid] = {
-            "loadBalancer": {
-                "servers": [{"url": f"http://{name}-{ing['service']}-1:{ing['port']}"}]
-            }
-        }
+        # `address` (remote host:port) bypasses the local edge-network container
+        # naming convention entirely — used for backends on another host (e.g. a
+        # libvirt VM reached over the private vswitch/cloud-network).
+        backend = (
+            ing["address"] if ing.get("address") else f"{name}-{ing['service']}-1:{ing['port']}"
+        )
+        services[rid] = {"loadBalancer": {"servers": [{"url": f"http://{backend}"}]}}
         if ing.get("www"):
             host = ing["host"]
             wid, rdid = f"{rid}-www", f"{rid}-www-redirect"

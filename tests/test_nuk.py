@@ -161,6 +161,30 @@ def test_explicit_priority():
     assert doc["http"]["routers"]["a-0"]["priority"] == 100
 
 
+# --- address: remote backend (e.g. a libvirt VM on another host) --------------
+
+
+def test_address_backend_bypasses_local_container_naming():
+    doc = nuk.build_ingress(
+        "hello", [{"host": "hello.astrojones.guru", "address": "10.10.2.4:8080"}]
+    )
+    servers = doc["http"]["services"]["hello-0"]["loadBalancer"]["servers"]
+    assert servers == [{"url": "http://10.10.2.4:8080"}]
+
+
+def test_ingress_model_requires_address_xor_service_port():
+    # local backend: service + port, no address — fine.
+    nuk.Ingress(host="h", service="s", port=1)
+    # remote backend: address only — fine.
+    nuk.Ingress(host="h", address="10.10.2.4:8080")
+    # neither given.
+    with pytest.raises(ValueError, match=r"service.*port.*required"):
+        nuk.Ingress(host="h")
+    # both given — ambiguous, rejected.
+    with pytest.raises(ValueError, match="set either"):
+        nuk.Ingress(host="h", service="s", port=1, address="10.10.2.4:8080")
+
+
 # --- www redirect (opt-in, apex domains) --------------------------------------
 
 
