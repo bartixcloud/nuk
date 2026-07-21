@@ -223,7 +223,7 @@ class Facilities(BaseModel):
     dns_provider: str | None = Field(default=None, alias="dnsProvider")
     secrets: Literal["sops", "generate", "ci-inject"]
     auth: Literal["basic", "oauth2-proxy", "authentik"]
-    runners: Literal["ephemeral", "persistent"]
+    runners: Literal["none", "ephemeral", "persistent"]
     data: OrgData = OrgData()
 
     @model_validator(mode="after")
