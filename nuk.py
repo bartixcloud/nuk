@@ -40,7 +40,13 @@ __version__ = "0.14.2"  # bumped on release by .github/workflows/release.yml
 ROOT = Path("/opt/nuklaut")
 DEPLOYS = ROOT / "deployments"
 DYNAMIC = ROOT / "traefik" / "dynamic"
+# Worker-terminated routers are staged here (inert on a worker — no local Traefik)
+# for the orchestrator to deliver onto the EDGE's dynamic dir. See cmd_apply / finding 6.
+EDGE_DYNAMIC = ROOT / "traefik" / "edge-dynamic"
 SECRETS = ROOT / "secrets"
+# This host's identity, written world-readable (no secrets) by cloud-init. Absent on a
+# legacy single-host controller -> read_self() defaults to an entry role (byte-identical).
+HOST_ENV = Path("/etc/nuklaut/host.env")
 
 # Shared data stack — owned, reproducible source vendored at
 # files/docker-compose.data.yml (bring it up once on the controller). Apps reach
@@ -619,12 +625,13 @@ def resolve_env_from(spec: dict) -> list[str]:
     return refs
 
 
-def build_override(
+def build_override(  # noqa: C901, PLR0913, PLR0917  # frozen wire-contract API; one render pass
     name: str,  # noqa: ARG001  # kept for signature stability (frozen wire-contract API / tests)
     ingress: list[dict],
     db_env: str | None = None,
     env_from: list[str] | None = None,
     db_services: list[str] | None = None,
+    publish_ip: str | None = None,
 ) -> dict | None:
     """Compose override wiring services to the shared edge/data networks + secrets.
 
@@ -653,6 +660,10 @@ def build_override(
         env_from: Resolved `spec.envFrom` secret-file paths.
         db_services: Services that should receive the db creds + data network;
             None means "the ingress services" (the legacy default).
+        publish_ip: When set (a worker with no local Traefik), ingress services
+            PUBLISH their port on this private IP (so the edge Traefik reaches
+            them over the cloud-network) instead of joining the local `edge`
+            network. None (the default) => unchanged, edge-network behavior.
 
     Returns:
         The override doc, or None when no service needs any wiring.
@@ -663,35 +674,50 @@ def build_override(
     db_set = set(db_targets) if db_env else set()
     # Ingress order first, then any db-only (non-ingress) services, deduped.
     ordered = list(dict.fromkeys([*ingress_services, *db_targets]))
+    # Worker edge-termination: collect the private-IP port bindings per service.
+    # Bind on publish_ip (not 0.0.0.0) so the app stays reachable ONLY via the edge.
+    publish_ports: dict[str, list[str]] = {}
+    if publish_ip:
+        for ing in ingress:
+            svc, port = ing.get("service"), ing.get("port")
+            if svc and port is not None:
+                mapping = f"{publish_ip}:{port}:{port}"
+                publish_ports.setdefault(svc, [])
+                if mapping not in publish_ports[svc]:
+                    publish_ports[svc].append(mapping)
     services: dict = {}
     for svc_name in ordered:
         is_ingress = svc_name in ingress_services
         is_db = svc_name in db_set
-        nets = (["edge"] if is_ingress else []) + (["data"] if is_db else [])
+        # Publishing on a private IP replaces the (inert) local `edge` join.
+        nets = (["edge"] if is_ingress and not publish_ip else []) + (["data"] if is_db else [])
         env_files = [*env_from, *([db_env] if is_db else [])]
         svc: dict = {"networks": nets}
+        if publish_ip and svc_name in publish_ports:
+            svc["ports"] = publish_ports[svc_name]
         if env_files:
             svc["env_file"] = env_files
         services[svc_name] = svc
     if not services:
         return None
     networks: dict = {}
-    if any(s in ingress_services for s in services):
+    if not publish_ip and any(s in ingress_services for s in services):
         networks["edge"] = {"external": True}
     if any(s in db_set for s in services):
         networks["data"] = {"external": True}
     return {"services": services, "networks": networks}
 
 
-def write_override(
+def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override's frozen API
     name: str,
     ingress: list[dict],
     db_env: str | None = None,
     env_from: list[str] | None = None,
     db_services: list[str] | None = None,
+    publish_ip: str | None = None,
 ) -> None:
     """Render and write `compose.override.yml` for an app (no-op when empty)."""
-    doc = build_override(name, ingress, db_env, env_from, db_services)
+    doc = build_override(name, ingress, db_env, env_from, db_services, publish_ip)
     if doc is None:
         return
     (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc))
@@ -852,6 +878,66 @@ def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901,
 def write_ingress(name: str, ingress: list[dict]) -> None:
     """Render and write the Traefik dynamic file for an app (removes it if empty)."""
     target = DYNAMIC / f"{name}.yml"
+    doc = build_ingress(name, ingress)
+    if doc is None:
+        target.unlink(missing_ok=True)
+        return
+    target.write_text(yaml.safe_dump(doc))
+
+
+def read_self() -> tuple[str, str | None]:
+    """Return (role, private_ip) for THIS host from /etc/nuklaut/host.env.
+
+    cloud-init writes ROLE + PRIVATE_IP there (world-readable, no secrets). When
+    the file is absent or unparseable — a legacy single-host controller — this
+    returns ("all-in-one", None): an entry role, so apply keeps writing ingress
+    locally and every existing render stays byte-identical.
+    """
+    role, private_ip = "all-in-one", None
+    try:
+        for raw_line in HOST_ENV.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if line.startswith("ROLE="):
+                role = line[len("ROLE=") :].strip() or role
+            elif line.startswith("PRIVATE_IP="):
+                private_ip = line[len("PRIVATE_IP=") :].strip() or None
+    except OSError:
+        pass
+    return role, private_ip
+
+
+def rewrite_ingress_for_edge(ingress: list[dict], self_ip: str) -> list[dict]:
+    """Rewrite local-backend ingress entries to the remote `address` form.
+
+    A non-edge host (worker) has no local Traefik, so its router must live on the
+    edge with an `address: <self_ip>:<port>` backend — the port build_override
+    publishes on the private IP. Entries that already carry `address` (a remote
+    backend, e.g. a libvirt VM) pass through unchanged. `auth`/`path`/`stripPrefix`/
+    `priority`/`www` are preserved verbatim so the edge router gates identically.
+    """
+    out: list[dict] = []
+    for ing in ingress:
+        if ing.get("address") or not ing.get("service"):
+            out.append(ing)
+            continue
+        rewritten = {k: v for k, v in ing.items() if k not in {"service", "port"}}
+        rewritten["address"] = f"{self_ip}:{ing['port']}"
+        out.append(rewritten)
+    return out
+
+
+def write_edge_ingress(name: str, ingress: list[dict]) -> None:
+    """Stage an app's Traefik router for delivery to the edge (worker apps).
+
+    Mirrors write_ingress but targets EDGE_DYNAMIC — a staging dir the orchestrator
+    (converge.sh) rsyncs into the edge's watched dynamic/ dir. The `worker-` prefix
+    lets the delivery scope its --delete to worker routers only, so edge-native
+    routers (Authentik, maintenance) are never touched. Flat file in the watched
+    dir, so it loads exactly like the edge's own routers — no subdir recursion
+    assumption. Inert on the worker itself (no local Traefik). Removed when empty.
+    """
+    EDGE_DYNAMIC.mkdir(parents=True, exist_ok=True)
+    target = EDGE_DYNAMIC / f"worker-{name}.yml"
     doc = build_ingress(name, ingress)
     if doc is None:
         target.unlink(missing_ok=True)
@@ -1694,8 +1780,24 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
             f"{name}: spec.envFrom secrets resolved but no ingress service to "
             f"attach them to — they won't be injected. Add an ingress entry."
         )
-    write_override(name, ingress, db_env, env_from, db_services)
-    write_ingress(name, ingress)
+    # Finding 6: a non-edge host (worker) has no local Traefik, so its ingress must
+    # terminate on the EDGE. Publish the container port on this host's private IP and
+    # STAGE the router (address:<self_ip>:<port> + auth) for the orchestrator to
+    # deliver to the edge; the local dynamic file would be inert here anyway.
+    role, self_ip = read_self()
+    edge_term = role not in _ENTRY_ROLES and bool(ingress)
+    if edge_term and self_ip is None:
+        sys.exit(
+            f"{name}: host is non-edge (role={role}) but /etc/nuklaut/host.env has no "
+            f"PRIVATE_IP — cannot publish ingress for edge termination"
+        )
+    write_override(name, ingress, db_env, env_from, db_services,
+                   publish_ip=self_ip if edge_term else None)
+    if edge_term:
+        write_edge_ingress(name, rewrite_ingress_for_edge(ingress, self_ip))
+        (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)  # keep the inert local dir clean
+    else:
+        write_ingress(name, ingress)
     persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
     # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
     # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
@@ -1855,6 +1957,8 @@ def cmd_delete(name: str, purge: bool) -> None:
         manifest = load(pdir / "manifest.yml")
         subprocess.run([*compose_args(name, manifest.raw), "down", "-v"], check=False)  # noqa: S603  # argv built from fixed verbs
     (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)
+    # Staged edge router (worker apps); next converge delivery reaps it off the edge.
+    (EDGE_DYNAMIC / f"worker-{name}.yml").unlink(missing_ok=True)
     shutil.rmtree(pdir, ignore_errors=True)
     # The app's database is kept by default — its creds file (in SECRETS, not
     # pdir) survives rmtree and keeps nuk aware of it (see `nuk db ls`). --purge
