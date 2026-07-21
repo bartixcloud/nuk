@@ -156,6 +156,42 @@ def test_auth_oauth_with_pathprefix_orders_oauth_then_strip():
     ]
 
 
+@pytest.mark.parametrize("bad", ["authentik", "oauth2-proxy", "Oauth", "sso", ""])
+def test_unknown_auth_value_refuses_to_render_instead_of_publishing(bad):
+    """An unrecognised `auth` must ABORT, never render an ungated router.
+
+    Regression for a fail-open authentication control: `auth` was an unvalidated
+    `str` and the render matched it with if/elif and no else, so any value outside
+    {oauth, basic} produced a router with no auth middleware and no error — the
+    manifest claimed the route was protected while Traefik served it to the world.
+
+    `authentik` is the specific trap: it is legal one layer up (facilities.auth),
+    so it is the natural thing to write per-route, and it published the route.
+    """
+    if bad == "":
+        pytest.skip("empty string is falsy upstream; covered by the Literal at load time")
+    with pytest.raises(ValueError, match="not a known gate"):
+        nuk.build_ingress("demo", [{"host": "h", "service": "s", "port": 1, "auth": bad}])
+
+
+@pytest.mark.parametrize("impl", ["authentik", "oauth2-proxy"])
+def test_ingress_auth_rejects_implementation_names_at_load(impl):
+    """Naming an auth *implementation* per-route is rejected with a pointer to `oauth`.
+
+    facilities.auth picks the implementation; every global.<impl>.yml defines the
+    same middleware names, so the per-route value stays implementation-agnostic.
+    """
+    with pytest.raises(ValueError, match=r"belongs in the org's facilities\.auth"):
+        nuk.Ingress(host="h", service="s", port=1, auth=impl)
+
+
+def test_ingress_auth_accepts_the_two_gates():
+    """The closed set still admits exactly the values the renderer implements."""
+    assert nuk.Ingress(host="h", service="s", port=1, auth="oauth").auth == "oauth"
+    assert nuk.Ingress(host="h", service="s", port=1, auth="basic").auth == "basic"
+    assert nuk.Ingress(host="h", service="s", port=1).auth is None
+
+
 def test_explicit_priority():
     doc = nuk.build_ingress("a", [{"host": "h", "service": "s", "port": 1, "priority": 100}])
     assert doc["http"]["routers"]["a-0"]["priority"] == 100
@@ -808,7 +844,9 @@ def test_redact_db_url_masks_password_keeps_scheme_host_db():
 
 
 def test_redact_db_url_handles_redis_and_passwordless_and_none():
-    assert nuk._redact_db_url("redis://app:tok@nuk-redis:6379/0") == "redis://app:***@nuk-redis:6379/0"
+    assert (
+        nuk._redact_db_url("redis://app:tok@nuk-redis:6379/0") == "redis://app:***@nuk-redis:6379/0"
+    )
     # no password -> returned unchanged (nothing to mask)
     assert nuk._redact_db_url("postgresql://host:5432/db") == "postgresql://host:5432/db"
     assert nuk._redact_db_url(None) is None

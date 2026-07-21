@@ -31,6 +31,7 @@ from pydantic import (
     Field,
     PrivateAttr,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -110,7 +111,35 @@ class Ingress(BaseModel):
     strip_prefix: bool = Field(default=False, alias="stripPrefix")
     priority: int | None = None
     www: bool = False
-    auth: str | None = None
+    # Which gate to put in front of this route — NOT which implementation provides it.
+    # `oauth` resolves to whatever `facilities.auth` selected for the org, because every
+    # global.<impl>.yml deliberately defines the same middleware names (oauth-auth,
+    # oauth-errors). So an org on Authentik still writes `auth: oauth` here.
+    #
+    # ⚠ This MUST stay a closed set. It was a bare `str | None`, and build_ingress matches
+    #   it with if/elif and no else — so any unrecognised value rendered a router with NO
+    #   auth middleware and NO error. `auth: authentik` is the tempting way to write it
+    #   (it IS legal one layer up, in facilities.auth) and it silently published the route.
+    #   An authentication control that fails OPEN on a typo is exactly the silent-failure
+    #   class the 2026-07-21 rebuild exists to make structurally impossible.
+    auth: Literal["basic", "oauth"] | None = None
+
+    @field_validator("auth", mode="before")
+    @classmethod
+    def _reject_impl_names(cls, v: object) -> object:
+        """Point the implementation names at the capability name they belong to.
+
+        Raises:
+            ValueError: If `auth` names an auth *implementation* rather than the gate.
+        """
+        if isinstance(v, str) and v in {"authentik", "oauth2-proxy"}:
+            msg = (
+                f"ingress.auth={v!r} names an auth IMPLEMENTATION, which belongs in the "
+                f"org's facilities.auth. Per-route, write `auth: oauth` — it resolves to "
+                f"whichever implementation this org runs."
+            )
+            raise ValueError(msg)
+        return v
 
     @model_validator(mode="after")
     def _check_backend(self) -> Ingress:
@@ -763,10 +792,21 @@ def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901,
         # errors (outer) catches the 401-403 the auth (inner) returns and serves
         # the sign-in page. Both middlewares live in global.yml; this host also
         # needs an oauth2-proxy /oauth2/ route (see docker-compose.traefik.yml).
+        # ⚠ The else is load-bearing. Without it an unrecognised value fell through to a
+        #   router with no auth middleware and no error — a security control failing OPEN.
+        #   Ingress.auth is a closed Literal now, but this function also takes raw dicts,
+        #   so it refuses unknown values itself rather than trusting its caller.
         if ing.get("auth") == "oauth":
             mw += ["oauth-errors@file", "oauth-auth@file"]
         elif ing.get("auth") == "basic":
             mw += ["auth@file"]
+        elif ing.get("auth") is not None:
+            msg = (
+                f"ingress.auth={ing['auth']!r} is not a known gate (expected 'oauth' or "
+                f"'basic'). Refusing to render an UNAUTHENTICATED router for a route that "
+                f"asked to be gated."
+            )
+            raise ValueError(msg)
         if ing.get("path") and ing.get("stripPrefix"):
             sid = f"{rid}-strip"
             middlewares[sid] = {"stripPrefix": {"prefixes": [ing["path"]]}}
@@ -1996,9 +2036,7 @@ def _status(
     ] = None,
     pretty: Annotated[
         bool,
-        typer.Option(
-            "--json", help="pretty-print the org-wide overview (always JSON either way)"
-        ),
+        typer.Option("--json", help="pretty-print the org-wide overview (always JSON either way)"),
     ] = False,
     show_all: Annotated[
         bool,
