@@ -117,6 +117,11 @@ class Ingress(BaseModel):
     strip_prefix: bool = Field(default=False, alias="stripPrefix")
     priority: int | None = None
     www: bool = False
+    # When this app runs on a non-edge host (worker), its container port is published on
+    # the private IP for the edge Traefik to reach it. hostPort overrides the HOST side of
+    # that bind (default = port), so two worker apps sharing a container port don't collide
+    # on the host. Ignored on an edge/all-in-one host (no publish). Finding 6.
+    host_port: int | None = Field(default=None, alias="hostPort")
     # Which gate to put in front of this route — NOT which implementation provides it.
     # `oauth` resolves to whatever `facilities.auth` selected for the org, because every
     # global.<impl>.yml deliberately defines the same middleware names (oauth-auth,
@@ -625,7 +630,7 @@ def resolve_env_from(spec: dict) -> list[str]:
     return refs
 
 
-def build_override(  # noqa: C901, PLR0913, PLR0917  # frozen wire-contract API; one render pass
+def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-contract API; one render pass
     name: str,  # noqa: ARG001  # kept for signature stability (frozen wire-contract API / tests)
     ingress: list[dict],
     db_env: str | None = None,
@@ -681,7 +686,8 @@ def build_override(  # noqa: C901, PLR0913, PLR0917  # frozen wire-contract API;
         for ing in ingress:
             svc, port = ing.get("service"), ing.get("port")
             if svc and port is not None:
-                mapping = f"{publish_ip}:{port}:{port}"
+                host_port = ing.get("hostPort") or port
+                mapping = f"{publish_ip}:{host_port}:{port}"
                 publish_ports.setdefault(svc, [])
                 if mapping not in publish_ports[svc]:
                     publish_ports[svc].append(mapping)
@@ -920,8 +926,8 @@ def rewrite_ingress_for_edge(ingress: list[dict], self_ip: str) -> list[dict]:
         if ing.get("address") or not ing.get("service"):
             out.append(ing)
             continue
-        rewritten = {k: v for k, v in ing.items() if k not in {"service", "port"}}
-        rewritten["address"] = f"{self_ip}:{ing['port']}"
+        rewritten = {k: v for k, v in ing.items() if k not in {"service", "port", "hostPort"}}
+        rewritten["address"] = f"{self_ip}:{ing.get('hostPort') or ing['port']}"
         out.append(rewritten)
     return out
 
