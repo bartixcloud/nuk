@@ -23,6 +23,14 @@ jobs:
     uses: astrojones/.github/.github/workflows/release.yml@main
     secrets: inherit
     with:
+      # The reusable workflow defaults to '["self-hosted","nuklaut"]' to keep
+      # GitHub-hosted minutes off private repos. Overridden here on purpose: version
+      # stamping and tag creation touch no astrojones infrastructure, and pinning them
+      # to the controller runner means a release cannot happen while that box is down —
+      # which is exactly the state the 2026-07-21 migration put the fleet in (checked:
+      # ONE runner org-wide, offline, and nothing carrying the `nuklaut` label).
+      # Trade accepted: a couple of GitHub-hosted minutes per release.
+      runs-on: '["ubuntu-latest"]'
       version-files: |
         nuk.py
         pyproject.toml
