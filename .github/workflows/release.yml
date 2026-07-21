@@ -30,7 +30,10 @@ jobs:
   build:
     needs: release
     if: ${{ needs.release.outputs.released == 'true' }}
-    runs-on: [self-hosted, nuklaut]
+    # GitHub-hosted on purpose: this job only checks out, runs shiv, smoke-tests the
+    # pyz and calls `gh`. It touches NO astrojones infrastructure, so pinning it to a
+    # self-hosted label made every release wait on a runner that need not exist.
+    runs-on: ubuntu-latest
     permissions:
       contents: write
       actions: write   # dispatch deploy.yml
