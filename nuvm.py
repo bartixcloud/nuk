@@ -22,6 +22,8 @@ _MEM_RE = re.compile(r"^\s*(\d+)\s*([GMgm]?)\s*$")
 BASE_IMAGE = Path("/var/lib/nuvm/base/base.qcow2")
 INSTANCES = Path("/var/lib/nuvm/instances")
 
+_PLACEHOLDER_USER_DATA = "#cloud-config\n"
+
 
 def memory_to_mib(spec: str) -> int:
     """Parse a memory spec like '16G' or '512M' (bare = MiB) into MiB."""
@@ -158,6 +160,11 @@ def run_plan(plan: list[list[str]], *, dry_run: bool, tolerant: bool = False) ->
                 raise
 
 
+def _is_placeholder_user_data(text: str) -> bool:
+    """True when user-data is still the P1 placeholder (no Ops O3 template)."""
+    return text.strip() == "#cloud-config"
+
+
 def _write_seed(host: nuk.Host, org: nuk.Org) -> None:
     d = instance_dir(host.name)
     d.mkdir(parents=True, exist_ok=True)
@@ -166,7 +173,7 @@ def _write_seed(host: nuk.Host, org: nuk.Org) -> None:
     (d / "network-config").write_text(render_network_config(host, gateway, prefixlen))
     (d / "meta-data").write_text(render_meta_data(host))
     # P1: minimal cloud-config; Ops O3 supplies the real template.
-    (d / "user-data").write_text("#cloud-config\n")
+    (d / "user-data").write_text(_PLACEHOLDER_USER_DATA)
 
 
 @app.command()
@@ -174,12 +181,21 @@ def up(
     name: str,
     org_file: Annotated[Path, typer.Option("--org-file")],
     dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+    force_minimal: Annotated[bool, typer.Option("--force-minimal")] = False,
 ) -> None:
     """Provision a declared libvirt host from the org manifest (idempotent)."""
     org = nuk.load_org(org_file)
     host = resolve_host(org, name)
     if not dry_run:
         _write_seed(host, org)
+        user_data = (instance_dir(name) / "user-data").read_text()
+        if _is_placeholder_user_data(user_data) and not force_minimal:
+            typer.echo(
+                f"refusing to provision {name!r} with placeholder cloud-init — "
+                "no credentials, no data stack; wire host.cloud-init.tpl.yaml "
+                "(Ops O3) or pass --force-minimal to boot a bare VM anyway"
+            )
+            raise typer.Exit(1)
     net = net_for(host, ephemeral=False)
     run_plan(build_seed_iso_plan(name), dry_run=dry_run)
     run_plan(

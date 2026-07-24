@@ -21,6 +21,13 @@ def test_memory_to_mib_rejects_garbage() -> None:
         nuvm.memory_to_mib("banana")
 
 
+def test_is_placeholder_user_data() -> None:
+    assert nuvm._is_placeholder_user_data("#cloud-config\n") is True
+    assert nuvm._is_placeholder_user_data(
+        "#cloud-config\nusers:\n  - name: ops\n"
+    ) is False
+
+
 def test_build_create_plan_overlay_then_virtinstall() -> None:
     plan = nuvm.build_create_plan("nuroot-db", vcpu=4, memory_mib=16384, net="br-priv")
     assert plan[0][:4] == ["qemu-img", "create", "-f", "qcow2"]
@@ -130,6 +137,16 @@ def test_cli_up_dry_run_prints_plan(tmp_path) -> None:
     assert "qemu-img" in r.output
     assert "virt-install" in r.output
     assert "network=br-priv" in r.output
+
+
+def test_up_refuses_placeholder_real_run(tmp_path, monkeypatch) -> None:
+    import yaml
+    monkeypatch.setattr(nuvm, "INSTANCES", tmp_path)
+    org = tmp_path / "org.yml"
+    org.write_text(yaml.safe_dump(ORG))
+    r = runner.invoke(nuvm.app, ["up", "nuroot-db", "--org-file", str(org)])
+    assert r.exit_code != 0
+    assert "placeholder" in r.output
 
 
 def test_cli_create_ephemeral_dry_run_uses_nat_ci(tmp_path) -> None:
