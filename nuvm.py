@@ -10,13 +10,12 @@ CLI executes them, or prints them under --dry-run.
 from __future__ import annotations
 
 import re
-import subprocess
+import subprocess  # noqa: S404  # all calls use fixed argv, no shell (see per-call S603/S607)
 from pathlib import Path
 from typing import Annotated
 
-import typer
-
 import nuk
+import typer
 
 _MEM_RE = re.compile(r"^\s*(\d+)\s*([GMgm]?)\s*$")
 
@@ -35,14 +34,17 @@ def memory_to_mib(spec: str) -> int:
 
 
 def instance_dir(name: str) -> Path:
+    """Per-VM state directory: /var/lib/nuvm/instances/<name>/."""
     return INSTANCES / name
 
 
 def overlay_path(name: str) -> Path:
+    """qemu-img COW overlay disk path for the named instance."""
     return instance_dir(name) / "overlay.qcow2"
 
 
 def seed_path(name: str) -> Path:
+    """cloud-init NoCloud seed ISO path for the named instance."""
     return instance_dir(name) / "seed.iso"
 
 
@@ -115,6 +117,7 @@ def render_network_config(host: nuk.Host, gateway: str, prefixlen: int) -> str:
 
 
 def render_meta_data(host: nuk.Host) -> str:
+    """cloud-init NoCloud meta-data: instance-id + local-hostname."""
     return f"instance-id: {host.name}-0\nlocal-hostname: {host.name}\n"
 
 
@@ -123,6 +126,7 @@ NET_CI = "nat-ci"
 
 
 def resolve_host(org: nuk.Org, name: str) -> nuk.Host:
+    """Look up `name` in `org.hosts`; raise if absent or not provider libvirt."""
     for h in org.hosts:
         if h.name == name:
             if h.provider != "libvirt":
@@ -134,6 +138,7 @@ def resolve_host(org: nuk.Org, name: str) -> nuk.Host:
 
 
 def net_for(host: nuk.Host, *, ephemeral: bool) -> str:  # noqa: ARG001
+    """Ephemeral CI VMs attach to nat-ci; data/generic VMs attach to br-priv."""
     return NET_CI if ephemeral else NET_PRIV
 
 
@@ -141,6 +146,7 @@ app = typer.Typer(no_args_is_help=True, help="libvirt VM lifecycle for nuk hosts
 
 
 def run_plan(plan: list[list[str]], *, dry_run: bool, tolerant: bool = False) -> None:
+    """Print each argv under --dry-run, else run it; tolerate failures if `tolerant`."""
     for argv in plan:
         if dry_run:
             typer.echo(" ".join(argv))
@@ -159,7 +165,8 @@ def _write_seed(host: nuk.Host, org: nuk.Org) -> None:
     prefixlen = int(org.network.vswitch_subnet.split("/")[1])
     (d / "network-config").write_text(render_network_config(host, gateway, prefixlen))
     (d / "meta-data").write_text(render_meta_data(host))
-    (d / "user-data").write_text("#cloud-config\n")  # P1: minimal; Ops O3 supplies the real template
+    # P1: minimal cloud-config; Ops O3 supplies the real template.
+    (d / "user-data").write_text("#cloud-config\n")
 
 
 @app.command()
@@ -209,6 +216,7 @@ def list_() -> None:
 
 
 def main() -> None:
+    """Console-script entrypoint (see [project.scripts] in pyproject.toml)."""
     app()
 
 

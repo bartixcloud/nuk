@@ -1,8 +1,11 @@
 from __future__ import annotations
 
-import pytest
-
+import nuk
 import nuvm
+import pytest
+from typer.testing import CliRunner
+
+runner = CliRunner()
 
 
 @pytest.mark.parametrize(
@@ -16,9 +19,6 @@ def test_memory_to_mib(spec: str, mib: int) -> None:
 def test_memory_to_mib_rejects_garbage() -> None:
     with pytest.raises(ValueError, match="memory"):
         nuvm.memory_to_mib("banana")
-
-
-from pathlib import Path
 
 
 def test_build_create_plan_overlay_then_virtinstall() -> None:
@@ -46,9 +46,6 @@ def test_seed_iso_plan_uses_cloud_localds() -> None:
     plan = nuvm.build_seed_iso_plan("nuroot-db")
     assert plan[0][0] == "cloud-localds"
     assert str(nuvm.seed_path("nuroot-db")) in plan[0]
-
-
-import nuk
 
 
 def _host(**kw):
@@ -122,11 +119,6 @@ def test_net_for_ephemeral_is_nat_ci(tmp_path) -> None:
     h = nuvm.resolve_host(_org(tmp_path), "nuroot-db")
     assert nuvm.net_for(h, ephemeral=True) == "nat-ci"
     assert nuvm.net_for(h, ephemeral=False) == "br-priv"
-
-
-from typer.testing import CliRunner
-
-runner = CliRunner()
 
 
 def test_cli_up_dry_run_prints_plan(tmp_path) -> None:
