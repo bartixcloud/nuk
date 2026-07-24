@@ -10,8 +10,12 @@ CLI executes them, or prints them under --dry-run.
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 _MEM_RE = re.compile(r"^\s*(\d+)\s*([GMgm]?)\s*$")
+
+BASE_IMAGE = Path("/var/lib/nuvm/base/base.qcow2")
+INSTANCES = Path("/var/lib/nuvm/instances")
 
 
 def memory_to_mib(spec: str) -> int:
@@ -22,3 +26,61 @@ def memory_to_mib(spec: str) -> int:
         raise ValueError(msg)
     value, unit = int(m.group(1)), m.group(2).upper()
     return value * 1024 if unit == "G" else value
+
+
+def instance_dir(name: str) -> Path:
+    return INSTANCES / name
+
+
+def overlay_path(name: str) -> Path:
+    return instance_dir(name) / "overlay.qcow2"
+
+
+def seed_path(name: str) -> Path:
+    return instance_dir(name) / "seed.iso"
+
+
+def build_create_plan(
+    name: str, vcpu: int, memory_mib: int, net: str, *, base: Path = BASE_IMAGE
+) -> list[list[str]]:
+    """qemu-img COW overlay on the base image, then virt-install --import."""
+    overlay = overlay_path(name)
+    return [
+        ["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(base), str(overlay)],
+        [
+            "virt-install",
+            "--name", name,
+            "--vcpus", str(vcpu),
+            "--memory", str(memory_mib),
+            "--disk", f"path={overlay},format=qcow2",
+            "--disk", f"path={seed_path(name)},device=cdrom",
+            "--network", f"network={net},model=virtio",
+            "--os-variant", "debian13",
+            "--graphics", "none",
+            "--import",
+            "--noautoconsole",
+        ],
+    ]
+
+
+def build_seed_iso_plan(name: str) -> list[list[str]]:
+    """Pack the rendered NoCloud seed dir into a cloud-init ISO."""
+    d = instance_dir(name)
+    return [
+        [
+            "cloud-localds",
+            "--network-config", str(d / "network-config"),
+            str(seed_path(name)),
+            str(d / "user-data"),
+            str(d / "meta-data"),
+        ]
+    ]
+
+
+def build_destroy_plan(name: str) -> list[list[str]]:
+    """Destroy + undefine (tolerant if absent) and delete instance state."""
+    return [
+        ["virsh", "destroy", name],
+        ["virsh", "undefine", name, "--nvram"],
+        ["rm", "-rf", str(instance_dir(name))],
+    ]
