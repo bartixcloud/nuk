@@ -12,6 +12,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import nuk
+
 _MEM_RE = re.compile(r"^\s*(\d+)\s*([GMgm]?)\s*$")
 
 BASE_IMAGE = Path("/var/lib/nuvm/base/base.qcow2")
@@ -84,3 +86,29 @@ def build_destroy_plan(name: str) -> list[list[str]]:
         ["virsh", "undefine", name, "--nvram"],
         ["rm", "-rf", str(instance_dir(name))],
     ]
+
+
+def _render(template: str, variables: dict[str, str]) -> str:
+    """Replace ${KEY} for each key in `variables`; leave everything else as-is."""
+    out = template
+    for key, value in variables.items():
+        out = out.replace("${" + key + "}", value)
+    return out
+
+
+def render_network_config(host: nuk.Host, gateway: str, prefixlen: int) -> str:
+    """cloud-init NoCloud v2 network config: one virtio NIC, static IP, MTU 1400."""
+    return (
+        "version: 2\n"
+        "ethernets:\n"
+        "  primary:\n"
+        '    match: {name: "en*"}\n'
+        "    mtu: 1400\n"
+        f"    addresses: [{host.private_ip}/{prefixlen}]\n"
+        "    routes:\n"
+        f"      - {{to: default, via: {gateway}}}\n"
+    )
+
+
+def render_meta_data(host: nuk.Host) -> str:
+    return f"instance-id: {host.name}-0\nlocal-hostname: {host.name}\n"

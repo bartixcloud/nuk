@@ -46,3 +46,36 @@ def test_seed_iso_plan_uses_cloud_localds() -> None:
     plan = nuvm.build_seed_iso_plan("nuroot-db")
     assert plan[0][0] == "cloud-localds"
     assert str(nuvm.seed_path("nuroot-db")) in plan[0]
+
+
+import nuk
+
+
+def _host(**kw):
+    base = {"name": "nuroot-db", "provider": "libvirt", "metal": "nuroot-metal",
+            "role": "data", "privateIp": "10.10.2.3", "vcpu": 4, "memory": "16G"}
+    base.update(kw)
+    return nuk.Host.model_validate(base)
+
+
+def test_render_substitutes_known_vars_only() -> None:
+    out = nuvm._render("host=${HOSTNAME} role=${ROLE} keep=${UNKNOWN} lit=$$X",
+                       {"HOSTNAME": "nuroot-db", "ROLE": "data"})
+    assert "host=nuroot-db" in out
+    assert "role=data" in out
+    assert "${UNKNOWN}" in out
+    assert "$$X" in out
+
+
+def test_render_network_config_static_ip_mtu() -> None:
+    nc = nuvm.render_network_config(_host(), gateway="10.10.2.1", prefixlen=24)
+    assert "10.10.2.3/24" in nc
+    assert "10.10.2.1" in nc
+    assert "mtu: 1400" in nc
+    assert "version: 2" in nc
+
+
+def test_render_meta_data_has_hostname() -> None:
+    md = nuvm.render_meta_data(_host())
+    assert "local-hostname: nuroot-db" in md
+    assert "instance-id:" in md
