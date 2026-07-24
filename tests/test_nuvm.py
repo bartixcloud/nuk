@@ -79,3 +79,46 @@ def test_render_meta_data_has_hostname() -> None:
     md = nuvm.render_meta_data(_host())
     assert "local-hostname: nuroot-db" in md
     assert "instance-id:" in md
+
+
+ORG = {
+    "apiVersion": "nukorg/v1", "kind": "Org", "metadata": {"name": "astrojones"},
+    "domains": ["astrojones.guru"], "platformDomain": "astrojones.guru",
+    "acmeEmail": "a@astrojones.guru",
+    "network": {"cidr": "10.10.0.0/16", "cloudSubnet": "10.10.1.0/24",
+                "vswitchSubnet": "10.10.2.0/24", "vswitchVlan": 4001},
+    "hosts": [
+        {"name": "hcbase", "provider": "hcloud", "type": "cx23", "role": "edge",
+         "privateIp": "10.10.1.2"},
+        {"name": "nuroot-metal", "provider": "manual", "ip": "1.2.3.4",
+         "role": "hypervisor", "privateIp": "10.10.2.2"},
+        {"name": "nuroot-db", "provider": "libvirt", "metal": "nuroot-metal",
+         "role": "data", "privateIp": "10.10.2.3", "vcpu": 4, "memory": "16G"},
+    ],
+    "facilities": {"dns": "wildcard", "tls": "dns01", "dnsProvider": "hetzner",
+                   "secrets": "sops", "auth": "authentik", "runners": "ephemeral"},
+    "mesh": "tailscale",
+}
+
+
+def _org(tmp_path):
+    import yaml
+    p = tmp_path / "org.yml"
+    p.write_text(yaml.safe_dump(ORG))
+    return nuk.load_org(p)
+
+
+def test_resolve_host_returns_libvirt_host(tmp_path) -> None:
+    h = nuvm.resolve_host(_org(tmp_path), "nuroot-db")
+    assert h.name == "nuroot-db" and h.memory == "16G"
+
+
+def test_resolve_host_rejects_non_libvirt(tmp_path) -> None:
+    with pytest.raises(ValueError, match="libvirt"):
+        nuvm.resolve_host(_org(tmp_path), "hcbase")
+
+
+def test_net_for_ephemeral_is_nat_ci(tmp_path) -> None:
+    h = nuvm.resolve_host(_org(tmp_path), "nuroot-db")
+    assert nuvm.net_for(h, ephemeral=True) == "nat-ci"
+    assert nuvm.net_for(h, ephemeral=False) == "br-priv"

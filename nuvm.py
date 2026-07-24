@@ -112,3 +112,22 @@ def render_network_config(host: nuk.Host, gateway: str, prefixlen: int) -> str:
 
 def render_meta_data(host: nuk.Host) -> str:
     return f"instance-id: {host.name}-0\nlocal-hostname: {host.name}\n"
+
+
+NET_PRIV = "br-priv"
+NET_CI = "nat-ci"
+
+
+def resolve_host(org: nuk.Org, name: str) -> nuk.Host:
+    for h in org.hosts:
+        if h.name == name:
+            if h.provider != "libvirt":
+                msg = f"host {name!r} is provider {h.provider!r}, not libvirt"
+                raise ValueError(msg)
+            return h
+    msg = f"host {name!r} not found in org"
+    raise ValueError(msg)
+
+
+def net_for(host: nuk.Host, *, ephemeral: bool) -> str:  # noqa: ARG001
+    return NET_CI if ephemeral else NET_PRIV
