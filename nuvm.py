@@ -10,7 +10,11 @@ CLI executes them, or prints them under --dry-run.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
+from typing import Annotated
+
+import typer
 
 import nuk
 
@@ -131,3 +135,82 @@ def resolve_host(org: nuk.Org, name: str) -> nuk.Host:
 
 def net_for(host: nuk.Host, *, ephemeral: bool) -> str:  # noqa: ARG001
     return NET_CI if ephemeral else NET_PRIV
+
+
+app = typer.Typer(no_args_is_help=True, help="libvirt VM lifecycle for nuk hosts")
+
+
+def run_plan(plan: list[list[str]], *, dry_run: bool, tolerant: bool = False) -> None:
+    for argv in plan:
+        if dry_run:
+            typer.echo(" ".join(argv))
+            continue
+        try:
+            subprocess.run(argv, check=True)  # noqa: S603
+        except subprocess.CalledProcessError:
+            if not tolerant:
+                raise
+
+
+def _write_seed(host: nuk.Host, org: nuk.Org) -> None:
+    d = instance_dir(host.name)
+    d.mkdir(parents=True, exist_ok=True)
+    gateway = org.network.vswitch_subnet.rsplit(".", 1)[0] + ".1"
+    prefixlen = int(org.network.vswitch_subnet.split("/")[1])
+    (d / "network-config").write_text(render_network_config(host, gateway, prefixlen))
+    (d / "meta-data").write_text(render_meta_data(host))
+    (d / "user-data").write_text("#cloud-config\n")  # P1: minimal; Ops O3 supplies the real template
+
+
+@app.command()
+def up(
+    name: str,
+    org_file: Annotated[Path, typer.Option("--org-file")],
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+) -> None:
+    """Provision a declared libvirt host from the org manifest (idempotent)."""
+    org = nuk.load_org(org_file)
+    host = resolve_host(org, name)
+    if not dry_run:
+        _write_seed(host, org)
+    net = net_for(host, ephemeral=False)
+    run_plan(build_seed_iso_plan(name), dry_run=dry_run)
+    run_plan(
+        build_create_plan(name, host.vcpu or 2, memory_to_mib(host.memory or "2G"), net),
+        dry_run=dry_run,
+    )
+
+
+@app.command()
+def create(
+    name: str,
+    cpu: Annotated[int, typer.Option("--cpu")] = 2,
+    mem: Annotated[str, typer.Option("--mem")] = "2G",
+    ephemeral: Annotated[bool, typer.Option("--ephemeral")] = False,
+    dry_run: Annotated[bool, typer.Option("--dry-run")] = False,
+) -> None:
+    """Create a throwaway VM (ephemeral → nat-ci, else br-priv)."""
+    net = NET_CI if ephemeral else NET_PRIV
+    run_plan(build_create_plan(name, cpu, memory_to_mib(mem), net), dry_run=dry_run)
+
+
+@app.command()
+def destroy(
+    name: str, dry_run: Annotated[bool, typer.Option("--dry-run")] = False
+) -> None:
+    """Destroy + undefine a VM and delete its state (tolerant)."""
+    run_plan(build_destroy_plan(name), dry_run=dry_run, tolerant=True)
+
+
+@app.command(name="list")
+def list_() -> None:
+    """List defined VMs (virsh passthrough)."""
+    subprocess.run(["virsh", "list", "--all"], check=False)  # noqa: S603, S607
+
+
+def main() -> None:
+    app()
+
+
+if __name__ == "__main__":
+    main()

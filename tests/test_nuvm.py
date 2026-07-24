@@ -122,3 +122,26 @@ def test_net_for_ephemeral_is_nat_ci(tmp_path) -> None:
     h = nuvm.resolve_host(_org(tmp_path), "nuroot-db")
     assert nuvm.net_for(h, ephemeral=True) == "nat-ci"
     assert nuvm.net_for(h, ephemeral=False) == "br-priv"
+
+
+from typer.testing import CliRunner
+
+runner = CliRunner()
+
+
+def test_cli_up_dry_run_prints_plan(tmp_path) -> None:
+    import yaml
+    org = tmp_path / "org.yml"
+    org.write_text(yaml.safe_dump(ORG))
+    r = runner.invoke(nuvm.app, ["up", "nuroot-db", "--org-file", str(org), "--dry-run"])
+    assert r.exit_code == 0, r.output
+    assert "qemu-img" in r.output
+    assert "virt-install" in r.output
+    assert "network=br-priv" in r.output
+
+
+def test_cli_create_ephemeral_dry_run_uses_nat_ci(tmp_path) -> None:
+    r = runner.invoke(nuvm.app, ["create", "scratch1", "--cpu", "2", "--mem", "2G",
+                                 "--ephemeral", "--dry-run"])
+    assert r.exit_code == 0, r.output
+    assert "network=nat-ci" in r.output
