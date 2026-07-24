@@ -266,6 +266,17 @@ def test_load_org_roundtrip(tmp_path):
     assert nuk.load_org(p).metadata.name == "astrojones"
 
 
+def test_astrocloud_libvirt_data_host_validates(tmp_path) -> None:
+    doc = dict(ORG_DOC)  # ORG_DOC already carries nuroot-metal + nuroot-db
+    p = tmp_path / "org.yml"
+    p.write_text(yaml.safe_dump(doc))
+    org = nuk.load_org(p)
+    db = next(h for h in org.hosts if h.name == "nuroot-db")
+    assert db.provider == "libvirt"
+    assert db.metal == "nuroot-metal"
+    assert db.private_ip.startswith("10.10.2.")
+
+
 def test_load_org_invalid_exits(tmp_path):
     p = tmp_path / "bad.yml"
     p.write_text("apiVersion: nukorg/v1\nkind: Org\n", encoding="utf-8")
