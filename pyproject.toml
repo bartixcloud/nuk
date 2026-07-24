@@ -8,6 +8,7 @@ dependencies = ["pydantic>=2.9", "typer>=0.15", "pyyaml>=6"]
 
 [project.scripts]
 nuk = "nuk:main"
+nuvm = "nuvm:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -18,10 +19,10 @@ build-backend = "hatchling.build"
 # nuk:main, and tests `import nuk` with pythonpath=["."]. Point hatchling at the
 # lone module.
 [tool.hatch.build.targets.wheel]
-only-include = ["nuk.py"]
+only-include = ["nuk.py", "nuvm.py"]
 
 [tool.hatch.build.targets.sdist]
-include = ["nuk.py", "tests", "README.md"]
+include = ["nuk.py", "nuvm.py", "tests", "README.md"]
 
 [dependency-groups]
 dev = ["ty", "pytest", "pytest-cov", "pytest-asyncio", "ruff", "pre-commit"]
