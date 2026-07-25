@@ -35,7 +35,7 @@ from pydantic import (
     model_validator,
 )
 
-__version__ = "0.15.0"  # bumped on release by .github/workflows/release.yml
+__version__ = "0.16.0"  # bumped on release by .github/workflows/release.yml
 
 ROOT = Path("/opt/nuklaut")
 DEPLOYS = ROOT / "deployments"
