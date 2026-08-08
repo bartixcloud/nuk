@@ -310,7 +310,7 @@ class Host(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     name: str
-    provider: Literal["hcloud", "libvirt", "metal", "manual"]
+    provider: Literal["hcloud", "libvirt", "incus", "metal", "manual"]
     role: Literal["edge", "data", "worker", "hypervisor", "all-in-one"]
     private_ip: str = Field(alias="privateIp")
     type: str | None = None  # hcloud server type, e.g. cx23
@@ -357,18 +357,25 @@ def _check_entry_and_mesh(hosts: list[Host], mesh: str) -> None:
         msg = "exactly one host must have role 'edge' or 'all-in-one'"
         raise ValueError(msg)
     if mesh == "none" and len(hosts) != 1:
-        msg = "mesh: none is only valid with a single host"
-        raise ValueError(msg)
+        # VMs on a hypervisor's bridge need no mesh: they share the bridge with
+        # the hypervisor host, which is the entry point. Any other multi-host
+        # shape must declare a mesh to reach across hosts.
+        bridge_hosts = [
+            h for h in hosts if h.provider in {"incus", "libvirt"} or h.role == "hypervisor"
+        ]
+        if len(bridge_hosts) != len(hosts):
+            msg = "mesh: none is only valid with a single host"
+            raise ValueError(msg)
 
 
-def _check_libvirt(hosts: list[Host]) -> None:
-    """Raise unless every libvirt host names an existing hypervisor host in `metal`."""
+def _check_vm_hosts(hosts: list[Host]) -> None:
+    """Raise unless every libvirt/incus host names an existing hypervisor host in `metal`."""
     hypervisors = {h.name for h in hosts if h.role == "hypervisor"}
     for h in hosts:
-        if h.provider != "libvirt":
+        if h.provider not in {"libvirt", "incus"}:
             continue
         if not h.metal:
-            msg = f"host {h.name}: provider libvirt requires 'metal' (its hypervisor host)"
+            msg = f"host {h.name}: provider {h.provider} requires 'metal' (its hypervisor host)"
             raise ValueError(msg)
         if h.metal not in hypervisors:
             msg = f"host {h.name}: metal {h.metal!r} is not a hypervisor host in this org"
@@ -378,6 +385,9 @@ def _check_libvirt(hosts: list[Host]) -> None:
 def _check_subnets(hosts: list[Host], network: Network) -> None:
     """Raise unless every host's private IP sits in its provider's declared subnet."""
     for h in hosts:
+        if h.role == "hypervisor":
+            # The hypervisor's privateIp is its management IP, not an app subnet.
+            continue
         cloud = h.provider == "hcloud"
         subnet = network.cloud_subnet if cloud else network.vswitch_subnet
         if not _ip_in_cidr(h.private_ip, subnet):
@@ -415,7 +425,7 @@ class Org(BaseModel):
         _check_domains(self.platform_domain, self.domains)
         _check_unique(self.hosts)
         _check_entry_and_mesh(self.hosts, self.mesh)
-        _check_libvirt(self.hosts)
+        _check_vm_hosts(self.hosts)
         if self.network is not None:
             _check_subnets(self.hosts, self.network)
         return self

@@ -208,6 +208,71 @@ def test_org_libvirt_metal_must_be_hypervisor():
         nuk.Org.model_validate(_hosts(hosts))
 
 
+def test_org_accepts_incus_provider():
+    hosts = [
+        {"name": "metal", "provider": "manual", "role": "hypervisor", "privateIp": "10.0.2.2"},
+        {
+            "name": "ingress",
+            "provider": "incus",
+            "metal": "metal",
+            "role": "edge",
+            "privateIp": "10.0.10.241",
+        },
+        {
+            "name": "deploy",
+            "provider": "incus",
+            "metal": "metal",
+            "role": "worker",
+            "privateIp": "10.0.10.107",
+        },
+        {
+            "name": "nuroot-db",
+            "provider": "incus",
+            "metal": "metal",
+            "role": "data",
+            "privateIp": "10.0.10.180",
+        },
+    ]
+    doc = {
+        **ORG_DOC,
+        "hosts": hosts,
+        "mesh": "none",
+        "network": {**ORG_DOC["network"], "vswitchSubnet": "10.0.10.0/24"},
+    }
+    org = nuk.Org.model_validate(doc)
+    assert org.mesh == "none"
+    assert len(org.hosts) == 4
+
+
+def test_org_incus_requires_metal():
+    hosts = [
+        {"name": "ingress", "provider": "incus", "role": "edge", "privateIp": "10.0.10.241"},
+    ]
+    with pytest.raises(ValueError, match="incus requires 'metal'"):
+        nuk.Org.model_validate({**ORG_DOC, "hosts": hosts, "mesh": "none"})
+
+
+def test_org_hypervisor_exempt_from_subnets():
+    # metal's privateIp (10.0.2.2) is NOT in vswitchSubnet — hypervisor hosts are exempt.
+    hosts = [
+        {"name": "metal", "provider": "manual", "role": "hypervisor", "privateIp": "10.0.2.2"},
+        {
+            "name": "ingress",
+            "provider": "incus",
+            "metal": "metal",
+            "role": "edge",
+            "privateIp": "10.0.10.241",
+        },
+    ]
+    doc = {
+        **ORG_DOC,
+        "hosts": hosts,
+        "mesh": "none",
+        "network": {**ORG_DOC["network"], "vswitchSubnet": "10.0.10.0/24"},
+    }
+    nuk.Org.model_validate(doc)  # must NOT raise
+
+
 def test_org_private_ip_must_be_unique():
     dup = [
         {"name": "a", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
