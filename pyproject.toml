@@ -15,7 +15,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 # nuk stays a single top-level module (NOT a src/ package): release-please bumps
-# __version__ via the x-release-please-version marker, the script/shiv entry is
+# __version__ via the x-release-please-version marker, the script entry is
 # nuk:main, and tests `import nuk` with pythonpath=["."]. Point hatchling at the
 # lone module.
 [tool.hatch.build.targets.wheel]

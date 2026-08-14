@@ -2,14 +2,12 @@ name: release
 
 # No-PR release: on push to main, the shared workflow derives the next version
 # from conventional commits, stamps it into nuk.py + pyproject.toml, commits that
-# to main ([skip ci]), and creates the tag + GitHub release — no PR. Then, in the
-# same run, we build the nuk.pyz from the tagged (already-stamped) source and
-# dispatch the controller deploy.
+# to main ([skip ci]), and creates the tag + GitHub release — no PR.
 #
-# The artifact is built with shiv, which bundles nuk's runtime deps
-# (pydantic/typer/pyyaml) into the pyz — pydantic-core is a native wheel a plain
-# `python -m zipapp` can't load. Build under python 3.13 to match the controller
-# ABI (pydantic-core ships per-ABI wheels).
+# We no longer ship a built binary: nuk is installed/updated straight from this
+# git repo (`uv tool install --from git+... nuk@<tag>` / `nuk update`), so the tag
+# + GitHub Release created here is the only artifact `nuk update` needs to resolve
+# "latest". There is no build/deploy job — see README "Releasing".
 
 on:
   push:
@@ -34,49 +32,3 @@ jobs:
       version-files: |
         nuk.py
         pyproject.toml
-
-  build:
-    needs: release
-    if: ${{ needs.release.outputs.released == 'true' }}
-    # GitHub-hosted on purpose: this job only checks out, runs shiv, smoke-tests the
-    # pyz and calls `gh`. It touches NO astrojones infrastructure, so pinning it to a
-    # self-hosted label made every release wait on a runner that need not exist.
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      actions: write   # dispatch deploy.yml
-    env:
-      TAG: ${{ needs.release.outputs.tag }}
-    steps:
-      # Check out the tag the release job just created — its tree already carries
-      # the stamped __version__, so no build-time stamping is needed.
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ needs.release.outputs.tag }}
-
-      - uses: actions/setup-python@v6
-        with:
-          python-version: "3.13"
-
-      - name: Build nuk.pyz
-        run: |
-          python3 -m pip install --quiet shiv
-          shiv -c nuk -o nuk.pyz . -p "/usr/bin/env python3"
-
-      - name: Smoke test (self-contained; no deps installed alongside)
-        run: |
-          # No `pip install`: shiv bundled every runtime dep into the pyz.
-          python3 nuk.pyz --help
-          got="$(python3 nuk.pyz --version)"
-          want="nuk ${TAG#v}"
-          [ "$got" = "$want" ] || { echo "::error::version mismatch: got '$got', want '$want'"; exit 1; }
-
-      - name: Attach nuk.pyz to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG" nuk.pyz --clobber
-
-      - name: Deploy to the controller
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh workflow run deploy.yml -f tag="$TAG"

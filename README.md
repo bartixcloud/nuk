@@ -7,11 +7,11 @@ running state. No daemon, no database — all state lives in `/opt/nuklaut/` on 
 controller host.
 
 It runs on the **nuklaut controller** (a single Hetzner VPS behind Traefik), not on
-your workstation (it refuses to run if `/opt/nuklaut` is absent). nuk ships as a
-versioned `nuk.pyz`; the controller installs a pinned release. The CLI is built with
-**typer** and validates manifests with **pydantic**, but those (plus PyYAML) are
-**bundled into the `nuk.pyz` by shiv** at release time — so the controller still needs
-only **python3** and the `docker` CLI on the host, nothing else installed.
+your workstation (it refuses to run if `/opt/nuklaut` is absent). nuk is installed
+straight from this git repo at a pinned tag via `uv tool install` (see "Install /
+run" below) — no built binary is shipped or deployed. The CLI is built with
+**typer** and validates manifests with **pydantic** (plus PyYAML); `uv` resolves and
+installs those deps into the tool's own venv on install/update.
 
 ## Manifest (`nuk/v1`)
 
@@ -110,9 +110,9 @@ nuk org show <path>               # the validated manifest as normalized YAML
 
 ## Shell completion
 
-The packaged `nuk.pyz` ships tab-completion for subcommands, flags, and **live
-deployment names** (`nuk status <TAB>`, `nuk logs <TAB>`, `nuk db purge <TAB>` enumerate
-the apps under `/opt/nuklaut/`). Install it once, in your shell:
+`nuk` ships tab-completion for subcommands, flags, and **live deployment names**
+(`nuk status <TAB>`, `nuk logs <TAB>`, `nuk db purge <TAB>` enumerate the apps under
+`/opt/nuklaut/`). Install it once, in your shell:
 
 ```bash
 nuk --install-completion        # detects your shell, writes the hook to its rc file
@@ -177,12 +177,11 @@ manifest `load()` boundary and in the command layer.
 
 ## Releasing
 
-Push a `vX.Y.Z` tag. CI (`.github/workflows/release.yml`) builds a self-contained
-`nuk.pyz` with **shiv** (under python 3.11, to match the controller ABI), bundling the
-project plus its runtime deps — pydantic, typer, PyYAML — into the single artifact, and
-attaches it to the GitHub release. The **nuklaut** infra repo pins a release via
-`NUK_VERSION` and installs that artifact to `/usr/local/bin/nuk` (host) and bakes it into
-the GitHub Actions runner image during `bootstrap.sh`.
+On push to `main`, `.github/workflows/release.yml` derives the next version from
+conventional commits, stamps it into `nuk.py` + `pyproject.toml`, and creates the tag +
+GitHub release — no PR, no build/deploy step. Nothing is built or attached to the
+release: `nuk update` (and `uv tool install --from git+...`) install straight from the
+tagged source, so the tag existing is the whole deliverable.
 
 ## Deployment
 
