@@ -1,6 +1,6 @@
 [project]
 name = "nuk"
-version = "0.12.0"
+version = "0.16.0"
 description = "Minimal Kubernetes-shaped Docker Compose deployer (nuklaut controller CLI)"
 readme = "README.md"
 requires-python = ">=3.13"
@@ -8,20 +8,21 @@ dependencies = ["pydantic>=2.9", "typer>=0.15", "pyyaml>=6"]
 
 [project.scripts]
 nuk = "nuk:main"
+nuvm = "nuvm:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 # nuk stays a single top-level module (NOT a src/ package): release-please bumps
-# __version__ via the x-release-please-version marker, the script/shiv entry is
+# __version__ via the x-release-please-version marker, the script entry is
 # nuk:main, and tests `import nuk` with pythonpath=["."]. Point hatchling at the
 # lone module.
 [tool.hatch.build.targets.wheel]
-only-include = ["nuk.py"]
+only-include = ["nuk.py", "nuvm.py"]
 
 [tool.hatch.build.targets.sdist]
-include = ["nuk.py", "tests", "README.md"]
+include = ["nuk.py", "nuvm.py", "tests", "README.md"]
 
 [dependency-groups]
 dev = ["ty", "pytest", "pytest-cov", "pytest-asyncio", "ruff", "pre-commit"]

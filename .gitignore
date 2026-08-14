@@ -6,6 +6,7 @@ dist/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
+.coverage
 nuk.pyz
 
 # external / generated trees that must never be committed

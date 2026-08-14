@@ -26,6 +26,16 @@ permissions:
 
 jobs:
   integration:
+    # ⚠ MUST NOT be a self-hosted runner that shares a host with the live data stack.
+    #   The header above already says so — and line 29 said `[self-hosted, nuklaut]`
+    #   anyway, contradicting it. Combined with the unfiltered `on: pull_request` above
+    #   and the fixture's `docker compose down -v`, ANY pull request would have brought
+    #   up the fixed-name nuk-postgres / nuk-redis on the controller and then deleted the
+    #   LIVE data volumes. It never fired only because no runner currently carries the
+    #   `nuklaut` label; the first one to come online would have armed it.
+    #
+    #   Keep this isolated. When the dedicated build tier exists this becomes
+    #   [self-hosted, build] — never a host that runs the platform.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

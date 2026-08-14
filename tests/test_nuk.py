@@ -156,9 +156,69 @@ def test_auth_oauth_with_pathprefix_orders_oauth_then_strip():
     ]
 
 
+@pytest.mark.parametrize("bad", ["authentik", "oauth2-proxy", "Oauth", "sso", ""])
+def test_unknown_auth_value_refuses_to_render_instead_of_publishing(bad):
+    """An unrecognised `auth` must ABORT, never render an ungated router.
+
+    Regression for a fail-open authentication control: `auth` was an unvalidated
+    `str` and the render matched it with if/elif and no else, so any value outside
+    {oauth, basic} produced a router with no auth middleware and no error — the
+    manifest claimed the route was protected while Traefik served it to the world.
+
+    `authentik` is the specific trap: it is legal one layer up (facilities.auth),
+    so it is the natural thing to write per-route, and it published the route.
+    """
+    if bad == "":
+        pytest.skip("empty string is falsy upstream; covered by the Literal at load time")
+    with pytest.raises(ValueError, match="not a known gate"):
+        nuk.build_ingress("demo", [{"host": "h", "service": "s", "port": 1, "auth": bad}])
+
+
+@pytest.mark.parametrize("impl", ["authentik", "oauth2-proxy"])
+def test_ingress_auth_rejects_implementation_names_at_load(impl):
+    """Naming an auth *implementation* per-route is rejected with a pointer to `oauth`.
+
+    facilities.auth picks the implementation; every global.<impl>.yml defines the
+    same middleware names, so the per-route value stays implementation-agnostic.
+    """
+    with pytest.raises(ValueError, match=r"belongs in the org's facilities\.auth"):
+        nuk.Ingress(host="h", service="s", port=1, auth=impl)
+
+
+def test_ingress_auth_accepts_the_two_gates():
+    """The closed set still admits exactly the values the renderer implements."""
+    assert nuk.Ingress(host="h", service="s", port=1, auth="oauth").auth == "oauth"
+    assert nuk.Ingress(host="h", service="s", port=1, auth="basic").auth == "basic"
+    assert nuk.Ingress(host="h", service="s", port=1).auth is None
+
+
 def test_explicit_priority():
     doc = nuk.build_ingress("a", [{"host": "h", "service": "s", "port": 1, "priority": 100}])
     assert doc["http"]["routers"]["a-0"]["priority"] == 100
+
+
+# --- address: remote backend (e.g. a libvirt VM on another host) --------------
+
+
+def test_address_backend_bypasses_local_container_naming():
+    doc = nuk.build_ingress(
+        "hello", [{"host": "hello.astrojones.guru", "address": "10.10.2.4:8080"}]
+    )
+    servers = doc["http"]["services"]["hello-0"]["loadBalancer"]["servers"]
+    assert servers == [{"url": "http://10.10.2.4:8080"}]
+
+
+def test_ingress_model_requires_address_xor_service_port():
+    # local backend: service + port, no address — fine.
+    nuk.Ingress(host="h", service="s", port=1)
+    # remote backend: address only — fine.
+    nuk.Ingress(host="h", address="10.10.2.4:8080")
+    # neither given.
+    with pytest.raises(ValueError, match=r"service.*port.*required"):
+        nuk.Ingress(host="h")
+    # both given — ambiguous, rejected.
+    with pytest.raises(ValueError, match="set either"):
+        nuk.Ingress(host="h", service="s", port=1, address="10.10.2.4:8080")
 
 
 # --- www redirect (opt-in, apex domains) --------------------------------------
@@ -784,7 +844,9 @@ def test_redact_db_url_masks_password_keeps_scheme_host_db():
 
 
 def test_redact_db_url_handles_redis_and_passwordless_and_none():
-    assert nuk._redact_db_url("redis://app:tok@nuk-redis:6379/0") == "redis://app:***@nuk-redis:6379/0"
+    assert (
+        nuk._redact_db_url("redis://app:tok@nuk-redis:6379/0") == "redis://app:***@nuk-redis:6379/0"
+    )
     # no password -> returned unchanged (nothing to mask)
     assert nuk._redact_db_url("postgresql://host:5432/db") == "postgresql://host:5432/db"
     assert nuk._redact_db_url(None) is None
@@ -958,3 +1020,113 @@ def test_resolve_manifest_falls_back_to_legacy(tmp_path):
 def test_resolve_manifest_returns_original_when_neither_exists(tmp_path):
     missing = tmp_path / "deployment.yml"
     assert nuk.resolve_manifest(missing) == missing
+
+
+# --- finding 6: a worker app terminates its ingress on the edge ---------------
+
+
+def test_read_self_parses_role_and_ip(tmp_path, monkeypatch):
+    he = tmp_path / "host.env"
+    he.write_text("ROLE=worker\nPRIVATE_IP=10.0.1.20\n")
+    monkeypatch.setattr(nuk, "HOST_ENV", he)
+    assert nuk.read_self() == ("worker", "10.0.1.20")
+
+
+def test_read_self_absent_defaults_to_entry_role(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "nope.env")
+    role, ip = nuk.read_self()
+    assert role in nuk._ENTRY_ROLES  # legacy single-host controller keeps writing locally
+    assert ip is None
+
+
+def test_rewrite_ingress_local_becomes_address_preserving_auth():
+    out = nuk.rewrite_ingress_for_edge(
+        [{"host": "hello.modl-agent.com", "service": "web", "port": 8080, "auth": "oauth"}],
+        "10.0.1.20",
+    )
+    assert out == [{"host": "hello.modl-agent.com", "address": "10.0.1.20:8080", "auth": "oauth"}]
+
+
+def test_rewrite_ingress_address_entry_passes_through_idempotent():
+    entry = [{"host": "vm.modl-agent.com", "address": "10.0.2.5:80"}]
+    assert nuk.rewrite_ingress_for_edge(entry, "10.0.1.20") == entry
+
+
+def test_edge_termination_router_keeps_backend_and_oauth_chain():
+    """The staged edge router points at the worker's private IP and STILL gates via
+    the oauth chain — proving auth survives the local→address rewrite (finding 6).
+    """
+    ingress = [{"host": "hello.modl-agent.com", "service": "web", "port": 8080, "auth": "oauth"}]
+    doc = nuk.build_ingress("hello", nuk.rewrite_ingress_for_edge(ingress, "10.0.1.20"))
+    svc = doc["http"]["services"]["hello-0"]["loadBalancer"]["servers"]
+    assert svc == [{"url": "http://10.0.1.20:8080"}]  # was http://hello-web-1:8080
+    assert doc["http"]["routers"]["hello-0"]["middlewares"] == [
+        "oauth-errors@file",
+        "oauth-auth@file",
+        "maintenance-errors@file",
+    ]
+
+
+def test_override_publish_ip_binds_private_ip_and_drops_edge():
+    ov = nuk.build_override(
+        "hello",
+        [{"host": "hello.modl-agent.com", "service": "web", "port": 8080}],
+        publish_ip="10.0.1.20",
+    )
+    assert ov["services"] == {"web": {"networks": [], "ports": ["10.0.1.20:8080:8080"]}}
+    assert ov["networks"] == {}  # no local edge network on a worker
+
+
+def test_override_publish_ip_with_db_keeps_data_network():
+    ov = nuk.build_override(
+        "hello",
+        [{"host": "hello.modl-agent.com", "service": "web", "port": 8080}],
+        db_env="/opt/nuklaut/secrets/hello-db.env",
+        publish_ip="10.0.1.20",
+    )
+    assert ov["services"]["web"]["ports"] == ["10.0.1.20:8080:8080"]
+    assert ov["services"]["web"]["networks"] == ["data"]
+    assert ov["services"]["web"]["env_file"] == ["/opt/nuklaut/secrets/hello-db.env"]
+    assert ov["networks"] == {"data": {"external": True}}
+
+
+def test_override_publish_ip_none_is_byte_identical_to_legacy():
+    ingress = [{"host": "hello.modl-agent.com", "service": "web", "port": 8080}]
+    assert nuk.build_override("hello", ingress, publish_ip=None) == nuk.build_override(
+        "hello", ingress
+    )
+
+
+def test_host_port_overrides_publish_and_backend_to_avoid_collision():
+    """Two worker apps sharing container port 8080 must not collide on the host.
+    hostPort remaps the HOST side; the edge backend follows it.
+    """
+    ingress = [{"host": "b.modl-agent.com", "service": "web", "port": 8080, "hostPort": 8081}]
+    ov = nuk.build_override("b", ingress, publish_ip="10.0.1.20")
+    assert ov["services"]["web"]["ports"] == ["10.0.1.20:8081:8080"]  # host 8081 -> container 8080
+    doc = nuk.build_ingress("b", nuk.rewrite_ingress_for_edge(ingress, "10.0.1.20"))
+    assert doc["http"]["services"]["b-0"]["loadBalancer"]["servers"] == [
+        {"url": "http://10.0.1.20:8081"}  # edge hits the published host port
+    ]
+
+
+def test_host_port_field_parses_via_alias():
+    assert nuk.Ingress(host="h", service="s", port=8080, hostPort=8081).host_port == 8081
+    assert nuk.Ingress(host="h", service="s", port=8080).host_port is None
+
+
+def test_write_edge_ingress_stages_prefixed_file(tmp_path, monkeypatch):
+    """Staged under the worker- prefix so converge's --delete scopes to it and never
+    touches edge-native routers; empty ingress reaps the staged file.
+    """
+    monkeypatch.setattr(nuk, "EDGE_DYNAMIC", tmp_path)
+    nuk.write_edge_ingress("hello", [{"host": "hello.modl-agent.com", "address": "10.0.1.20:8080"}])
+    staged = tmp_path / "worker-hello.yml"
+    assert staged.exists()
+    doc = yaml.safe_load(staged.read_text())
+    assert doc["http"]["services"]["hello-0"]["loadBalancer"]["servers"] == [
+        {"url": "http://10.0.1.20:8080"}
+    ]
+    # empty ingress removes the staged file (app deleted / lost its ingress)
+    nuk.write_edge_ingress("hello", [])
+    assert not staged.exists()

@@ -8,6 +8,7 @@ compose project, optional ingress hosts, and env files. State lives entirely in
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -15,7 +16,9 @@ import secrets
 import shutil
 import subprocess  # noqa: S404  # all calls use fixed argv, no shell (see per-call S603/S607)
 import sys
+import urllib.error
 import urllib.request
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal, cast
 from urllib.parse import urlparse
@@ -28,15 +31,22 @@ from pydantic import (
     Field,
     PrivateAttr,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
-__version__ = "0.12.0"  # bumped on release by .github/workflows/release.yml
+__version__ = "0.16.0"  # bumped on release by .github/workflows/release.yml
 
 ROOT = Path("/opt/nuklaut")
 DEPLOYS = ROOT / "deployments"
 DYNAMIC = ROOT / "traefik" / "dynamic"
+# Worker-terminated routers are staged here (inert on a worker — no local Traefik)
+# for the orchestrator to deliver onto the EDGE's dynamic dir. See cmd_apply / finding 6.
+EDGE_DYNAMIC = ROOT / "traefik" / "edge-dynamic"
 SECRETS = ROOT / "secrets"
+# This host's identity, written world-readable (no secrets) by cloud-init. Absent on a
+# legacy single-host controller -> read_self() defaults to an entry role (byte-identical).
+HOST_ENV = Path("/etc/nuklaut/host.env")
 
 # Shared data stack — owned, reproducible source vendored at
 # files/docker-compose.data.yml (bring it up once on the controller). Apps reach
@@ -97,13 +107,65 @@ class Ingress(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
     host: str
-    service: str
-    port: int
+    service: str | None = None
+    port: int | None = None
+    # "<ip>:<port>" backend outside this host's docker "edge" network — e.g. a
+    # libvirt VM on a separate hypervisor host, reached over the private
+    # vswitch/cloud-network. Mutually exclusive with service/port.
+    address: str | None = None
     path: str | None = None
     strip_prefix: bool = Field(default=False, alias="stripPrefix")
     priority: int | None = None
     www: bool = False
-    auth: str | None = None
+    # When this app runs on a non-edge host (worker), its container port is published on
+    # the private IP for the edge Traefik to reach it. hostPort overrides the HOST side of
+    # that bind (default = port), so two worker apps sharing a container port don't collide
+    # on the host. Ignored on an edge/all-in-one host (no publish). Finding 6.
+    host_port: int | None = Field(default=None, alias="hostPort")
+    # Which gate to put in front of this route — NOT which implementation provides it.
+    # `oauth` resolves to whatever `facilities.auth` selected for the org, because every
+    # global.<impl>.yml deliberately defines the same middleware names (oauth-auth,
+    # oauth-errors). So an org on Authentik still writes `auth: oauth` here.
+    #
+    # ⚠ This MUST stay a closed set. It was a bare `str | None`, and build_ingress matches
+    #   it with if/elif and no else — so any unrecognised value rendered a router with NO
+    #   auth middleware and NO error. `auth: authentik` is the tempting way to write it
+    #   (it IS legal one layer up, in facilities.auth) and it silently published the route.
+    #   An authentication control that fails OPEN on a typo is exactly the silent-failure
+    #   class the 2026-07-21 rebuild exists to make structurally impossible.
+    auth: Literal["basic", "oauth"] | None = None
+
+    @field_validator("auth", mode="before")
+    @classmethod
+    def _reject_impl_names(cls, v: object) -> object:
+        """Point the implementation names at the capability name they belong to.
+
+        Raises:
+            ValueError: If `auth` names an auth *implementation* rather than the gate.
+        """
+        if isinstance(v, str) and v in {"authentik", "oauth2-proxy"}:
+            msg = (
+                f"ingress.auth={v!r} names an auth IMPLEMENTATION, which belongs in the "
+                f"org's facilities.auth. Per-route, write `auth: oauth` — it resolves to "
+                f"whichever implementation this org runs."
+            )
+            raise ValueError(msg)
+        return v
+
+    @model_validator(mode="after")
+    def _check_backend(self) -> Ingress:
+        """Exactly one backend: `address` (remote) or `service`+`port` (local).
+
+        Raises:
+            ValueError: If both or neither backend forms are given.
+        """
+        if self.address and (self.service is not None or self.port is not None):
+            msg = "ingress: set either `address` or `service`+`port`, not both"
+            raise ValueError(msg)
+        if not self.address and (self.service is None or self.port is None):
+            msg = "ingress: `service` and `port` are required unless `address` is set"
+            raise ValueError(msg)
+        return self
 
 
 class EnvFrom(BaseModel):
@@ -201,7 +263,7 @@ class Facilities(BaseModel):
     dns_provider: str | None = Field(default=None, alias="dnsProvider")
     secrets: Literal["sops", "generate", "ci-inject"]
     auth: Literal["basic", "oauth2-proxy", "authentik"]
-    runners: Literal["ephemeral", "persistent"]
+    runners: Literal["none", "ephemeral", "persistent"]
     data: OrgData = OrgData()
 
     @model_validator(mode="after")
@@ -218,24 +280,120 @@ class Facilities(BaseModel):
         if self.tls == "dns01" and not self.dns_provider:
             msg = "facilities.tls=dns01 requires facilities.dnsProvider"
             raise ValueError(msg)
+        if self.dns == "manual" and self.tls != "http01":
+            # Manual DNS cannot answer the DNS-01 challenge automatically; the only
+            # operated pairing for manual records is the HTTP-01 challenge.
+            msg = "facilities.dns=manual requires facilities.tls=http01"
+            raise ValueError(msg)
         return self
 
 
-class Controller(BaseModel):
-    """`controller` — how this org's controller host is provisioned + reached."""
+class Network(BaseModel):
+    """`network` — the private-network plan (Hetzner Cloud-Network + vSwitch).
+
+    Declared from the start but only wired up from the multi-host chapter on; a
+    single-host org may omit it entirely (then no subnet checks run).
+    """
 
     model_config = ConfigDict(populate_by_name=True)
 
-    hostname: str
-    provisioner: Literal["terraform", "manual", "ansible"]
-    deploy_mode: Literal["ssh", "local"] = Field(default="ssh", alias="deployMode")
+    cidr: str
+    cloud_subnet: str = Field(alias="cloudSubnet")
+    vswitch_subnet: str = Field(alias="vswitchSubnet")
+    vswitch_vlan: int = Field(alias="vswitchVlan")
+    vswitch_name: str | None = Field(default=None, alias="vswitchName")
 
 
-class Pins(BaseModel):
-    """`pins` — pinned generic-core + nuk versions this org runs (owner/repo@ref)."""
+class Host(BaseModel):
+    """`hosts[]` — one machine or VM the org runs, addressed by its private IP."""
 
-    core: str
-    nuk: str | None = None
+    model_config = ConfigDict(populate_by_name=True)
+
+    name: str
+    provider: Literal["hcloud", "libvirt", "incus", "metal", "manual"]
+    role: Literal["edge", "data", "worker", "hypervisor", "all-in-one"]
+    private_ip: str = Field(alias="privateIp")
+    type: str | None = None  # hcloud server type, e.g. cx23
+    ip: str | None = None  # public IP for manual/metal hosts
+    metal: str | None = None  # libvirt: the hypervisor host it runs on
+    vcpu: int | None = None
+    memory: str | None = None
+
+
+def _ip_in_cidr(ip: str, cidr: str) -> bool:
+    """Return whether `ip` falls inside the `cidr` block (False if either won't parse)."""
+    try:
+        return ipaddress.ip_address(ip) in ipaddress.ip_network(cidr, strict=False)
+    except ValueError:
+        return False
+
+
+_ENTRY_ROLES = frozenset({"edge", "all-in-one"})
+
+
+def _check_domains(platform_domain: str, domains: list[str]) -> None:
+    """Raise unless the platform domain is one of the managed domains."""
+    if platform_domain not in domains:
+        msg = f"platformDomain {platform_domain!r} must be one of domains {domains}"
+        raise ValueError(msg)
+
+
+def _check_unique(hosts: list[Host]) -> None:
+    """Raise if any host name or private IP is duplicated."""
+    names = [h.name for h in hosts]
+    if len(names) != len(set(names)):
+        msg = "hosts[].name must be unique"
+        raise ValueError(msg)
+    ips = [h.private_ip for h in hosts]
+    if len(ips) != len(set(ips)):
+        msg = "hosts[].privateIp must be unique"
+        raise ValueError(msg)
+
+
+def _check_entry_and_mesh(hosts: list[Host], mesh: str) -> None:
+    """Raise unless there is exactly one entry-point host and mesh fits the count."""
+    entry = [h for h in hosts if h.role in _ENTRY_ROLES]
+    if len(entry) != 1:
+        msg = "exactly one host must have role 'edge' or 'all-in-one'"
+        raise ValueError(msg)
+    if mesh == "none" and len(hosts) != 1:
+        # VMs on a hypervisor's bridge need no mesh: they share the bridge with
+        # the hypervisor host, which is the entry point. Any other multi-host
+        # shape must declare a mesh to reach across hosts.
+        bridge_hosts = [
+            h for h in hosts if h.provider in {"incus", "libvirt"} or h.role == "hypervisor"
+        ]
+        if len(bridge_hosts) != len(hosts):
+            msg = "mesh: none is only valid with a single host"
+            raise ValueError(msg)
+
+
+def _check_vm_hosts(hosts: list[Host]) -> None:
+    """Raise unless every libvirt/incus host names an existing hypervisor host in `metal`."""
+    hypervisors = {h.name for h in hosts if h.role == "hypervisor"}
+    for h in hosts:
+        if h.provider not in {"libvirt", "incus"}:
+            continue
+        if not h.metal:
+            msg = f"host {h.name}: provider {h.provider} requires 'metal' (its hypervisor host)"
+            raise ValueError(msg)
+        if h.metal not in hypervisors:
+            msg = f"host {h.name}: metal {h.metal!r} is not a hypervisor host in this org"
+            raise ValueError(msg)
+
+
+def _check_subnets(hosts: list[Host], network: Network) -> None:
+    """Raise unless every host's private IP sits in its provider's declared subnet."""
+    for h in hosts:
+        if h.role == "hypervisor":
+            # The hypervisor's privateIp is its management IP, not an app subnet.
+            continue
+        cloud = h.provider == "hcloud"
+        subnet = network.cloud_subnet if cloud else network.vswitch_subnet
+        if not _ip_in_cidr(h.private_ip, subnet):
+            field = "cloudSubnet" if cloud else "vswitchSubnet"
+            msg = f"host {h.name}: privateIp {h.private_ip} is not in {field} {subnet}"
+            raise ValueError(msg)
 
 
 class Org(BaseModel):
@@ -246,12 +404,46 @@ class Org(BaseModel):
     api_version: Literal["nukorg/v1"] = Field(alias="apiVersion")
     kind: Literal["Org"]
     metadata: Metadata
-    domain: str
+    domains: list[str]
+    platform_domain: str = Field(alias="platformDomain")
     acme_email: str = Field(alias="acmeEmail")
-    controller: Controller
+    network: Network | None = None
+    hosts: list[Host]
     facilities: Facilities
+    mesh: Literal["tailscale", "none"] = "none"
     overlays: list[str] = []
-    pins: Pins
+
+    @model_validator(mode="after")
+    def _check_topology(self) -> Org:
+        """Enforce the host-topology invariants the platform relies on.
+
+        Raises:
+            ValueError: On any violated invariant (unique names/IPs, exactly one
+                entry-point host, mesh/host-count coupling, libvirt→hypervisor,
+                platformDomain membership, and private-IP subnet placement).
+        """
+        _check_domains(self.platform_domain, self.domains)
+        _check_unique(self.hosts)
+        _check_entry_and_mesh(self.hosts, self.mesh)
+        _check_vm_hosts(self.hosts)
+        if self.network is not None:
+            _check_subnets(self.hosts, self.network)
+        return self
+
+
+def validate_ingress_hosts(org: Org, manifest: Manifest) -> None:
+    """Assert every ingress host in `manifest` ends on one of the org's domains.
+
+    Args:
+        org: The validated Org (its `domains` are the managed set).
+        manifest: A deployment manifest whose ingress hosts must be covered.
+
+    Raises:
+        SystemExit: If any ingress host is not under a managed domain.
+    """
+    for ing in manifest.spec.ingress:
+        if not any(ing.host == d or ing.host.endswith(f".{d}") for d in org.domains):
+            sys.exit(f"nuk: ingress host {ing.host!r} is not under a managed domain {org.domains}")
 
 
 def sh(*cmd: str, cwd: Path | None = None) -> None:
@@ -448,12 +640,13 @@ def resolve_env_from(spec: dict) -> list[str]:
     return refs
 
 
-def build_override(
+def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-contract API; one render pass
     name: str,  # noqa: ARG001  # kept for signature stability (frozen wire-contract API / tests)
     ingress: list[dict],
     db_env: str | None = None,
     env_from: list[str] | None = None,
     db_services: list[str] | None = None,
+    publish_ip: str | None = None,
 ) -> dict | None:
     """Compose override wiring services to the shared edge/data networks + secrets.
 
@@ -482,6 +675,10 @@ def build_override(
         env_from: Resolved `spec.envFrom` secret-file paths.
         db_services: Services that should receive the db creds + data network;
             None means "the ingress services" (the legacy default).
+        publish_ip: When set (a worker with no local Traefik), ingress services
+            PUBLISH their port on this private IP (so the edge Traefik reaches
+            them over the cloud-network) instead of joining the local `edge`
+            network. None (the default) => unchanged, edge-network behavior.
 
     Returns:
         The override doc, or None when no service needs any wiring.
@@ -492,35 +689,51 @@ def build_override(
     db_set = set(db_targets) if db_env else set()
     # Ingress order first, then any db-only (non-ingress) services, deduped.
     ordered = list(dict.fromkeys([*ingress_services, *db_targets]))
+    # Worker edge-termination: collect the private-IP port bindings per service.
+    # Bind on publish_ip (not 0.0.0.0) so the app stays reachable ONLY via the edge.
+    publish_ports: dict[str, list[str]] = {}
+    if publish_ip:
+        for ing in ingress:
+            svc, port = ing.get("service"), ing.get("port")
+            if svc and port is not None:
+                host_port = ing.get("hostPort") or port
+                mapping = f"{publish_ip}:{host_port}:{port}"
+                publish_ports.setdefault(svc, [])
+                if mapping not in publish_ports[svc]:
+                    publish_ports[svc].append(mapping)
     services: dict = {}
     for svc_name in ordered:
         is_ingress = svc_name in ingress_services
         is_db = svc_name in db_set
-        nets = (["edge"] if is_ingress else []) + (["data"] if is_db else [])
+        # Publishing on a private IP replaces the (inert) local `edge` join.
+        nets = (["edge"] if is_ingress and not publish_ip else []) + (["data"] if is_db else [])
         env_files = [*env_from, *([db_env] if is_db else [])]
         svc: dict = {"networks": nets}
+        if publish_ip and svc_name in publish_ports:
+            svc["ports"] = publish_ports[svc_name]
         if env_files:
             svc["env_file"] = env_files
         services[svc_name] = svc
     if not services:
         return None
     networks: dict = {}
-    if any(s in ingress_services for s in services):
+    if not publish_ip and any(s in ingress_services for s in services):
         networks["edge"] = {"external": True}
     if any(s in db_set for s in services):
         networks["data"] = {"external": True}
     return {"services": services, "networks": networks}
 
 
-def write_override(
+def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override's frozen API
     name: str,
     ingress: list[dict],
     db_env: str | None = None,
     env_from: list[str] | None = None,
     db_services: list[str] | None = None,
+    publish_ip: str | None = None,
 ) -> None:
     """Render and write `compose.override.yml` for an app (no-op when empty)."""
-    doc = build_override(name, ingress, db_env, env_from, db_services)
+    doc = build_override(name, ingress, db_env, env_from, db_services, publish_ip)
     if doc is None:
         return
     (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc))
@@ -585,7 +798,10 @@ def _rule(ing: dict) -> str:
 def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901, PLR0912  # one router-build loop; clean extraction would obscure the per-field ordering
     """Render the Traefik file-provider doc, or None to remove the dynamic file.
 
-    Each entry needs host/service/port. Optional, all backward-compatible:
+    Each entry needs host + (service/port, a local docker "edge"-network
+    container) or (address, a remote "<ip>:<port>" backend — e.g. a libvirt VM
+    on another host, reached over the private vswitch/cloud-network). Optional,
+    all backward-compatible:
       path        adds PathPrefix(`<path>`) to the router rule
       stripPrefix strip `path` before proxying (needs path)
       priority    explicit router priority (Traefik else ranks by rule length)
@@ -618,10 +834,21 @@ def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901,
         # errors (outer) catches the 401-403 the auth (inner) returns and serves
         # the sign-in page. Both middlewares live in global.yml; this host also
         # needs an oauth2-proxy /oauth2/ route (see docker-compose.traefik.yml).
+        # ⚠ The else is load-bearing. Without it an unrecognised value fell through to a
+        #   router with no auth middleware and no error — a security control failing OPEN.
+        #   Ingress.auth is a closed Literal now, but this function also takes raw dicts,
+        #   so it refuses unknown values itself rather than trusting its caller.
         if ing.get("auth") == "oauth":
             mw += ["oauth-errors@file", "oauth-auth@file"]
         elif ing.get("auth") == "basic":
             mw += ["auth@file"]
+        elif ing.get("auth") is not None:
+            msg = (
+                f"ingress.auth={ing['auth']!r} is not a known gate (expected 'oauth' or "
+                f"'basic'). Refusing to render an UNAUTHENTICATED router for a route that "
+                f"asked to be gated."
+            )
+            raise ValueError(msg)
         if ing.get("path") and ing.get("stripPrefix"):
             sid = f"{rid}-strip"
             middlewares[sid] = {"stripPrefix": {"prefixes": [ing["path"]]}}
@@ -634,11 +861,13 @@ def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901,
         if "priority" in ing:
             router["priority"] = ing["priority"]
         routers[rid] = router
-        services[rid] = {
-            "loadBalancer": {
-                "servers": [{"url": f"http://{name}-{ing['service']}-1:{ing['port']}"}]
-            }
-        }
+        # `address` (remote host:port) bypasses the local edge-network container
+        # naming convention entirely — used for backends on another host (e.g. a
+        # libvirt VM reached over the private vswitch/cloud-network).
+        backend = (
+            ing["address"] if ing.get("address") else f"{name}-{ing['service']}-1:{ing['port']}"
+        )
+        services[rid] = {"loadBalancer": {"servers": [{"url": f"http://{backend}"}]}}
         if ing.get("www"):
             host = ing["host"]
             wid, rdid = f"{rid}-www", f"{rid}-www-redirect"
@@ -665,6 +894,66 @@ def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901,
 def write_ingress(name: str, ingress: list[dict]) -> None:
     """Render and write the Traefik dynamic file for an app (removes it if empty)."""
     target = DYNAMIC / f"{name}.yml"
+    doc = build_ingress(name, ingress)
+    if doc is None:
+        target.unlink(missing_ok=True)
+        return
+    target.write_text(yaml.safe_dump(doc))
+
+
+def read_self() -> tuple[str, str | None]:
+    """Return (role, private_ip) for THIS host from /etc/nuklaut/host.env.
+
+    cloud-init writes ROLE + PRIVATE_IP there (world-readable, no secrets). When
+    the file is absent or unparseable — a legacy single-host controller — this
+    returns ("all-in-one", None): an entry role, so apply keeps writing ingress
+    locally and every existing render stays byte-identical.
+    """
+    role, private_ip = "all-in-one", None
+    try:
+        for raw_line in HOST_ENV.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if line.startswith("ROLE="):
+                role = line[len("ROLE=") :].strip() or role
+            elif line.startswith("PRIVATE_IP="):
+                private_ip = line[len("PRIVATE_IP=") :].strip() or None
+    except OSError:
+        pass
+    return role, private_ip
+
+
+def rewrite_ingress_for_edge(ingress: list[dict], self_ip: str) -> list[dict]:
+    """Rewrite local-backend ingress entries to the remote `address` form.
+
+    A non-edge host (worker) has no local Traefik, so its router must live on the
+    edge with an `address: <self_ip>:<port>` backend — the port build_override
+    publishes on the private IP. Entries that already carry `address` (a remote
+    backend, e.g. a libvirt VM) pass through unchanged. `auth`/`path`/`stripPrefix`/
+    `priority`/`www` are preserved verbatim so the edge router gates identically.
+    """
+    out: list[dict] = []
+    for ing in ingress:
+        if ing.get("address") or not ing.get("service"):
+            out.append(ing)
+            continue
+        rewritten = {k: v for k, v in ing.items() if k not in {"service", "port", "hostPort"}}
+        rewritten["address"] = f"{self_ip}:{ing.get('hostPort') or ing['port']}"
+        out.append(rewritten)
+    return out
+
+
+def write_edge_ingress(name: str, ingress: list[dict]) -> None:
+    """Stage an app's Traefik router for delivery to the edge (worker apps).
+
+    Mirrors write_ingress but targets EDGE_DYNAMIC — a staging dir the orchestrator
+    (converge.sh) rsyncs into the edge's watched dynamic/ dir. The `worker-` prefix
+    lets the delivery scope its --delete to worker routers only, so edge-native
+    routers (Authentik, maintenance) are never touched. Flat file in the watched
+    dir, so it loads exactly like the edge's own routers — no subdir recursion
+    assumption. Inert on the worker itself (no local Traefik). Removed when empty.
+    """
+    EDGE_DYNAMIC.mkdir(parents=True, exist_ok=True)
+    target = EDGE_DYNAMIC / f"worker-{name}.yml"
     doc = build_ingress(name, ingress)
     if doc is None:
         target.unlink(missing_ok=True)
@@ -1025,6 +1314,433 @@ def purge_databases(app: str) -> None:
     (SECRETS / f"{app}-db.env").unlink(missing_ok=True)
 
 
+# --- provenance-on-apply -------------------------------------------------------
+# `nuk apply` stamps DEPLOYS/<name>/provenance.json with the exact commit/image
+# it deployed, so `status` has a trustworthy source even for rsync-mirrored
+# (.git-less) workflow deploys. Best-effort by design: see the try/except around
+# its only call site in cmd_apply.
+
+
+def _iso_utc_now() -> str:
+    """Current time as an ISO-8601 UTC timestamp with a `Z` suffix."""
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _provenance_path(name: str) -> Path:
+    """On-disk path of an app's provenance record."""
+    return project_dir(name) / "provenance.json"
+
+
+def read_provenance(name: str) -> dict | None:
+    """Read an app's provenance.json, or None if absent/unreadable/malformed."""
+    path = _provenance_path(name)
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def write_provenance(
+    name: str, *, repo: str | None, branch: str, commit: str | None, image_digest: str | None
+) -> None:
+    """Write DEPLOYS/<name>/provenance.json — the trustworthy source `status` prefers.
+
+    Raises on write failure; the caller (`cmd_apply`) treats this as best-effort
+    and must not fail the deploy over it.
+
+    Args:
+        name: The deployment name.
+        repo: The declared source repo, if any.
+        branch: The declared source branch.
+        commit: The full deployed commit sha, if resolvable.
+        image_digest: The deployed image's digest, if resolvable.
+    """
+    payload = {
+        "repo": repo,
+        "branch": branch,
+        "commit": commit,
+        "imageDigest": image_digest,
+        "appliedAt": _iso_utc_now(),
+    }
+    _provenance_path(name).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _full_commit_sha(repo_dir: Path) -> str | None:
+    """Full HEAD sha of `repo_dir`'s checkout, or None if unavailable."""
+    try:
+        out = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],  # noqa: S607  # git on PATH
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=4,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return out or None
+
+
+def _parse_compose_images_json(text: str) -> list[dict]:
+    """Parse `docker compose images --format json` output (one array or JSON-lines)."""
+    text = text.strip()
+    if not text:
+        return []
+    try:
+        if text.startswith("["):
+            data = json.loads(text)
+            return data if isinstance(data, list) else []
+        return [json.loads(line) for line in text.splitlines() if line.strip()]
+    except (ValueError, json.JSONDecodeError):
+        return []
+
+
+def _resolve_image_digest(name: str, raw: dict) -> str | None:
+    """Best-effort digest of the app's first compose image, or None if unresolvable."""
+    try:
+        proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            [*compose_args(name, raw), "images", "--format", "json"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=15,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    rows = _parse_compose_images_json(proc.stdout)
+    if not rows:
+        return None
+    repository = rows[0].get("Repository")
+    if not repository:
+        return None
+    tag = rows[0].get("Tag") or "latest"
+    try:
+        digest = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["docker", "inspect", "--format", "{{index .RepoDigests 0}}", f"{repository}:{tag}"],  # noqa: S607  # docker on PATH
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return digest or None
+
+
+# --- status overview (nukview data-layer port) ---------------------------------
+# Ported from nukview's server-only data layer (buildOverview/readApp/driftFor in
+# nukview's $lib/server/nuk.ts) so the overview logic lives in ONE place; nukview
+# becomes a thin renderer over this JSON. Field names mirror nukview's types.ts
+# by key so the renderer needs no remap. Every field degrades on a missing
+# source — this never throws out of build_overview().
+
+
+def _read_yaml_safe(path: Path) -> dict | list | None:
+    """Best-effort YAML read: None on any I/O or parse error, never raises."""
+    try:
+        return yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+
+
+def _git_provenance(repo_dir: Path) -> dict:
+    """Full commit sha + committer date + github web URL for `repo_dir`'s HEAD.
+
+    Returns {} when there is no checkout / no commit — the caller degrades that
+    field rather than failing.
+    """
+    try:
+        out = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["git", "-C", str(repo_dir), "log", "-1", "--format=%H%x09%cI"],  # noqa: S607  # git on PATH
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=4,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return {}
+    if not out:
+        return {}
+    full_commit, _, date = out.partition("\t")
+    return {
+        "full_commit": full_commit,
+        "last_commit": date or None,
+        "repo_url": git_origin(str(repo_dir)),
+    }
+
+
+_VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
+def _read_version(repo_dir: Path) -> str | None:
+    """Best-effort app version: pyproject.toml > package.json > `git describe`.
+
+    Mirrors nukview's readVersion — the controller checkout has no tags, so
+    version files win; `git describe` is the floor and degrades to a short sha.
+    """
+    pyproject = repo_dir / "pyproject.toml"
+    if pyproject.exists():
+        m = _VERSION_RE.search(pyproject.read_text(encoding="utf-8"))
+        if m:
+            return m.group(1)
+    package_json = repo_dir / "package.json"
+    if package_json.exists():
+        try:
+            data = json.loads(package_json.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = None
+        version = data.get("version") if isinstance(data, dict) else None
+        if isinstance(version, str):
+            return version
+    try:
+        out = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["git", "-C", str(repo_dir), "describe", "--tags", "--always", "--abbrev=7"],  # noqa: S607
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=4,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return out or None
+
+
+def _list_workflows(repo_dir: Path) -> list[dict]:
+    """GitHub Actions workflows in `repo_dir`, with normalised trigger events."""
+    wf_dir = repo_dir / ".github" / "workflows"
+    if not wf_dir.is_dir():
+        return []
+    out = []
+    for f in sorted(wf_dir.iterdir()):
+        if f.suffix not in {".yml", ".yaml"}:
+            continue
+        doc = _read_yaml_safe(f)
+        doc = doc if isinstance(doc, dict) else {}
+        # YAML 1.1 parses the bare key `on:` as the boolean True — PyYAML follows
+        # that resolver, so a GitHub Actions workflow's trigger key lands under
+        # `True`, not the string "on". Check both.
+        on = doc.get("on", doc.get(True))
+        if isinstance(on, str):
+            triggers = [on]
+        elif isinstance(on, list):
+            triggers = on
+        elif isinstance(on, dict):
+            triggers = list(on.keys())
+        else:
+            triggers = []
+        name = doc.get("name")
+        wf_name = name if isinstance(name, str) else f.name
+        out.append({"file": f.name, "name": wf_name, "triggers": triggers})
+    return out
+
+
+def _dynamic_routers(name: str) -> list[dict] | None:
+    """Router id/rule pairs nuk rendered into the Traefik file provider for `name`."""
+    doc = _read_yaml_safe(DYNAMIC / f"{name}.yml")
+    http = doc.get("http") if isinstance(doc, dict) else None
+    routers = http.get("routers") if isinstance(http, dict) else None
+    if not routers:
+        return None
+    return [
+        {"id": rid, "rule": (r or {}).get("rule", ""), "live": None} for rid, r in routers.items()
+    ]
+
+
+def _probe(host: str, timeout: float = 2.5) -> str | None:
+    """Black-box "is it serving?" — outbound HTTPS HEAD, never Docker.
+
+    Any HTTP answer (incl. 3xx/4xx) means Traefik routed to a live backend;
+    >=500 means the backend is down / showing the maintenance page. An
+    unreachable host (DNS, TLS, timeout, connection refused) is unknown (None),
+    not "missing" — nuk cannot tell "no DNS" from "not my problem" from here.
+    """
+    req = urllib.request.Request(f"https://{host}/", method="HEAD")  # noqa: S310  # fixed https scheme
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # fixed https scheme
+            status = resp.status
+    except urllib.error.HTTPError as e:
+        status = e.code
+    except (urllib.error.URLError, OSError, TimeoutError):
+        return None
+    return "missing" if status >= 500 else "enabled"  # noqa: PLR2004  # HTTP status code, not a magic number
+
+
+def _annotate_routers(routers: list[dict] | None, hosts: list[str]) -> list[dict]:
+    """Attach a best-effort live probe to each router, matched by its rule's host."""
+    live_by_host = {h: _probe(h) for h in hosts}
+    out = []
+    for r in routers or []:
+        host = next((h for h in hosts if f"`{h}`" in r.get("rule", "")), None)
+        out.append({**r, "live": live_by_host.get(host) if host else None})
+    return out
+
+
+def _drift_for(hosts: list[str], routers: list[dict] | None) -> str:
+    """Two-file consistency check between the manifest's hosts and Traefik's routers.
+
+    Does every manifest ingress host appear in a router nuk actually rendered?
+    Compares two files nuk itself wrote — never re-renders. Returns "unknown"
+    when there are no hosts to check, "drift" when the dynamic file is missing
+    or a host is absent from it, else "in-sync".
+    """
+    if not hosts:
+        return "unknown"
+    if routers is None:
+        return "drift"
+    blob = " ".join(r.get("rule", "") for r in routers)
+    return "in-sync" if all(f"`{h}`" in blob for h in hosts) else "drift"
+
+
+def _overview_ingress_fields(spec: dict) -> tuple[list[str], list[dict]]:
+    """Deduped host list + full ingress view list from a manifest's `spec.ingress`."""
+    entries = [i for i in (spec.get("ingress") or []) if isinstance(i, dict) and i.get("host")]
+    hosts = list(dict.fromkeys(i["host"] for i in entries))
+    ingress = [
+        {
+            "host": i["host"],
+            "service": i.get("service"),
+            "port": i.get("port"),
+            "path": i.get("path"),
+            "auth": i.get("auth"),
+        }
+        for i in entries
+    ]
+    return hosts, ingress
+
+
+def _overview_features(spec: dict) -> dict:
+    """`spec.databases` -> the declared-backing-services view."""
+    databases = spec.get("databases")
+    databases = databases if isinstance(databases, dict) else {}
+    pg = databases.get("postgres")
+    return {
+        "postgres": bool(pg),
+        "redis": bool(databases.get("redis")),
+        "postgresDriver": pg.get("driver") if isinstance(pg, dict) else None,
+    }
+
+
+def _overview_provenance(
+    name: str, source_raw: dict | None
+) -> tuple[str | None, str | None, str | None, str | None, str | None]:
+    """commit/commitUrl/repoUrl/lastCommit/imageDigest, provenance.json-first.
+
+    Returns:
+        (commit, commit_url, repo_url, last_commit, image_digest) — each None
+        when its source is unavailable.
+    """
+    repo_dir = project_dir(name) / "repo"
+    provenance = read_provenance(name)
+    git_prov = _git_provenance(repo_dir)
+
+    full_commit = (provenance or {}).get("commit") or git_prov.get("full_commit")
+    commit = full_commit[:12] if full_commit else None
+
+    web = git_prov.get("repo_url")
+    commit_url = f"{web}/commit/{full_commit}" if web and full_commit else None
+    declared_repo_url = (
+        github_url(source_raw["repo"]) if source_raw and source_raw.get("repo") else None
+    )
+    return (
+        commit,
+        commit_url,
+        declared_repo_url or web,
+        git_prov.get("last_commit"),
+        (provenance or {}).get("imageDigest"),
+    )
+
+
+def _read_app_overview(name: str, *, probe_enabled: bool = False) -> dict:
+    """Build one app's Overview entry from on-disk state. Degrades; never raises."""
+    notes: list[str] = []
+    manifest_raw = _read_yaml_safe(project_dir(name) / "manifest.yml")
+    if manifest_raw is None:
+        notes.append("manifest.yml unreadable")
+    spec = manifest_raw.get("spec") if isinstance(manifest_raw, dict) else None
+    spec = spec if isinstance(spec, dict) else {}
+
+    hosts, ingress = _overview_ingress_fields(spec)
+    source_raw = spec.get("source") if isinstance(spec.get("source"), dict) else None
+    source = (
+        {"repo": source_raw.get("repo"), "branch": source_raw.get("branch")} if source_raw else None
+    )
+
+    commit, commit_url, repo_url, last_commit, image_digest = _overview_provenance(name, source_raw)
+    if not commit:
+        notes.append("no git checkout / commit unavailable")
+
+    repo_dir = project_dir(name) / "repo"
+    routers = _dynamic_routers(name)
+    routers_out = _annotate_routers(routers, hosts) if probe_enabled else (routers or [])
+
+    return {
+        "name": name,
+        "hosts": hosts,
+        "source": source,
+        "repoUrl": repo_url,
+        "commit": commit,
+        "commitUrl": commit_url,
+        "lastCommit": last_commit,
+        "version": _read_version(repo_dir),
+        "routers": routers_out,
+        "drift": _drift_for(hosts, routers),
+        "features": _overview_features(spec),
+        "workflows": _list_workflows(repo_dir),
+        "ingress": ingress,
+        "notes": notes,
+        "imageDigest": image_digest,
+    }
+
+
+def build_overview(*, probe_enabled: bool = False) -> dict:
+    """Walk DEPLOYS/*/ and build the org-wide status Overview. Degrades; never raises."""
+    errors: list[str] = []
+    names: list[str] = []
+    if DEPLOYS.exists():
+        names = sorted(p.name for p in DEPLOYS.iterdir() if p.is_dir())
+    else:
+        errors.append(f"cannot read {DEPLOYS} — is /opt/nuklaut mounted?")
+    return {
+        "apps": [_read_app_overview(n, probe_enabled=probe_enabled) for n in names],
+        "liveRoutingAvailable": False,  # Traefik api@internal integration is a later chapter
+        "nukRoot": str(ROOT),
+        "generatedAt": _iso_utc_now(),
+        "errors": errors,
+    }
+
+
+def _soll_vs_ist(overview: dict, org_file: Path | None) -> dict:
+    """`--all`: declared org hosts (soll) vs this command's local observation (ist).
+
+    Args:
+        overview: The already-built Overview dict (read for its observed app count).
+        org_file: Path to the org manifest (`nuklaut.org.yml`); required.
+
+    Returns:
+        The extra top-level keys `status --all` adds to the Overview.
+
+    Raises:
+        SystemExit: When `org_file` is not given, or is not a valid Org manifest.
+    """
+    if org_file is None:
+        sys.exit("nuk status --all: --org-file PATH is required (path to nuklaut.org.yml)")
+    org = load_org(org_file)
+    return {
+        "hosts": [h.model_dump(by_alias=True) for h in org.hosts],
+        "sollVsIst": {
+            "declaredHosts": len(org.hosts),
+            # TODO(K2.5): per-host observed via DOCKER_HOST fan-out (ssh per host,  # noqa: FIX002
+            # one nuk status per host, merge). Kapitel 1 is single-host, so
+            # "observed" is just this controller — the one this command runs on.
+            "observedHosts": 1,
+            "declaredApps": None,  # nukorg/v1 does not declare apps (yet)
+            "observedApps": len(overview["apps"]),
+        },
+    }
+
+
 # --- command layer ------------------------------------------------------------
 # Commands read typed scalars off the validated Manifest but pass its raw dict
 # (manifest.raw / manifest.raw["spec"]) to the wire-contract render functions.
@@ -1080,13 +1796,42 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
             f"{name}: spec.envFrom secrets resolved but no ingress service to "
             f"attach them to — they won't be injected. Add an ingress entry."
         )
-    write_override(name, ingress, db_env, env_from, db_services)
-    write_ingress(name, ingress)
+    # Finding 6: a non-edge host (worker) has no local Traefik, so its ingress must
+    # terminate on the EDGE. Publish the container port on this host's private IP and
+    # STAGE the router (address:<self_ip>:<port> + auth) for the orchestrator to
+    # deliver to the edge; the local dynamic file would be inert here anyway.
+    role, self_ip = read_self()
+    edge_term = role not in _ENTRY_ROLES and bool(ingress)
+    if edge_term and self_ip is None:
+        sys.exit(
+            f"{name}: host is non-edge (role={role}) but /etc/nuklaut/host.env has no "
+            f"PRIVATE_IP — cannot publish ingress for edge termination"
+        )
+    write_override(name, ingress, db_env, env_from, db_services,
+                   publish_ip=self_ip if edge_term else None)
+    if edge_term:
+        write_edge_ingress(name, rewrite_ingress_for_edge(ingress, self_ip))
+        (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)  # keep the inert local dir clean
+    else:
+        write_ingress(name, ingress)
     persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
     # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
     # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
     # whose image id changed.
     sh(*compose_args(name, raw), "up", "-d")
+    # Provenance is best-effort: `status` prefers it over the live repo/ checkout
+    # (trustworthy even for rsync-mirrored, .git-less workflow deploys), but a
+    # write failure here must never fail an otherwise-successful apply.
+    try:
+        write_provenance(
+            name,
+            repo=source.repo,
+            branch=source.branch,
+            commit=_full_commit_sha(repo) if (repo / ".git").exists() else None,
+            image_digest=_resolve_image_digest(name, raw),
+        )
+    except OSError as e:
+        print(f"{name}: provenance not recorded ({e})")
 
 
 def cmd_get() -> None:
@@ -1187,6 +1932,23 @@ def cmd_status(name: str) -> None:
     print(f"  revision: {_applied_revision(name)}")
 
 
+def cmd_status_overview(
+    *, pretty: bool, show_all: bool, org_file: Path | None, probe: bool
+) -> None:
+    """Print the org-wide status Overview as JSON (walks DEPLOYS/*/; see build_overview).
+
+    Args:
+        pretty: Indent the JSON for human scanning; compact (single-line) otherwise.
+        show_all: Also emit the `--all` soll-vs-ist block (needs `org_file`).
+        org_file: Path to `nuklaut.org.yml`, required when `show_all` is set.
+        probe: Best-effort outbound HTTPS probe per ingress host (off by default).
+    """
+    overview = build_overview(probe_enabled=probe)
+    if show_all:
+        overview.update(_soll_vs_ist(overview, org_file))
+    print(json.dumps(overview, indent=2 if pretty else None))
+
+
 def cmd_logs(name: str) -> None:
     """Follow compose logs for a deployment."""
     manifest = load(project_dir(name) / "manifest.yml")
@@ -1211,6 +1973,8 @@ def cmd_delete(name: str, purge: bool) -> None:
         manifest = load(pdir / "manifest.yml")
         subprocess.run([*compose_args(name, manifest.raw), "down", "-v"], check=False)  # noqa: S603  # argv built from fixed verbs
     (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)
+    # Staged edge router (worker apps); next converge delivery reaps it off the edge.
+    (EDGE_DYNAMIC / f"worker-{name}.yml").unlink(missing_ok=True)
     shutil.rmtree(pdir, ignore_errors=True)
     # The app's database is kept by default — its creds file (in SECRETS, not
     # pdir) survives rmtree and keeps nuk aware of it (see `nuk db ls`). --purge
@@ -1261,9 +2025,7 @@ def _known_deployments() -> list[str]:
     """
     if not DEPLOYS.exists():
         return []
-    return sorted(
-        p.name for p in DEPLOYS.iterdir() if p.is_dir() and (p / "manifest.yml").exists()
-    )
+    return sorted(p.name for p in DEPLOYS.iterdir() if p.is_dir() and (p / "manifest.yml").exists())
 
 
 def complete_deployment_name(incomplete: str) -> list[str]:
@@ -1386,11 +2148,40 @@ def _apply(
 @app.command("status")
 def _status(
     name: Annotated[
-        str, typer.Argument(help="deployment name", autocompletion=complete_deployment_name)
-    ],
+        str | None,
+        typer.Argument(
+            help="deployment name; omit for the org-wide overview",
+            autocompletion=complete_deployment_name,
+        ),
+    ] = None,
+    pretty: Annotated[
+        bool,
+        typer.Option("--json", help="pretty-print the org-wide overview (always JSON either way)"),
+    ] = False,
+    show_all: Annotated[
+        bool,
+        typer.Option(
+            "--all",
+            help="org-wide: also compare against the declared org manifest (needs --org-file)",
+        ),
+    ] = False,
+    org_file: Annotated[
+        Path | None,
+        typer.Option("--org-file", help="path to nuklaut.org.yml (required with --all)"),
+    ] = None,
+    probe: Annotated[
+        bool,
+        typer.Option(
+            "--probe",
+            help="org-wide: best-effort outbound HTTPS probe per ingress host (off by default)",
+        ),
+    ] = False,
 ) -> None:
-    """Show one app's health, ingress, databases (redacted URLs), and source."""
-    cmd_status(name)
+    """Show one app's health/ingress/databases/source (NAME), or the org-wide overview as JSON."""
+    if name is not None:
+        cmd_status(name)
+        return
+    cmd_status_overview(pretty=pretty, show_all=show_all, org_file=org_file, probe=probe)
 
 
 @app.command("logs")
@@ -1443,9 +2234,7 @@ def _db_ls() -> None:
 
 @db_app.command("purge")
 def _db_purge(
-    name: Annotated[
-        str, typer.Argument(help="deployment name", autocompletion=complete_db_name)
-    ],
+    name: Annotated[str, typer.Argument(help="deployment name", autocompletion=complete_db_name)],
 ) -> None:
     """Drop a retained app's database + creds."""
     cmd_db_purge(name)
