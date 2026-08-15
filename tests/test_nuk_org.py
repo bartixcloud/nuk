@@ -373,3 +373,14 @@ def test_origin_org_from_github_url(monkeypatch):
 def test_origin_org_none_without_remote(monkeypatch):
     monkeypatch.setattr(nuk, "git_origin", lambda _p: None)
     assert nuk.origin_org() is None
+
+
+def test_org_accepts_app_role():
+    """`app` is the rename of `worker` (spec §3.1). Both are accepted during the
+    migration so the nuk and infra submodules can be bumped independently.
+    """
+    hosts = [
+        {"name": "ingress", "provider": "incus", "role": "edge", "privateIp": "10.0.10.241"},
+        {"name": "deploy", "provider": "incus", "role": "app", "privateIp": "10.0.10.107"},
+    ]
+    assert [h.role for h in [nuk.Host(**h) for h in hosts]] == ["edge", "app"]
