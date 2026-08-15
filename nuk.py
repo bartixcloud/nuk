@@ -311,10 +311,7 @@ class Host(BaseModel):
 
     name: str
     provider: Literal["hcloud", "libvirt", "incus", "metal", "manual"]
-    # `worker` is the pre-2026-08 name for `app`; both are accepted during the
-    # rename so the nuk and infra submodules can be bumped independently. Drop
-    # `worker` once every org manifest says `app` (spec §11 step 3).
-    role: Literal["edge", "data", "app", "worker", "hypervisor", "all-in-one"]
+    role: Literal["edge", "data", "app", "hypervisor", "all-in-one"]
     private_ip: str = Field(alias="privateIp")
     type: str | None = None  # hcloud server type, e.g. cx23
     ip: str | None = None  # public IP for manual/metal hosts

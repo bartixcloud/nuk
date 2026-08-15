@@ -19,10 +19,10 @@ network:                            # private plan; omit entirely for a lone sin
   vswitchVlan: 4001                 # the Robot vSwitch VLAN id
 hosts:                              # one entry per machine or VM; addressed by privateIp
   - { name: hcbase,         provider: hcloud,  type: cx23, role: edge,       privateIp: 10.10.1.2 }
-  - { name: controller,     provider: hcloud,  type: cx33, role: worker,     privateIp: 10.10.1.3 }
+  - { name: controller,     provider: hcloud,  type: cx33, role: app,     privateIp: 10.10.1.3 }
   - { name: nuroot-metal,   provider: manual,  ip: 1.2.3.4, role: hypervisor, privateIp: 10.10.2.2 }
   - { name: nuroot-db,      provider: libvirt, metal: nuroot-metal, vcpu: 4, memory: 16G, role: data,   privateIp: 10.10.2.3 }
-  - { name: nuroot-compute, provider: libvirt, metal: nuroot-metal, vcpu: 8, memory: 32G, role: worker, privateIp: 10.10.2.4 }
+  - { name: nuroot-compute, provider: libvirt, metal: nuroot-metal, vcpu: 8, memory: 32G, role: app, privateIp: 10.10.2.4 }
 facilities:
   dns: wildcard                     # wildcard | manual   (manual pairs with tls: http01)
   tls: dns01                        # dns01 | http01      (wildcard requires dns01)

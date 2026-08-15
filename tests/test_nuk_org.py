@@ -174,7 +174,7 @@ def test_org_requires_exactly_one_entry_point():
 
 
 def test_org_rejects_zero_entry_points():
-    no_edge = [{"name": "w", "provider": "hcloud", "role": "worker", "privateIp": "10.10.1.2"}]
+    no_edge = [{"name": "w", "provider": "hcloud", "role": "app", "privateIp": "10.10.1.2"}]
     with pytest.raises(nuk.ValidationError):
         nuk.Org.model_validate(_hosts(no_edge, mesh="none"))
 
@@ -187,7 +187,7 @@ def test_org_mesh_none_only_single_host():
 def test_org_libvirt_requires_metal():
     hosts = [
         {"name": "hcbase", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
-        {"name": "vm", "provider": "libvirt", "role": "worker", "privateIp": "10.10.2.3"},
+        {"name": "vm", "provider": "libvirt", "role": "app", "privateIp": "10.10.2.3"},
     ]
     with pytest.raises(nuk.ValidationError):
         nuk.Org.model_validate(_hosts(hosts))
@@ -200,7 +200,7 @@ def test_org_libvirt_metal_must_be_hypervisor():
             "name": "vm",
             "provider": "libvirt",
             "metal": "hcbase",
-            "role": "worker",
+            "role": "app",
             "privateIp": "10.10.2.3",
         },
     ]
@@ -222,7 +222,7 @@ def test_org_accepts_incus_provider():
             "name": "deploy",
             "provider": "incus",
             "metal": "metal",
-            "role": "worker",
+            "role": "app",
             "privateIp": "10.0.10.107",
         },
         {
@@ -276,7 +276,7 @@ def test_org_hypervisor_exempt_from_subnets():
 def test_org_private_ip_must_be_unique():
     dup = [
         {"name": "a", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
-        {"name": "b", "provider": "hcloud", "role": "worker", "privateIp": "10.10.1.2"},
+        {"name": "b", "provider": "hcloud", "role": "app", "privateIp": "10.10.1.2"},
     ]
     with pytest.raises(nuk.ValidationError):
         nuk.Org.model_validate(_hosts(dup))
@@ -373,6 +373,14 @@ def test_origin_org_from_github_url(monkeypatch):
 def test_origin_org_none_without_remote(monkeypatch):
     monkeypatch.setattr(nuk, "git_origin", lambda _p: None)
     assert nuk.origin_org() is None
+
+
+def test_org_rejects_retired_worker_role():
+    """`worker` was renamed to `app` (spec §3.1); the alias is retired so a stale
+    manifest fails loudly instead of validating into a role nothing else knows.
+    """
+    with pytest.raises(nuk.ValidationError):
+        nuk.Host(name="w", provider="incus", role="worker", privateIp="10.0.10.107")
 
 
 def test_org_accepts_app_role():

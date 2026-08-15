@@ -1027,9 +1027,9 @@ def test_resolve_manifest_returns_original_when_neither_exists(tmp_path):
 
 def test_read_self_parses_role_and_ip(tmp_path, monkeypatch):
     he = tmp_path / "host.env"
-    he.write_text("ROLE=worker\nPRIVATE_IP=10.0.1.20\n")
+    he.write_text("ROLE=app\nPRIVATE_IP=10.0.1.20\n")
     monkeypatch.setattr(nuk, "HOST_ENV", he)
-    assert nuk.read_self() == ("worker", "10.0.1.20")
+    assert nuk.read_self() == ("app", "10.0.1.20")
 
 
 def test_read_self_absent_defaults_to_entry_role(tmp_path, monkeypatch):
