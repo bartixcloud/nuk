@@ -1031,6 +1031,99 @@ def placement_matches(manifest: Deployment | Facility, role: str) -> bool:
     return placement.role == role
 
 
+# Facility manifests live in <tree>/facilities/*.yml, where <tree> is the git tree
+# the convergence loop pulled. Vocabulary comes from git, not runtime discovery —
+# a HARD constraint, not a preference (spec §5.3): the edge renders routers for
+# apps it does not run, so the host rendering a router is not necessarily the host
+# running the facility, and a host-local registry cannot answer.
+FACILITY_DIR = "facilities"
+
+
+def load_facilities(tree: Path) -> list[Facility]:
+    """Load every `kind: Facility` manifest in `<tree>/facilities/*.yml`.
+
+    A tree with no facilities dir yields no facilities — the empty vocabulary.
+    That is not an error here; it becomes one at lookup time, when a router asks
+    for a capability nobody declared (spec §5.4).
+
+    Args:
+        tree: Root of the manifest tree (the git checkout the loop pulled).
+
+    Returns:
+        The facilities, ordered by filename for a deterministic vocabulary.
+    """
+    fdir = tree / FACILITY_DIR
+    if not fdir.is_dir():
+        return []
+    return [m for p in sorted(fdir.glob("*.yml")) if isinstance(m := load(p), Facility)]
+
+
+def route_vocabulary(facilities: list[Facility]) -> dict[str, list[str]]:
+    """Map each declared route capability to its middleware chain.
+
+    Order within a chain is the facility's declaration order: outer→inner, the
+    same order the existing hardcoded chain uses (`[oauth-errors, oauth-auth]` —
+    errors outside catches the 401-403 auth returns and serves the sign-in page).
+
+    Raises:
+        SystemExit: If two facilities declare the same capability. A closed
+            vocabulary with two answers is not closed; picking one silently
+            would let a manifest added to the tree shadow the real gate.
+    """
+    vocab: dict[str, list[str]] = {}
+    for f in facilities:
+        route = f.spec.provides.route
+        if route is None:
+            continue
+        if route.capability in vocab:
+            sys.exit(
+                f"nuk: route capability {route.capability!r} is declared by more than one "
+                f"facility (second: {f.metadata.name!r}). Refusing an ambiguous vocabulary."
+            )
+        vocab[route.capability] = list(route.middlewares)
+    return vocab
+
+
+def env_facility(facilities: list[Facility], capability: str) -> Facility | None:
+    """The facility declaring `provides.env.capability == capability`, if any."""
+    for f in facilities:
+        env = f.spec.provides.env
+        if env is not None and env.capability == capability:
+            return f
+    return None
+
+
+def consumes(manifest: Deployment) -> set[str]:
+    """The capabilities this Deployment consumes, derived from its own fields.
+
+    Static consumption (spec §5.3) — the map is a literal lookup, and adding a
+    capability adds a row:
+
+    | Deployment field        | Consumes                   |
+    |--------------------------|----------------------------|
+    | `ingress[].auth: oauth` | route capability `auth`    |
+    | `databases:`            | env capability `databases` |
+
+    A Deployment consuming nothing still gets the default `tls` route from the
+    ingress facility; `tls` is substrate, not consumption. Plan 3's loop uses
+    this to refuse the consumers of a facility that failed its health gate
+    (§7.5) without any runtime state.
+
+    Args:
+        manifest: The Deployment being considered.
+
+    Returns:
+        The capability names consumed; empty for none.
+    """
+    caps: set[str] = set()
+    if any(ing.auth == "oauth" for ing in manifest.spec.ingress):
+        caps.add("auth")
+    db = manifest.spec.databases
+    if db.postgres or db.redis:
+        caps.add("databases")
+    return caps
+
+
 def rewrite_ingress_for_edge(ingress: list[dict], self_ip: str) -> list[dict]:
     """Rewrite local-backend ingress entries to the remote `address` form.
 
