@@ -8,6 +8,7 @@ compose project, optional ingress hosts, and env files. State lives entirely in
 
 from __future__ import annotations
 
+import grp
 import ipaddress
 import json
 import os
@@ -1854,12 +1855,40 @@ def _soll_vs_ist(overview: dict, org_file: Path | None) -> dict:
 # (manifest.raw / manifest.raw["spec"]) to the wire-contract render functions.
 
 
-def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901, PLR0912  # linear apply pipeline; splitting it would scatter the reconcile order
+_FACILITY_GROUP = "nuk-facility"
+
+
+def _is_privileged() -> bool:
+    """Whether the caller may apply a Facility.
+
+    One binary, authority derived from the caller — the `systemctl` model
+    (spec §4.4). A second binary would give zero isolation: same host, same
+    user, same filesystem.
+
+    Root, or membership in `nuk-facility`. A missing group is not an error —
+    it means nobody has been granted the capability, so only root qualifies.
+    """
+    if os.geteuid() == 0:
+        return True
+    try:
+        gid = grp.getgrnam(_FACILITY_GROUP).gr_gid
+    except KeyError:
+        return False
+    return gid in os.getgroups()
+
+
+def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901, PLR0912, PLR0915  # linear apply pipeline; splitting it would scatter the reconcile order
     """Create or update a deployment from a manifest."""
     manifest_path = resolve_manifest(manifest_path)
     manifest = load(manifest_path)
     raw = manifest.raw
     name = manifest.metadata.name
+    if manifest.kind == "Facility" and not _is_privileged():
+        print(
+            f"{name}: Facility apply requires root or membership in group "
+            f"{_FACILITY_GROUP!r} (spec §4.4). Refusing."
+        )
+        sys.exit(1)
     role, self_ip = read_self()
     if not placement_matches(manifest, role):
         print(

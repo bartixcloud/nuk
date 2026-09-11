@@ -167,3 +167,52 @@ def test_all_in_one_matches_every_placement(tmp_path):
     assert nuk.placement_matches(m, "all-in-one") is True
     f = nuk.load(_write(tmp_path, FACILITY_AUTH, name="f.yml"))
     assert nuk.placement_matches(f, "all-in-one") is True
+
+
+def test_facility_apply_refuses_when_unprivileged(tmp_path, monkeypatch, capsys):
+    """Spec §4.4/§12: non-privileged `nuk apply <Facility>` raises."""
+    doc = _write(tmp_path, FACILITY_AUTH)
+    monkeypatch.setattr(nuk, "_is_privileged", lambda: False)
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    with pytest.raises(SystemExit):
+        nuk.cmd_apply(doc, None)
+    captured = capsys.readouterr()  # ONE call — a second returns empty
+    assert "nuk-facility" in captured.out + captured.err
+
+
+def test_deployment_apply_is_not_gated_by_privilege(tmp_path, monkeypatch):
+    """Only Facilities need authority. A Deployment must not trip the guard.
+
+    Stop right after the guard by making placement mismatch, so the test asserts
+    on the guard alone and never reaches git or docker.
+    """
+    doc = _write(tmp_path, DEPLOYMENT_HELLO)
+    monkeypatch.setattr(nuk, "_is_privileged", lambda: False)
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    nuk.cmd_apply(doc, None)  # placement app != edge -> clean no-op, no SystemExit
+
+
+def test_is_privileged_true_for_root(monkeypatch):
+    monkeypatch.setattr(nuk.os, "geteuid", lambda: 0)
+    assert nuk._is_privileged() is True
+
+
+def test_is_privileged_false_without_group(monkeypatch):
+    monkeypatch.setattr(nuk.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(nuk.os, "getgroups", lambda: [1000])
+    monkeypatch.setattr(nuk.grp, "getgrnam", _raise_keyerror)
+    assert nuk._is_privileged() is False
+
+
+def test_is_privileged_true_via_group(monkeypatch):
+    class _Grp:
+        gr_gid = 4242
+
+    monkeypatch.setattr(nuk.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(nuk.os, "getgroups", lambda: [1000, 4242])
+    monkeypatch.setattr(nuk.grp, "getgrnam", lambda _name: _Grp())
+    assert nuk._is_privileged() is True
+
+
+def _raise_keyerror(_name):
+    raise KeyError(_name)
