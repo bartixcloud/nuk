@@ -1970,7 +1970,7 @@ def _is_privileged() -> bool:
     return gid in os.getgroups()
 
 
-def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901, PLR0912, PLR0915  # linear apply pipeline; splitting it would scatter the reconcile order
+def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline; splitting it would scatter the reconcile order
     """Create or update a deployment from a manifest."""
     manifest_path = resolve_manifest(manifest_path)
     manifest = load(manifest_path)
@@ -2016,6 +2016,21 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
             sh("git", "-C", str(repo), "fetch", "--quiet")
             sh("git", "-C", str(repo), "checkout", branch)
             sh("git", "-C", str(repo), "pull", "--ff-only", "--quiet")
+    elif manifest.kind == "Facility":
+        # A sourceless Facility (data-stack, ingress): its compose payload ships
+        # beside its manifest at <tree>/facilities/<name>/ — the manifest's own
+        # directory is the tree root for a hand-run apply, the loop passes the
+        # archive root. Mirror it into the project dir exactly like a cloned
+        # repo, so compose_args' existing `-f repo/<file>` resolution works
+        # unchanged.
+        payload = manifest_path.resolve().parent / name
+        if not payload.is_dir():
+            sys.exit(
+                f"{manifest_path}: Facility {name} has no source.repo and no "
+                f"facilities/{name}/ payload directory — nothing to apply"
+            )
+        shutil.rmtree(repo, ignore_errors=True)
+        sh("rsync", "-a", "--delete", f"{payload}/", str(repo) + "/")
     else:
         sys.exit(f"{manifest_path}: spec.source.repo is required unless --repo-path is given")
     ingress = raw["spec"].get("ingress", []) or []

@@ -216,3 +216,70 @@ def test_is_privileged_true_via_group(monkeypatch):
 
 def _raise_keyerror(_name):
     raise KeyError(_name)
+
+
+def test_sourceless_facility_mirrors_its_payload(tmp_path, monkeypatch):
+    """A Facility with no source.repo applies its <tree>/facilities/<name>/ payload."""
+    tree = tmp_path / "tree"
+    (tree / "facilities" / "data-stack").mkdir(parents=True)
+    (tree / "facilities" / "data-stack" / "docker-compose.data.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    manifest = tree / "facilities" / "data-stack.yml"
+    manifest.write_text(
+        textwrap.dedent(
+            """
+            apiVersion: nuk/v1
+            kind: Facility
+            metadata: {name: data-stack}
+            spec:
+              placement: {role: data}
+              compose: docker-compose.data.yml
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    commands = []
+    monkeypatch.setattr(nuk, "sh", lambda *cmd: commands.append(cmd))
+    monkeypatch.setattr(nuk, "read_self", lambda: ("data", "10.0.10.180"))
+    monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deployments")
+    monkeypatch.setattr(nuk, "provision_databases", lambda *_a: None)
+    monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
+    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
+    monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
+    monkeypatch.setattr(nuk, "write_ingress", lambda *_a: None)
+    monkeypatch.setattr(nuk, "persist_manifest", lambda *_a: None)
+    monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["docker", "compose"])
+    monkeypatch.setattr(nuk, "write_provenance", lambda *_a, **_k: None)
+    nuk.cmd_apply(manifest, None)
+    rsync = [c for c in commands if c[0] == "rsync"]
+    assert len(rsync) == 1
+    src = rsync[0][-2].rstrip("/")
+    assert src.endswith("facilities/data-stack")
+
+
+def test_sourceless_facility_without_payload_refuses(tmp_path, monkeypatch):
+    tree = tmp_path / "tree"
+    (tree / "facilities").mkdir(parents=True)
+    manifest = tree / "facilities" / "data-stack.yml"
+    manifest.write_text(
+        textwrap.dedent(
+            """
+            apiVersion: nuk/v1
+            kind: Facility
+            metadata: {name: data-stack}
+            spec:
+              placement: {role: data}
+              compose: docker-compose.data.yml
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(nuk, "read_self", lambda: ("data", "10.0.10.180"))
+    monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deployments")
+    with pytest.raises(SystemExit, match="payload directory"):
+        nuk.cmd_apply(manifest, None)
