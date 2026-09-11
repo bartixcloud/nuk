@@ -254,3 +254,36 @@ def test_shipped_facilities_reproduce_the_default_vocabulary():
     vocab = nuk.route_vocabulary(nuk.load_facilities(infra))
     for capability, chain in nuk.DEFAULT_ROUTE_VOCAB.items():
         assert vocab[capability] == chain
+
+
+def test_env_bind_refuses_when_no_facility_declares_it(tmp_path, monkeypatch):
+    """Spec §5.4: `env` bind raises -> abort before render, nothing written.
+
+    preflight is stubbed to prove the refusal happens BEFORE any docker exec:
+    if the guard were ordered after it, this would raise from the stub instead.
+    """
+    monkeypatch.setattr(
+        nuk, "preflight_data_stack", lambda *_a: pytest.fail("preflight ran before the guard")
+    )
+    facilities = nuk.load_facilities(_tree(tmp_path, oauth=OAUTH_FACILITY))
+    with pytest.raises(SystemExit, match="no facility provides"):
+        nuk.provision_databases("hello", {"postgres": True}, facilities)
+
+
+def test_env_bind_is_a_noop_when_nothing_is_requested(tmp_path):
+    """No databases requested = no capability needed. The guard must not fire."""
+    facilities = nuk.load_facilities(_tree(tmp_path, oauth=OAUTH_FACILITY))
+    assert nuk.provision_databases("hello", {}, facilities) is None
+
+
+def test_env_bind_proceeds_when_the_facility_is_declared(tmp_path, monkeypatch):
+    """With the data-stack facility present, the guard passes and bind runs."""
+    calls = []
+    monkeypatch.setattr(nuk, "preflight_data_stack", lambda *a: calls.append(a))
+    monkeypatch.setattr(nuk, "read_db_env", lambda _app: {})
+    monkeypatch.setattr(nuk, "ensure_postgres", lambda *_a, **_k: "postgresql://x")
+    monkeypatch.setattr(nuk, "write_db_env", lambda _app, _env: "/opt/nuklaut/secrets/hello-db.env")
+    facilities = nuk.load_facilities(_tree(tmp_path, data=DATA_FACILITY))
+    out = nuk.provision_databases("hello", {"postgres": True}, facilities)
+    assert calls == [(True, False)]
+    assert out == "/opt/nuklaut/secrets/hello-db.env"

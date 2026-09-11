@@ -57,6 +57,10 @@ HOST_ENV = Path("/etc/nuklaut/host.env")
 PG_CONTAINER = "nuk-postgres"
 REDIS_CONTAINER = "nuk-redis"
 
+# The capability name a Deployment's `spec.databases` block asks for; the
+# data-stack facility declares it via spec.provides.env.capability.
+_DATABASES_CAPABILITY = "databases"
+
 # nuk distributes as a normal Python package: run ephemerally with
 #   uvx --from git+https://github.com/astrojones/nuk@<ref> nuk ...
 # or install/upgrade a pinned copy with `nuk update` (→ uv tool install --from …).
@@ -1491,12 +1495,14 @@ def ensure_redis(app: str, prev_url: str | None) -> str:
     return f"redis://{app}:{pw}@{REDIS_CONTAINER}:6379/0"
 
 
-def provision_databases(app: str, databases: dict) -> str | None:
+def provision_databases(app: str, databases: dict, facilities: list[Facility]) -> str | None:
     """Provision the databases a manifest requested.
 
     Args:
         app: The app name.
         databases: The raw `spec.databases` dict.
+        facilities: The tree's Facility manifests, to check the `databases`
+            env capability is actually declared before binding against it.
 
     Returns:
         The path to the creds env-file the override should inject, or None when
@@ -1507,6 +1513,14 @@ def provision_databases(app: str, databases: dict) -> str | None:
     want_redis = bool(databases.get("redis"))
     if not (want_pg or want_redis):
         return None
+    # Fail closed before touching the data stack: binding against a facility the
+    # org never declared writes half a per-app state (role, database, ACL user)
+    # that nothing owns and nothing will tear down (spec §5.4).
+    if env_facility(facilities, _DATABASES_CAPABILITY) is None:
+        sys.exit(
+            f"{app}: spec.databases requests {_DATABASES_CAPABILITY!r} but no facility "
+            f"provides it. Apply facilities/data-stack.yml first, or drop spec.databases."
+        )
     _safe_ident(app)
     preflight_data_stack(want_pg, want_redis)
     prev = read_db_env(app)
@@ -2065,7 +2079,7 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
     else:
         sys.exit(f"{manifest_path}: spec.source.repo is required unless --repo-path is given")
     ingress = raw["spec"].get("ingress", []) or []
-    db_env = provision_databases(name, raw["spec"].get("databases") or {})
+    db_env = provision_databases(name, raw["spec"].get("databases") or {}, facilities)
     db_services = resolve_db_services(name, raw, db_env)
     if db_env and not db_services:
         print(

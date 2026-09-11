@@ -547,8 +547,8 @@ def test_pw_from_url_roundtrip():
 
 
 def test_provision_databases_noop_without_request():
-    assert nuk.provision_databases("app", {}) is None
-    assert nuk.provision_databases("app", {"postgres": False, "redis": False}) is None
+    assert nuk.provision_databases("app", {}, []) is None
+    assert nuk.provision_databases("app", {"postgres": False, "redis": False}, []) is None
 
 
 def test_db_env_roundtrip(tmp_path, monkeypatch):
@@ -606,6 +606,7 @@ def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(nuk, "SECRETS", tmp_path)
     monkeypatch.setattr(nuk, "preflight_data_stack", lambda *a, **k: None)
+    monkeypatch.setattr(nuk, "env_facility", lambda *a, **k: object())
     seen: list[str | None] = []
 
     def fake_pg(app, prev, driver=None):
@@ -613,11 +614,11 @@ def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
         return (f"postgresql+{driver}" if driver else "postgresql") + f"://{app}:x@h:5432/{app}"
 
     monkeypatch.setattr(nuk, "ensure_postgres", fake_pg)
-    nuk.provision_databases("app", {"postgres": {"driver": "asyncpg"}})
+    nuk.provision_databases("app", {"postgres": {"driver": "asyncpg"}}, [])
     assert seen == ["asyncpg"]
     assert nuk.read_db_env("app")["DATABASE_URL"].startswith("postgresql+asyncpg://")
 
-    nuk.provision_databases("app", {"postgres": True})
+    nuk.provision_databases("app", {"postgres": True}, [])
     assert seen == ["asyncpg", None]
 
 
@@ -728,13 +729,14 @@ def test_provision_databases_runs_preflight_before_exec(tmp_path, monkeypatch):
     """
     monkeypatch.setattr(nuk, "SECRETS", tmp_path)
     monkeypatch.setattr(nuk, "_container_state", lambda name: (False, False))
+    monkeypatch.setattr(nuk, "env_facility", lambda *a, **k: object())
 
     def fail(*a, **k):
         pytest.fail("ensure_postgres must not run when preflight fails")
 
     monkeypatch.setattr(nuk, "ensure_postgres", fail)
     with pytest.raises(SystemExit):
-        nuk.provision_databases("app", {"postgres": True})
+        nuk.provision_databases("app", {"postgres": True}, [])
 
 
 # --- vendored data stack (issue #10): the owned, reproducible source ----------
