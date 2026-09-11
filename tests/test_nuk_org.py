@@ -392,3 +392,49 @@ def test_org_accepts_app_role():
         {"name": "deploy", "provider": "incus", "role": "app", "privateIp": "10.0.10.107"},
     ]
     assert [h.role for h in [nuk.Host(**h) for h in hosts]] == ["edge", "app"]
+
+
+# --- singleton roles (spec §3.1) -------------------------------------------------
+
+
+def test_org_rejects_two_app_hosts():
+    hosts = [
+        {"name": "edge", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
+        {"name": "a", "provider": "hcloud", "role": "app", "privateIp": "10.10.1.3"},
+        {"name": "b", "provider": "hcloud", "role": "app", "privateIp": "10.10.1.4"},
+    ]
+    with pytest.raises(nuk.ValidationError, match="at most one host may have role 'app'"):
+        nuk.Org.model_validate(_hosts(hosts))
+
+
+def test_org_rejects_two_data_hosts():
+    hosts = [
+        {"name": "edge", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
+        {"name": "a", "provider": "hcloud", "role": "data", "privateIp": "10.10.1.3"},
+        {"name": "b", "provider": "hcloud", "role": "data", "privateIp": "10.10.1.4"},
+    ]
+    with pytest.raises(nuk.ValidationError, match="at most one host may have role 'data'"):
+        nuk.Org.model_validate(_hosts(hosts))
+
+
+def test_org_allows_two_hypervisors():
+    """The broker spawns ephemeral VMs per metal box; placement never targets the role."""
+    hosts = [
+        {"name": "edge", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
+        {
+            "name": "m1",
+            "provider": "manual",
+            "ip": "1.2.3.4",
+            "role": "hypervisor",
+            "privateIp": "10.10.2.2",
+        },
+        {
+            "name": "m2",
+            "provider": "manual",
+            "ip": "1.2.3.5",
+            "role": "hypervisor",
+            "privateIp": "10.10.2.3",
+        },
+    ]
+    org = nuk.Org.model_validate(_hosts(hosts))
+    assert [h.name for h in org.hosts] == ["edge", "m1", "m2"]

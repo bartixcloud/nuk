@@ -462,6 +462,27 @@ def _check_entry_and_mesh(hosts: list[Host], mesh: str) -> None:
             raise ValueError(msg)
 
 
+_SINGLETON_ROLES = frozenset({"app", "data"})
+
+
+def _check_singleton_roles(hosts: list[Host]) -> None:
+    """Raise unless placement-target roles are 1:1 with hosts (spec §3.1).
+
+    `edge`/`all-in-one` are already exactly-one via `_check_entry_and_mesh`;
+    `hypervisor` is exempt — placement never targets it, and the broker needs
+    multi-metal to be legal. Multi-host roles are future work; the seam is a
+    `selector:` on placement, not a redesign (§13).
+    """
+    for role in sorted(_SINGLETON_ROLES):
+        named = [h.name for h in hosts if h.role == role]
+        if len(named) > 1:
+            msg = (
+                f"at most one host may have role {role!r} "
+                f"(placement is a singleton model today) — found: {', '.join(named)}"
+            )
+            raise ValueError(msg)
+
+
 def _check_vm_hosts(hosts: list[Host]) -> None:
     """Raise unless every libvirt/incus host names an existing hypervisor host in `metal`."""
     hypervisors = {h.name for h in hosts if h.role == "hypervisor"}
@@ -514,11 +535,13 @@ class Org(BaseModel):
         Raises:
             ValueError: On any violated invariant (unique names/IPs, exactly one
                 entry-point host, mesh/host-count coupling, libvirt→hypervisor,
-                platformDomain membership, and private-IP subnet placement).
+                at most one host per placement-target role, platformDomain membership,
+                and private-IP subnet placement).
         """
         _check_domains(self.platform_domain, self.domains)
         _check_unique(self.hosts)
         _check_entry_and_mesh(self.hosts, self.mesh)
+        _check_singleton_roles(self.hosts)
         _check_vm_hosts(self.hosts)
         if self.network is not None:
             _check_subnets(self.hosts, self.network)
