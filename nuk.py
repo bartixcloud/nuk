@@ -1124,6 +1124,29 @@ def env_facility(facilities: list[Facility], capability: str) -> Facility | None
     return None
 
 
+def facility_health(manifest: Facility) -> str | None:
+    """Whether this facility's containers are actually up on THIS host.
+
+    Vocabulary is git-derived and identical fleet-wide; health is same-host
+    (spec §5.3). A facility declaring no containers has nothing to check — a
+    pure route declaration like basic-auth is a statement about the edge's
+    middleware file, not about a process.
+
+    Args:
+        manifest: The facility being applied.
+
+    Returns:
+        None when healthy, otherwise a one-line reason naming the container.
+    """
+    for container in manifest.spec.health.containers:
+        exists, healthy = _container_state(container)
+        if not exists:
+            return f"container {container!r} is not running"
+        if not healthy:
+            return f"container {container!r} is running but not healthy"
+    return None
+
+
 def consumes(manifest: Deployment) -> set[str]:
     """The capabilities this Deployment consumes, derived from its own fields.
 
@@ -2116,6 +2139,12 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
     # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
     # whose image id changed.
     sh(*compose_args(name, raw), "up", "-d")
+    # An unhealthy facility must not become "current": write_provenance is what
+    # `nuk status`, `nuk rollback` and drift.sh read as the deployed state, so
+    # appending here would both hide the breakage and put the last known-good
+    # entry out of rollback's reach (spec §5.4).
+    if manifest.kind == "Facility" and (reason := facility_health(manifest)) is not None:
+        sys.exit(f"{name}: facility is not healthy — {reason}. Provenance not appended.")
     # Provenance is best-effort: `status` prefers it over the live repo/ checkout
     # (trustworthy even for rsync-mirrored, .git-less workflow deploys), but a
     # write failure here must never fail an otherwise-successful apply.

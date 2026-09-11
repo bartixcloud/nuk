@@ -287,3 +287,68 @@ def test_env_bind_proceeds_when_the_facility_is_declared(tmp_path, monkeypatch):
     out = nuk.provision_databases("hello", {"postgres": True}, facilities)
     assert calls == [(True, False)]
     assert out == "/opt/nuklaut/secrets/hello-db.env"
+
+
+def test_facility_health_passes_when_every_container_is_healthy(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "_container_state", lambda _c: (True, True))
+    f = nuk.load_facilities(_tree(tmp_path, data=DATA_FACILITY))[0]
+    assert nuk.facility_health(f) is None
+
+
+def test_facility_health_reports_a_missing_container(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "_container_state", lambda c: (c != "nuk-redis", True))
+    f = nuk.load_facilities(_tree(tmp_path, data=DATA_FACILITY))[0]
+    assert "nuk-redis" in nuk.facility_health(f)
+
+
+def test_facility_health_reports_an_unhealthy_container(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "_container_state", lambda c: (True, c != "nuk-postgres"))
+    f = nuk.load_facilities(_tree(tmp_path, data=DATA_FACILITY))[0]
+    reason = nuk.facility_health(f)
+    assert "nuk-postgres" in reason and "not healthy" in reason
+
+
+def test_facility_with_no_health_block_passes(tmp_path, monkeypatch):
+    """basic-auth declares no containers — nothing to check, nothing to fail."""
+    monkeypatch.setattr(
+        nuk, "_container_state", lambda _c: pytest.fail("must not probe with no health block")
+    )
+    f = nuk.load_facilities(_tree(tmp_path, basic=BASIC_FACILITY))[0]
+    assert nuk.facility_health(f) is None
+
+
+def test_unhealthy_facility_apply_does_not_append_provenance(tmp_path, monkeypatch):
+    """Spec §5.4: apply fails, provenance is NOT appended, the previous entry stays.
+
+    Everything between load and the health gate is stubbed — this test is about
+    the ORDER of two statements (gate before provenance), not about git, compose,
+    or docker. `sh` is stubbed to a no-op so the clone/rsync and `up -d` never run;
+    if the gate were placed after write_provenance, the pytest.fail below fires.
+    """
+    doc = tmp_path / "auth.yml"
+    doc.write_text(textwrap.dedent(OAUTH_FACILITY).lstrip(), encoding="utf-8")
+
+    repo_src = tmp_path / "src"
+    repo_src.mkdir()
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deployments")
+    monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
+    monkeypatch.setattr(nuk, "sh", lambda *_a, **_k: None)
+    monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "provision_databases", lambda *_a: None)
+    monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
+    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
+    monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
+    monkeypatch.setattr(nuk, "write_ingress", lambda *_a: None)
+    monkeypatch.setattr(nuk, "persist_manifest", lambda *_a: None)
+    monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["true"])
+    monkeypatch.setattr(
+        nuk, "facility_health", lambda _m: "container 'authentik-server' is not running"
+    )
+    monkeypatch.setattr(
+        nuk, "write_provenance", lambda *_a, **_k: pytest.fail("provenance must not be appended")
+    )
+
+    with pytest.raises(SystemExit, match="not healthy"):
+        nuk.cmd_apply(doc, str(repo_src))
