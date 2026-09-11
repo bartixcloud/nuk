@@ -131,3 +131,39 @@ def test_unknown_placement_role_is_rejected(tmp_path):
     )
     with pytest.raises(SystemExit):
         nuk.load(doc)
+
+
+def test_placement_matches_own_role(tmp_path):
+    m = nuk.load(_write(tmp_path, DEPLOYMENT_HELLO))
+    assert nuk.placement_matches(m, "app") is True
+
+
+def test_placement_does_not_match_other_role(tmp_path):
+    m = nuk.load(_write(tmp_path, DEPLOYMENT_HELLO))
+    assert nuk.placement_matches(m, "edge") is False
+
+
+def test_unplaced_manifest_matches_every_role(tmp_path):
+    """No placement = legacy manifest. It applies wherever it is run, as before."""
+    m = nuk.load(
+        _write(
+            tmp_path,
+            """
+            apiVersion: nuk/v1
+            kind: Deployment
+            metadata: {name: legacy}
+            spec:
+              source: {repo: https://github.com/astrojones/legacy.git}
+            """,
+        )
+    )
+    assert nuk.placement_matches(m, "app") is True
+    assert nuk.placement_matches(m, "edge") is True
+
+
+def test_all_in_one_matches_every_placement(tmp_path):
+    """all-in-one is a real composition of edge + data + app (spec §3.1)."""
+    m = nuk.load(_write(tmp_path, DEPLOYMENT_HELLO))
+    assert nuk.placement_matches(m, "all-in-one") is True
+    f = nuk.load(_write(tmp_path, FACILITY_AUTH, name="f.yml"))
+    assert nuk.placement_matches(f, "all-in-one") is True

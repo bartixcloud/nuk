@@ -1011,6 +1011,25 @@ def read_self() -> tuple[str, str | None]:
     return role, private_ip
 
 
+def placement_matches(manifest: Deployment | Facility, role: str) -> bool:
+    """Whether THIS host, with `role`, is the one that runs `manifest`.
+
+    The convergence loop hands every host the same tree; each applies the subset
+    it owns. A manifest placed elsewhere is another host's job, not an error —
+    hence a clean no-op rather than a failure (spec §5.4).
+
+    Two documented exceptions match:
+      * no `placement` at all — a manifest written before placement existed.
+        It applies wherever it is run, exactly as it did before.
+      * role `all-in-one` — a real composition of edge + data + app (spec §3.1),
+        so it owns every placement.
+    """
+    placement = manifest.spec.placement
+    if placement is None or role == "all-in-one":
+        return True
+    return placement.role == role
+
+
 def rewrite_ingress_for_edge(ingress: list[dict], self_ip: str) -> list[dict]:
     """Rewrite local-backend ingress entries to the remote `address` form.
 
@@ -1838,11 +1857,18 @@ def _soll_vs_ist(overview: dict, org_file: Path | None) -> dict:
 def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901, PLR0912  # linear apply pipeline; splitting it would scatter the reconcile order
     """Create or update a deployment from a manifest."""
     manifest_path = resolve_manifest(manifest_path)
-    DYNAMIC.mkdir(parents=True, exist_ok=True)
-    DEPLOYS.mkdir(parents=True, exist_ok=True)
     manifest = load(manifest_path)
     raw = manifest.raw
     name = manifest.metadata.name
+    role, self_ip = read_self()
+    if not placement_matches(manifest, role):
+        print(
+            f"{name}: spec.placement.role={manifest.spec.placement.role!r} but this host "
+            f"is role={role!r} — nothing to do"
+        )
+        return
+    DYNAMIC.mkdir(parents=True, exist_ok=True)
+    DEPLOYS.mkdir(parents=True, exist_ok=True)
     source = manifest.spec.source
     pdir = project_dir(name)
     pdir.mkdir(parents=True, exist_ok=True)
@@ -1889,7 +1915,6 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
     # terminate on the EDGE. Publish the container port on this host's private IP and
     # STAGE the router (address:<self_ip>:<port> + auth) for the orchestrator to
     # deliver to the edge; the local dynamic file would be inert here anyway.
-    role, self_ip = read_self()
     edge_term = role not in _ENTRY_ROLES and bool(ingress)
     if edge_term and self_ip is None:
         sys.exit(
