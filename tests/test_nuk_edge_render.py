@@ -161,3 +161,45 @@ def test_edge_render_skips_deployments_without_ingress(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
     assert nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml")) == []
     assert not (dynamic / "hello.yml").exists()
+
+
+def test_reap_removes_only_the_legacy_worker_prefix(tmp_path, monkeypatch):
+    """Spec §11 step 6: the one-time reap, scoped exactly to what delivery wrote."""
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    for name in ("worker-hello.yml", "worker-other.yml", "global.yml", "hello.yml", "oauth.yml"):
+        (dynamic / name).write_text("http: {}\n", encoding="utf-8")
+    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    reaped = nuk.reap_legacy_worker_routers()
+    assert sorted(reaped) == ["worker-hello.yml", "worker-other.yml"]
+    assert sorted(p.name for p in dynamic.iterdir()) == ["global.yml", "hello.yml", "oauth.yml"]
+
+
+def test_reap_is_idempotent(tmp_path, monkeypatch):
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    assert nuk.reap_legacy_worker_routers() == []
+    assert nuk.reap_legacy_worker_routers() == []
+
+
+def test_render_edge_routers_reaps_first(tmp_path, monkeypatch):
+    """A stale worker-hello.yml and a fresh hello.yml define the SAME router key.
+
+    Traefik resolves that nondeterministically, so the stale one must be gone
+    before the fresh one is published — not merely at some later point.
+    """
+    tree = _tree(tmp_path, {"hello": HELLO}, {"auth": OAUTH_FACILITY})
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    (dynamic / "worker-hello.yml").write_text("http: {}\n", encoding="utf-8")
+    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml"))
+    assert not (dynamic / "worker-hello.yml").exists()
+    assert (dynamic / "hello.yml").exists()
+
+
+def test_edge_dynamic_staging_is_gone():
+    """The staging dir and both writers are deleted, not deprecated."""
+    for gone in ("EDGE_DYNAMIC", "write_edge_ingress", "rewrite_ingress_for_edge"):
+        assert not hasattr(nuk, gone), f"{gone} should have been deleted"

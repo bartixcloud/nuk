@@ -42,9 +42,6 @@ __version__ = "0.24.0"  # bumped on release by .github/workflows/release.yml
 ROOT = Path("/opt/nuklaut")
 DEPLOYS = ROOT / "deployments"
 DYNAMIC = ROOT / "traefik" / "dynamic"
-# Worker-terminated routers are staged here (inert on a worker — no local Traefik)
-# for the orchestrator to deliver onto the EDGE's dynamic dir. See cmd_apply / finding 6.
-EDGE_DYNAMIC = ROOT / "traefik" / "edge-dynamic"
 SECRETS = ROOT / "secrets"
 # This host's identity, written world-readable (no secrets) by cloud-init. Absent on a
 # legacy single-host controller -> read_self() defaults to an entry role (byte-identical).
@@ -1192,6 +1189,37 @@ def backend_address(org: Org, manifest: Deployment, ing: dict) -> str:
     return f"{hosts[0].private_ip}:{ing.get('hostPort') or ing['port']}"
 
 
+# The prefix the deleted delivery path used to scope its rsync --delete. Files
+# carrying it are the only thing this codebase ever removes without being asked:
+# a stale worker-<name>.yml and a freshly-rendered <name>.yml define the SAME
+# router key (ids are f"{name}-{i}"), Traefik picks between them
+# nondeterministically, and a stale file predating an `auth:` addition could win.
+_LEGACY_ROUTER_PREFIX = "worker-"
+
+
+def reap_legacy_worker_routers() -> list[str]:
+    """Remove routers the retired cross-host delivery path left on the edge.
+
+    Bounded and one-time: scoped to the `worker-` prefix, so the edge's native
+    routers (global.yml, oauth.yml, maintenance) are untouched — the same scope
+    converge.sh's `--include='worker-*.yml' --exclude='*'` enforced. Idempotent;
+    a no-op once the fleet has converged.
+
+    This is the single documented exception to "report, never delete"
+    (spec §7.4). Everything else stale is reported and left for a human.
+
+    Returns:
+        The filenames removed, for the caller to log.
+    """
+    if not DYNAMIC.is_dir():
+        return []
+    reaped = []
+    for p in sorted(DYNAMIC.glob(f"{_LEGACY_ROUTER_PREFIX}*.yml")):
+        p.unlink()
+        reaped.append(p.name)
+    return reaped
+
+
 def render_edge_routers(tree: Path, org: Org) -> list[str]:
     """On the edge: render a router for EVERY Deployment with ingress.
 
@@ -1211,6 +1239,8 @@ def render_edge_routers(tree: Path, org: Org) -> list[str]:
         The names of the deployments whose routers were written.
     """
     DYNAMIC.mkdir(parents=True, exist_ok=True)
+    for stale in reap_legacy_worker_routers():
+        print(f"edge: reaped legacy router {stale} (cross-host delivery is retired)")
     vocab = route_vocabulary(load_facilities(tree))
     rendered: list[str] = []
     for manifest in load_deployments(tree):
@@ -1283,45 +1313,6 @@ def consumes(manifest: Deployment) -> set[str]:
     if db.postgres or db.redis:
         caps.add("databases")
     return caps
-
-
-def rewrite_ingress_for_edge(ingress: list[dict], self_ip: str) -> list[dict]:
-    """Rewrite local-backend ingress entries to the remote `address` form.
-
-    A non-edge host (worker) has no local Traefik, so its router must live on the
-    edge with an `address: <self_ip>:<port>` backend — the port build_override
-    publishes on the private IP. Entries that already carry `address` (a remote
-    backend, e.g. a libvirt VM) pass through unchanged. `auth`/`path`/`stripPrefix`/
-    `priority`/`www` are preserved verbatim so the edge router gates identically.
-    """
-    out: list[dict] = []
-    for ing in ingress:
-        if ing.get("address") or not ing.get("service"):
-            out.append(ing)
-            continue
-        rewritten = {k: v for k, v in ing.items() if k not in {"service", "port", "hostPort"}}
-        rewritten["address"] = f"{self_ip}:{ing.get('hostPort') or ing['port']}"
-        out.append(rewritten)
-    return out
-
-
-def write_edge_ingress(name: str, ingress: list[dict], vocab: dict[str, list[str]]) -> None:
-    """Stage an app's Traefik router for delivery to the edge (worker apps).
-
-    Mirrors write_ingress but targets EDGE_DYNAMIC — a staging dir the orchestrator
-    (converge.sh) rsyncs into the edge's watched dynamic/ dir. The `worker-` prefix
-    lets the delivery scope its --delete to worker routers only, so edge-native
-    routers (Authentik, maintenance) are never touched. Flat file in the watched
-    dir, so it loads exactly like the edge's own routers — no subdir recursion
-    assumption. Inert on the worker itself (no local Traefik). Removed when empty.
-    """
-    EDGE_DYNAMIC.mkdir(parents=True, exist_ok=True)
-    target = EDGE_DYNAMIC / f"worker-{name}.yml"
-    doc = build_ingress(name, ingress, vocab)
-    if doc is None:
-        target.unlink(missing_ok=True)
-        return
-    target.write_text(yaml.safe_dump(doc))
 
 
 # --- shared databases (postgres + redis) -------------------------------------
@@ -2223,22 +2214,19 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
             f"{name}: spec.envFrom secrets resolved but no ingress service to "
             f"attach them to — they won't be injected. Add an ingress entry."
         )
-    # Finding 6: a non-edge host (worker) has no local Traefik, so its ingress must
-    # terminate on the EDGE. Publish the container port on this host's private IP and
-    # STAGE the router (address:<self_ip>:<port> + auth) for the orchestrator to
-    # deliver to the edge; the local dynamic file would be inert here anyway.
+    # The edge renders EVERY router from the git tree (spec §6), so a non-edge host
+    # no longer authors anything for it. It still PUBLISHES its container port on
+    # its private IP — that is the backend the edge's router points at.
     edge_term = role not in _ENTRY_ROLES and bool(ingress)
     if edge_term and self_ip is None:
         sys.exit(
             f"{name}: host is non-edge (role={role}) but /etc/nuklaut/host.env has no "
-            f"PRIVATE_IP — cannot publish ingress for edge termination"
+            f"PRIVATE_IP — cannot publish ingress for the edge to reach"
         )
-    write_override(
-        name, ingress, db_env, env_from, db_services, publish_ip=self_ip if edge_term else None
-    )
+    write_override(name, ingress, db_env, env_from, db_services,
+                   publish_ip=self_ip if edge_term else None)
     if edge_term:
-        write_edge_ingress(name, rewrite_ingress_for_edge(ingress, self_ip), vocab)
-        (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)  # keep the inert local dir clean
+        (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)  # inert here; the edge owns it
     else:
         write_ingress(name, ingress, vocab)
     persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
@@ -2406,8 +2394,6 @@ def cmd_delete(name: str, purge: bool) -> None:
         manifest = load(pdir / "manifest.yml")
         subprocess.run([*compose_args(name, manifest.raw), "down", "-v"], check=False)  # noqa: S603  # argv built from fixed verbs
     (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)
-    # Staged edge router (worker apps); next converge delivery reaps it off the edge.
-    (EDGE_DYNAMIC / f"worker-{name}.yml").unlink(missing_ok=True)
     shutil.rmtree(pdir, ignore_errors=True)
     # The app's database is kept by default — its creds file (in SECRETS, not
     # pdir) survives rmtree and keeps nuk aware of it (see `nuk db ls`). --purge
