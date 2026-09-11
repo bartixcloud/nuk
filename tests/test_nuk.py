@@ -21,7 +21,9 @@ def test_legacy_single_host_gets_maintenance_only():
     but it is a cross-file (@file) reference — NOT an app-local middleware
     definition — so http.middlewares stays empty when nothing strips/redirects.
     """
-    doc = nuk.build_ingress("bartix", [{"host": "bartix.de", "service": "web", "port": 8080}])
+    doc = nuk.build_ingress(
+        "bartix", [{"host": "bartix.de", "service": "web", "port": 8080}], nuk.DEFAULT_ROUTE_VOCAB
+    )
     assert doc == {
         "http": {
             "routers": {
@@ -43,8 +45,8 @@ def test_legacy_single_host_gets_maintenance_only():
 
 
 def test_empty_ingress_is_none():
-    assert nuk.build_ingress("x", []) is None
-    assert nuk.build_ingress("x", None) is None
+    assert nuk.build_ingress("x", [], nuk.DEFAULT_ROUTE_VOCAB) is None
+    assert nuk.build_ingress("x", None, nuk.DEFAULT_ROUTE_VOCAB) is None
 
 
 # --- kolbe: same-origin two-image split via PathPrefix + stripPrefix ----------
@@ -63,6 +65,7 @@ def test_kolbe_pathprefix_split():
             },
             {"host": "kolbe.astrojones.de", "service": "frontend", "port": 80},
         ],
+        nuk.DEFAULT_ROUTE_VOCAB,
     )
     routers = doc["http"]["routers"]
     services = doc["http"]["services"]
@@ -88,7 +91,9 @@ def test_path_without_strip_has_no_local_middleware():
     """PathPrefix without stripPrefix defines no app-local middleware; the router
     still inherits the maintenance-errors reference.
     """
-    doc = nuk.build_ingress("a", [{"host": "h", "path": "/x", "service": "s", "port": 1}])
+    doc = nuk.build_ingress(
+        "a", [{"host": "h", "path": "/x", "service": "s", "port": 1}], nuk.DEFAULT_ROUTE_VOCAB
+    )
     assert doc["http"]["routers"]["a-0"]["rule"] == "Host(`h`) && PathPrefix(`/x`)"
     assert doc["http"]["routers"]["a-0"]["middlewares"] == ["maintenance-errors@file"]
     # no app-local middleware DEFINITIONS (maintenance-errors lives in global.yml)
@@ -100,6 +105,7 @@ def test_every_app_router_inherits_maintenance_errors():
     doc = nuk.build_ingress(
         "kolbeapp",
         [{"host": "kolbeapp.de", "service": "frontend", "port": 80, "www": True}],
+        nuk.DEFAULT_ROUTE_VOCAB,
     )
     routers = doc["http"]["routers"]
     assert routers["kolbeapp-0"]["middlewares"] == ["maintenance-errors@file"]
@@ -122,6 +128,7 @@ def test_auth_oauth_prepends_forwardauth_chain():
                 "auth": "oauth",
             }
         ],
+        nuk.DEFAULT_ROUTE_VOCAB,
     )
     assert doc["http"]["routers"]["nukview-0"]["middlewares"] == [
         "oauth-errors@file",
@@ -147,6 +154,7 @@ def test_auth_oauth_with_pathprefix_orders_oauth_then_strip():
                 "auth": "oauth",
             }
         ],
+        nuk.DEFAULT_ROUTE_VOCAB,
     )
     assert doc["http"]["routers"]["api-0"]["middlewares"] == [
         "oauth-errors@file",
@@ -170,8 +178,10 @@ def test_unknown_auth_value_refuses_to_render_instead_of_publishing(bad):
     """
     if bad == "":
         pytest.skip("empty string is falsy upstream; covered by the Literal at load time")
-    with pytest.raises(ValueError, match="not a known gate"):
-        nuk.build_ingress("demo", [{"host": "h", "service": "s", "port": 1, "auth": bad}])
+    with pytest.raises(ValueError, match="no facility in the tree provides"):
+        nuk.build_ingress(
+            "demo", [{"host": "h", "service": "s", "port": 1, "auth": bad}], nuk.DEFAULT_ROUTE_VOCAB
+        )
 
 
 @pytest.mark.parametrize("impl", ["authentik", "oauth2-proxy"])
@@ -193,7 +203,9 @@ def test_ingress_auth_accepts_the_two_gates():
 
 
 def test_explicit_priority():
-    doc = nuk.build_ingress("a", [{"host": "h", "service": "s", "port": 1, "priority": 100}])
+    doc = nuk.build_ingress(
+        "a", [{"host": "h", "service": "s", "port": 1, "priority": 100}], nuk.DEFAULT_ROUTE_VOCAB
+    )
     assert doc["http"]["routers"]["a-0"]["priority"] == 100
 
 
@@ -202,7 +214,9 @@ def test_explicit_priority():
 
 def test_address_backend_bypasses_local_container_naming():
     doc = nuk.build_ingress(
-        "hello", [{"host": "hello.astrojones.guru", "address": "10.10.2.4:8080"}]
+        "hello",
+        [{"host": "hello.astrojones.guru", "address": "10.10.2.4:8080"}],
+        nuk.DEFAULT_ROUTE_VOCAB,
     )
     servers = doc["http"]["services"]["hello-0"]["loadBalancer"]["servers"]
     assert servers == [{"url": "http://10.10.2.4:8080"}]
@@ -230,6 +244,7 @@ def test_www_redirect_router_and_middleware():
         [
             {"host": "kolbeapp.de", "service": "frontend", "port": 80, "www": True},
         ],
+        nuk.DEFAULT_ROUTE_VOCAB,
     )
     routers = doc["http"]["routers"]
     mws = doc["http"]["middlewares"]
@@ -1057,7 +1072,9 @@ def test_edge_termination_router_keeps_backend_and_oauth_chain():
     the oauth chain — proving auth survives the local→address rewrite (finding 6).
     """
     ingress = [{"host": "hello.modl-agent.com", "service": "web", "port": 8080, "auth": "oauth"}]
-    doc = nuk.build_ingress("hello", nuk.rewrite_ingress_for_edge(ingress, "10.0.1.20"))
+    doc = nuk.build_ingress(
+        "hello", nuk.rewrite_ingress_for_edge(ingress, "10.0.1.20"), nuk.DEFAULT_ROUTE_VOCAB
+    )
     svc = doc["http"]["services"]["hello-0"]["loadBalancer"]["servers"]
     assert svc == [{"url": "http://10.0.1.20:8080"}]  # was http://hello-web-1:8080
     assert doc["http"]["routers"]["hello-0"]["middlewares"] == [
@@ -1104,7 +1121,9 @@ def test_host_port_overrides_publish_and_backend_to_avoid_collision():
     ingress = [{"host": "b.modl-agent.com", "service": "web", "port": 8080, "hostPort": 8081}]
     ov = nuk.build_override("b", ingress, publish_ip="10.0.1.20")
     assert ov["services"]["web"]["ports"] == ["10.0.1.20:8081:8080"]  # host 8081 -> container 8080
-    doc = nuk.build_ingress("b", nuk.rewrite_ingress_for_edge(ingress, "10.0.1.20"))
+    doc = nuk.build_ingress(
+        "b", nuk.rewrite_ingress_for_edge(ingress, "10.0.1.20"), nuk.DEFAULT_ROUTE_VOCAB
+    )
     assert doc["http"]["services"]["b-0"]["loadBalancer"]["servers"] == [
         {"url": "http://10.0.1.20:8081"}  # edge hits the published host port
     ]
@@ -1120,7 +1139,11 @@ def test_write_edge_ingress_stages_prefixed_file(tmp_path, monkeypatch):
     touches edge-native routers; empty ingress reaps the staged file.
     """
     monkeypatch.setattr(nuk, "EDGE_DYNAMIC", tmp_path)
-    nuk.write_edge_ingress("hello", [{"host": "hello.modl-agent.com", "address": "10.0.1.20:8080"}])
+    nuk.write_edge_ingress(
+        "hello",
+        [{"host": "hello.modl-agent.com", "address": "10.0.1.20:8080"}],
+        nuk.DEFAULT_ROUTE_VOCAB,
+    )
     staged = tmp_path / "worker-hello.yml"
     assert staged.exists()
     doc = yaml.safe_load(staged.read_text())
@@ -1128,5 +1151,5 @@ def test_write_edge_ingress_stages_prefixed_file(tmp_path, monkeypatch):
         {"url": "http://10.0.1.20:8080"}
     ]
     # empty ingress removes the staged file (app deleted / lost its ingress)
-    nuk.write_edge_ingress("hello", [])
+    nuk.write_edge_ingress("hello", [], nuk.DEFAULT_ROUTE_VOCAB)
     assert not staged.exists()

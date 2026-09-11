@@ -885,7 +885,25 @@ def _rule(ing: dict) -> str:
     return rule
 
 
-def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901, PLR0912  # one router-build loop; clean extraction would obscure the per-field ordering
+# The gates the pre-facility code hardcoded. Retained for the legacy all-in-one
+# path — a single-host controller with no facilities dir — so its renders stay
+# byte-identical (spec §12). A tree that ships facilities/ overrides it entirely;
+# test_shipped_facilities_reproduce_the_default_vocabulary keeps the two in step.
+# Keys are CAPABILITY names (post-translation, see _ROUTE_CAPABILITY below).
+DEFAULT_ROUTE_VOCAB: dict[str, list[str]] = {
+    "auth": ["oauth-errors@file", "oauth-auth@file"],
+    "basic": ["auth@file"],
+}
+
+# The §5.3 field→capability map for route effects: `ingress[].auth: oauth`
+# consumes route capability `auth`. Field values absent here translate to
+# themselves (`basic` → `basic`). Adding a capability adds a row.
+_ROUTE_CAPABILITY: dict[str, str] = {"oauth": "auth"}
+
+
+def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extraction would obscure the per-field ordering
+    name: str, ingress: list[dict], vocab: dict[str, list[str]]
+) -> dict | None:
     """Render the Traefik file-provider doc, or None to remove the dynamic file.
 
     Each entry needs host + (service/port, a local docker "edge"-network
@@ -903,6 +921,9 @@ def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901,
     Args:
         name: The deployment name, used to prefix router/service ids.
         ingress: The raw `spec.ingress[]` entries.
+        vocab: Route capabilities declared by the facilities in the git tree,
+            mapped to their middleware chains (see route_vocabulary). A router
+            that asks for a capability absent from this mapping is refused.
 
     Returns:
         The Traefik dynamic doc, or None when there is no ingress.
@@ -919,26 +940,32 @@ def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901,
             "tls": {"certResolver": "letsencrypt"},
         }
         mw = []
-        # Opt-in GitHub-OAuth gate (oauth2-proxy forwardAuth) for internal apps
-        # like nukview. Mirror the dashboard's [oauth-errors, oauth-auth] order:
-        # errors (outer) catches the 401-403 the auth (inner) returns and serves
-        # the sign-in page. Both middlewares live in global.yml; this host also
-        # needs an oauth2-proxy /oauth2/ route (see docker-compose.traefik.yml).
-        # ⚠ The else is load-bearing. Without it an unrecognised value fell through to a
-        #   router with no auth middleware and no error — a security control failing OPEN.
-        #   Ingress.auth is a closed Literal now, but this function also takes raw dicts,
-        #   so it refuses unknown values itself rather than trusting its caller.
-        if ing.get("auth") == "oauth":
-            mw += ["oauth-errors@file", "oauth-auth@file"]
-        elif ing.get("auth") == "basic":
-            mw += ["auth@file"]
-        elif ing.get("auth") is not None:
-            msg = (
-                f"ingress.auth={ing['auth']!r} is not a known gate (expected 'oauth' or "
-                f"'basic'). Refusing to render an UNAUTHENTICATED router for a route that "
-                f"asked to be gated."
-            )
-            raise ValueError(msg)
+        # ⚠ The refusals below are load-bearing. The chain this replaced once had no
+        #   `else`, and an unrecognised value fell through to a router with no auth
+        #   middleware and no error — a security control failing OPEN. The lookup
+        #   keeps that closed and widens it: an undeclared capability, and a
+        #   capability whose chain is empty, are BOTH refusals (spec §5.4).
+        want = ing.get("auth")
+        if want is not None:
+            # §5.3's field→capability map: the router asks for `oauth`, the
+            # facility provides `auth`. Identity for unmapped values (`basic`).
+            capability = _ROUTE_CAPABILITY.get(want, want)
+            if capability not in vocab:
+                msg = (
+                    f"ingress.auth={want!r} maps to capability {capability!r}, which no "
+                    f"facility in the tree provides (declared: {sorted(vocab) or 'none'}). "
+                    f"Refusing to render an UNAUTHENTICATED router for a route that "
+                    f"asked to be gated — apply a Facility declaring "
+                    f"spec.provides.route.capability={capability!r} first."
+                )
+                raise ValueError(msg)
+            if not vocab[capability]:
+                msg = (
+                    f"ingress.auth={want!r} resolves to an EMPTY middleware list. Refusing "
+                    f"to render an ungated router."
+                )
+                raise ValueError(msg)
+            mw += vocab[capability]
         if ing.get("path") and ing.get("stripPrefix"):
             sid = f"{rid}-strip"
             middlewares[sid] = {"stripPrefix": {"prefixes": [ing["path"]]}}
@@ -981,10 +1008,10 @@ def build_ingress(name: str, ingress: list[dict]) -> dict | None:  # noqa: C901,
     return {"http": http}
 
 
-def write_ingress(name: str, ingress: list[dict]) -> None:
+def write_ingress(name: str, ingress: list[dict], vocab: dict[str, list[str]]) -> None:
     """Render and write the Traefik dynamic file for an app (removes it if empty)."""
     target = DYNAMIC / f"{name}.yml"
-    doc = build_ingress(name, ingress)
+    doc = build_ingress(name, ingress, vocab)
     if doc is None:
         target.unlink(missing_ok=True)
         return
@@ -1144,7 +1171,7 @@ def rewrite_ingress_for_edge(ingress: list[dict], self_ip: str) -> list[dict]:
     return out
 
 
-def write_edge_ingress(name: str, ingress: list[dict]) -> None:
+def write_edge_ingress(name: str, ingress: list[dict], vocab: dict[str, list[str]]) -> None:
     """Stage an app's Traefik router for delivery to the edge (worker apps).
 
     Mirrors write_ingress but targets EDGE_DYNAMIC — a staging dir the orchestrator
@@ -1156,7 +1183,7 @@ def write_edge_ingress(name: str, ingress: list[dict]) -> None:
     """
     EDGE_DYNAMIC.mkdir(parents=True, exist_ok=True)
     target = EDGE_DYNAMIC / f"worker-{name}.yml"
-    doc = build_ingress(name, ingress)
+    doc = build_ingress(name, ingress, vocab)
     if doc is None:
         target.unlink(missing_ok=True)
         return
@@ -1989,6 +2016,10 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
             f"is role={role!r} — nothing to do"
         )
         return
+    # The manifest's own directory is the tree root for a hand-run apply; the
+    # convergence loop passes the archive root, whose facilities/ sits alongside.
+    facilities = load_facilities(manifest_path.resolve().parent)
+    vocab = route_vocabulary(facilities) if facilities else DEFAULT_ROUTE_VOCAB
     DYNAMIC.mkdir(parents=True, exist_ok=True)
     DEPLOYS.mkdir(parents=True, exist_ok=True)
     source = manifest.spec.source
@@ -2062,10 +2093,10 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
         name, ingress, db_env, env_from, db_services, publish_ip=self_ip if edge_term else None
     )
     if edge_term:
-        write_edge_ingress(name, rewrite_ingress_for_edge(ingress, self_ip))
+        write_edge_ingress(name, rewrite_ingress_for_edge(ingress, self_ip), vocab)
         (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)  # keep the inert local dir clean
     else:
-        write_ingress(name, ingress)
+        write_ingress(name, ingress, vocab)
     persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
     # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
     # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services

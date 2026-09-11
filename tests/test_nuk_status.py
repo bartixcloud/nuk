@@ -94,7 +94,7 @@ def _stand_up(  # noqa: PLR0913  # test fixture helper — one knob per axis und
     (pdir / "manifest.yml").write_text(yaml.safe_dump(manifest), encoding="utf-8")
 
     if with_dynamic:
-        nuk.write_ingress(name, ingress)
+        nuk.write_ingress(name, ingress, nuk.DEFAULT_ROUTE_VOCAB)
 
     sha = None
     if with_git:
