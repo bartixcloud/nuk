@@ -44,7 +44,7 @@ TLS_FACILITY = """
     metadata: {name: ingress}
     spec:
       placement: {role: edge}
-      compose: files/docker-compose.traefik.yml
+      compose: docker-compose.traefik.yml
       provides:
         route: {capability: tls}
       health: {containers: [traefik]}
@@ -56,7 +56,7 @@ DATA_FACILITY = """
     metadata: {name: data-stack}
     spec:
       placement: {role: data}
-      compose: files/docker-compose.data.yml
+      compose: docker-compose.data.yml
       provides:
         env: {capability: databases, bind: postgres}
       health: {containers: [nuk-postgres, nuk-redis]}
