@@ -30,6 +30,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    TypeAdapter,
     ValidationError,
     field_validator,
     model_validator,
@@ -99,6 +100,14 @@ class Compose(BaseModel):
     """`spec.compose` — path to the compose file inside the repo."""
 
     file: str = "docker-compose.yml"
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_string(cls, data: object) -> object:
+        """Allow passing compose as a string directly (converted to {file: ...})."""
+        if isinstance(data, str):
+            return {"file": data}
+        return data
 
 
 class Ingress(BaseModel):
@@ -198,6 +207,56 @@ class Databases(_NullTolerant):
     attach_all: bool = Field(default=False, alias="attachAll")
 
 
+class Placement(BaseModel):
+    """`spec.placement` — the role whose hosts run this manifest's containers.
+
+    Shared by both kinds (spec §4.2). Replaces the two implicit placement
+    mechanisms it supersedes: "whichever host someone ran `nuk apply` on", and
+    converge.sh's `APPS="a.yml b.yml"` environment variable.
+    """
+
+    role: Literal["edge", "data", "app", "hypervisor", "all-in-one"]
+
+
+class Health(_NullTolerant):
+    """`spec.health` — how a facility proves it is actually up.
+
+    Vocabulary is git-derived and fleet-wide; health is same-host (spec §5.3).
+    Only the host whose `placement.role` owns a facility can check it.
+    """
+
+    containers: list[str] = []
+
+
+class RouteProvide(BaseModel):
+    """`spec.provides.route` — a stateless decoration a router can opt into.
+
+    `capability` is what the facility HANDS OUT; a Deployment consumes it via
+    the §5.3 field→capability map (`ingress[].auth: oauth` → `auth`).
+    `middlewares` are applied in declaration order, outer→inner.
+    """
+
+    capability: str
+    middlewares: list[str] = []
+
+
+class EnvProvide(BaseModel):
+    """`spec.provides.env` — a stateful binding handed to an app as env vars."""
+
+    capability: str
+    bind: Literal["postgres"]
+
+
+class Provides(_NullTolerant):
+    """`spec.provides` — what a Facility hands out.
+
+    The whole of `Facility ≡ Deployment + spec.provides`.
+    """
+
+    route: RouteProvide | None = None
+    env: EnvProvide | None = None
+
+
 class Spec(_NullTolerant):
     """The manifest `spec` block."""
 
@@ -208,6 +267,7 @@ class Spec(_NullTolerant):
     ingress: list[Ingress] = []
     env_from: list[EnvFrom] = Field(default=[], alias="envFrom")
     databases: Databases = Databases()
+    placement: Placement | None = None
 
 
 class Metadata(BaseModel):
@@ -216,8 +276,19 @@ class Metadata(BaseModel):
     name: str
 
 
+class FacilitySpec(Spec):
+    """A Facility's `spec` — a Deployment's spec plus what it hands out.
+
+    `Facility ≡ Deployment + spec.provides` (spec §4.2). `source`, `compose`,
+    `ingress`, `databases`, `placement` are inherited unchanged.
+    """
+
+    provides: Provides = Provides()
+    health: Health = Health()
+
+
 class Manifest(_NullTolerant):
-    """A validated nuk/v1 Deployment manifest.
+    """The fields every nuk/v1 document shares, whatever its kind.
 
     Carries the typed view used by the command layer plus the raw parsed dict
     (`raw`) handed unchanged to the wire-contract render functions, so their
@@ -227,9 +298,7 @@ class Manifest(_NullTolerant):
     model_config = ConfigDict(populate_by_name=True)
 
     api_version: Literal["nuk/v1"] = Field(alias="apiVersion")
-    kind: Literal["Deployment"]
     metadata: Metadata
-    spec: Spec = Spec()
 
     _raw: dict = PrivateAttr(default_factory=dict)
 
@@ -237,6 +306,26 @@ class Manifest(_NullTolerant):
     def raw(self) -> dict:
         """The original parsed manifest dict (wire-contract input)."""
         return self._raw
+
+
+class Deployment(Manifest):
+    """An app stack: containers, ingress, optional databases."""
+
+    kind: Literal["Deployment"]
+    spec: Spec = Spec()
+
+
+class Facility(Manifest):
+    """A platform service that additionally declares what it provides."""
+
+    kind: Literal["Facility"]
+    spec: FacilitySpec = FacilitySpec()
+
+
+# One document family, one apiVersion, one union — discriminated on `kind` so a
+# typo in `kind` is a validation error rather than a silently-skipped document.
+AnyManifest = Annotated[Deployment | Facility, Field(discriminator="kind")]
+_MANIFEST_ADAPTER = TypeAdapter(AnyManifest)
 
 
 # --- org capability manifest (nukorg/v1) --------------------------------------
@@ -431,7 +520,7 @@ class Org(BaseModel):
         return self
 
 
-def validate_ingress_hosts(org: Org, manifest: Manifest) -> None:
+def validate_ingress_hosts(org: Org, manifest: Deployment | Facility) -> None:
     """Assert every ingress host in `manifest` ends on one of the org's domains.
 
     Args:
@@ -451,8 +540,8 @@ def sh(*cmd: str, cwd: Path | None = None) -> None:
     subprocess.run(cmd, cwd=cwd, check=True)  # noqa: S603  # fixed argv, no shell
 
 
-def load(path: Path) -> Manifest:
-    """Parse and validate a manifest file into a `Manifest`.
+def load(path: Path) -> Deployment | Facility:
+    """Parse and validate a manifest file into a `Deployment` or a `Facility`.
 
     Args:
         path: Path to the manifest YAML.
@@ -462,13 +551,13 @@ def load(path: Path) -> Manifest:
         functions.
 
     Raises:
-        SystemExit: If the document is not a valid nuk/v1 Deployment.
+        SystemExit: If the document is not a valid nuk/v1 Deployment or Facility.
     """
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     try:
-        manifest = Manifest.model_validate(raw)
+        manifest = _MANIFEST_ADAPTER.validate_python(raw)
     except ValidationError:
-        sys.exit(f"{path}: not a nuk/v1 Deployment")
+        sys.exit(f"{path}: not a nuk/v1 Deployment or Facility")
     manifest._raw = raw  # noqa: SLF001  # stash wire-contract input on its own model
     return manifest
 
@@ -1807,8 +1896,9 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
             f"{name}: host is non-edge (role={role}) but /etc/nuklaut/host.env has no "
             f"PRIVATE_IP — cannot publish ingress for edge termination"
         )
-    write_override(name, ingress, db_env, env_from, db_services,
-                   publish_ip=self_ip if edge_term else None)
+    write_override(
+        name, ingress, db_env, env_from, db_services, publish_ip=self_ip if edge_term else None
+    )
     if edge_term:
         write_edge_ingress(name, rewrite_ingress_for_edge(ingress, self_ip))
         (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)  # keep the inert local dir clean

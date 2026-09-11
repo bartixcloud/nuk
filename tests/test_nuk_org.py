@@ -300,8 +300,8 @@ def test_org_private_ip_must_match_subnet():
 # --- ingress-host coverage ---------------------------------------------------
 
 
-def _manifest(host: str) -> nuk.Manifest:
-    return nuk.Manifest.model_validate(
+def _manifest(host: str) -> nuk.Deployment:
+    return nuk.Deployment.model_validate(
         {
             "apiVersion": "nuk/v1",
             "kind": "Deployment",
