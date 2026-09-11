@@ -1147,6 +1147,90 @@ def env_facility(facilities: list[Facility], capability: str) -> Facility | None
     return None
 
 
+# App deployments live in <tree>/deployments/*.yml. The edge enumerates this dir
+# to render a router for every one of them; before this, placement was implicit —
+# "whichever host someone ran `nuk apply` on", or converge.sh's APPS= variable.
+DEPLOYMENT_DIR = "deployments"
+
+
+def load_deployments(tree: Path) -> list[Deployment]:
+    """Load every `kind: Deployment` manifest in `<tree>/deployments/*.yml`."""
+    ddir = tree / DEPLOYMENT_DIR
+    if not ddir.is_dir():
+        return []
+    return [m for p in sorted(ddir.glob("*.yml")) if isinstance(m := load(p), Deployment)]
+
+
+def backend_address(org: Org, manifest: Deployment, ing: dict) -> str:
+    """Where the edge should send traffic for one ingress entry.
+
+    An explicit `address` (a backend the org does not manage) passes through.
+    Otherwise the backend is the private IP of the org's host for this
+    deployment's `placement.role`, on the published port — the port
+    build_override publishes, which is `hostPort` when set and `port` otherwise.
+
+    Raises:
+        ValueError: If the deployment has no placement (the edge cannot guess
+            which host runs it), or the org declares no host with that role.
+    """
+    if ing.get("address"):
+        return ing["address"]
+    placement = manifest.spec.placement
+    if placement is None:
+        msg = (
+            f"{manifest.metadata.name}: has ingress but no spec.placement — the edge "
+            f"cannot resolve a backend without knowing which host runs it."
+        )
+        raise ValueError(msg)
+    hosts = [h for h in org.hosts if h.role == placement.role]
+    if not hosts:
+        msg = (
+            f"{manifest.metadata.name}: placement.role={placement.role!r} but the org "
+            f"manifest declares no host with role {placement.role!r}."
+        )
+        raise ValueError(msg)
+    return f"{hosts[0].private_ip}:{ing.get('hostPort') or ing['port']}"
+
+
+def render_edge_routers(tree: Path, org: Org) -> list[str]:
+    """On the edge: render a router for EVERY Deployment with ingress.
+
+    Cross-host router delivery is gone. The edge reads the same git tree every
+    host reads and resolves each backend from the org manifest, so the app host
+    authors nothing that reaches the edge (spec §6, §6.3).
+
+    Stale routers for retired apps are NOT removed here — a manifest disappearing
+    from git is destructive, and the loop reports rather than deletes (spec §7.4).
+    The one bounded exception is the legacy `worker-` prefix (reap_legacy_worker_routers).
+
+    Args:
+        tree: Root of the manifest tree the loop pulled.
+        org: The validated org manifest, source of every backend private IP.
+
+    Returns:
+        The names of the deployments whose routers were written.
+    """
+    DYNAMIC.mkdir(parents=True, exist_ok=True)
+    vocab = route_vocabulary(load_facilities(tree))
+    rendered: list[str] = []
+    for manifest in load_deployments(tree):
+        ingress = manifest.raw.get("spec", {}).get("ingress") or []
+        if not ingress:
+            continue
+        resolved = [
+            {k: v for k, v in ing.items() if k not in {"service", "port", "hostPort"}}
+            | {"address": backend_address(org, manifest, ing)}
+            for ing in ingress
+        ]
+        name = manifest.metadata.name
+        doc = build_ingress(name, resolved, vocab)
+        if doc is None:
+            continue
+        (DYNAMIC / f"{name}.yml").write_text(yaml.safe_dump(doc))
+        rendered.append(name)
+    return rendered
+
+
 def facility_health(manifest: Facility) -> str | None:
     """Whether this facility's containers are actually up on THIS host.
 
