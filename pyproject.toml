@@ -1,6 +1,6 @@
 [project]
 name = "nuk"
-version = "0.22.0"
+version = "0.23.0"
 description = "Minimal Kubernetes-shaped Docker Compose deployer (nuklaut controller CLI)"
 readme = "README.md"
 requires-python = ">=3.13"
