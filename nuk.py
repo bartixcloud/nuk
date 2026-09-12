@@ -266,10 +266,17 @@ class RouteProvide(BaseModel):
 
 
 class EnvProvide(BaseModel):
-    """`spec.provides.env` — a stateful binding handed to an app as env vars."""
+    """`spec.provides.env` — a stateful binding handed to an app as env vars.
+
+    `bind` names the wire protocol a capability is offered on. `postgres`
+    is a SQL bind to a provisioned cluster; `otlp` is an OTLP ingest
+    endpoint (facility `logging`, spec §14.1) — declared for the vocabulary
+    only, since no manifest field consumes `logs` (§14.3) and no code
+    branches on the value.
+    """
 
     capability: str
-    bind: Literal["postgres"]
+    bind: Literal["postgres", "otlp"]
 
 
 class Provides(_NullTolerant):
