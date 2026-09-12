@@ -1746,10 +1746,29 @@ def purge_databases(app: str) -> None:
 
 
 # --- provenance-on-apply -------------------------------------------------------
-# `nuk apply` stamps DEPLOYS/<name>/provenance.json with the exact commit/image
-# it deployed, so `status` has a trustworthy source even for rsync-mirrored
-# (.git-less) workflow deploys. Best-effort by design: see the try/except around
-# its only call site in cmd_apply.
+# `nuk apply` appends the exact commit/image it deployed to
+# /var/lib/nuk/releases/<name>.jsonl, one JSON object per line, so `status` has a
+# trustworthy source even for rsync-mirrored (.git-less) workflow deploys.
+# Best-effort by design: see the try/except around its only call site in cmd_apply.
+#
+# It was a single object at DEPLOYS/<name>/provenance.json until 0.18 — a record,
+# not a history, overwritten on every apply (spec §8). The file moved to
+# /var/lib/nuk/releases so it survives a VM rebuild on the host's data volume
+# (same store family as Loki chunks, §14.4); a legacy provenance.json is READ as a
+# seed, never written. Appending is what makes `nuk rollback` possible at all, and
+# it is the one genuinely valuable idea in Helm, in better shape than Helm's.
+
+# Releases kept per deployment (spec §8: the last 20). A bound, not a policy:
+# the file is read whole on every apply, and an operator choosing a rollback
+# target cannot meaningfully scan past a few dozen entries. Combined with the
+# same-release refresh below, 20 is effectively "every recent release".
+RELEASE_LIMIT = 20
+
+# /var/lib/nuk is the loop's state dir (CONVERGE_STATE, Task 3). releases/ is
+# created by cloud-init and install_converge (Task 7) and defensively here, so a
+# hand-run `sudo nuk apply` on a pre-loop host still records (spec §8: survives
+# VM rebuild by living on the host's data volume).
+RELEASES = Path("/var/lib/nuk/releases")
 
 
 def _iso_utc_now() -> str:
@@ -1762,22 +1781,69 @@ def _provenance_path(name: str) -> Path:
     return project_dir(name) / "provenance.json"
 
 
-def read_provenance(name: str) -> dict | None:
-    """Read an app's provenance.json, or None if absent/unreadable/malformed."""
-    path = _provenance_path(name)
+def _releases_path(name: str) -> Path:
+    """On-disk path of an app's release history (spec §8)."""
+    return RELEASES / f"{name}.jsonl"
+
+
+def read_provenance_history(name: str) -> list[dict]:
+    """Every recorded release for `name`, oldest first; `[]` if none.
+
+    Reads /var/lib/nuk/releases/<name>.jsonl, skipping unparseable lines — a
+    half-written line from a killed apply must not blank the history. When the
+    JSONL does not exist yet, a legacy DEPLOYS/<name>/provenance.json (a bare
+    object from nuk <= 0.18, or a list from the interim 0.19 format) seeds the
+    history; the legacy file is never written. Reads have no side effects: the
+    upgrade happens on the next append anyway.
+    """
+    path = _releases_path(name)
     if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    return data if isinstance(data, dict) else None
+        legacy = _provenance_path(name)
+        if not legacy.exists():
+            return []
+        try:
+            data = json.loads(legacy.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        if isinstance(data, dict):
+            return [data]
+        if isinstance(data, list):
+            return [e for e in data if isinstance(e, dict)]
+        return []
+    entries: list[dict] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(entry, dict):
+            entries.append(entry)
+    return entries
+
+
+def read_provenance(name: str) -> dict | None:
+    """The CURRENT release for `name`, or None if nothing is recorded.
+
+    Signature and contract unchanged across the history migration: `cmd_status`
+    and `_overview_provenance` want one entry, and "current" is the newest.
+    """
+    history = read_provenance_history(name)
+    return history[-1] if history else None
 
 
 def write_provenance(
     name: str, *, repo: str | None, branch: str, commit: str | None, image_digest: str | None
 ) -> None:
-    """Write DEPLOYS/<name>/provenance.json — the trustworthy source `status` prefers.
+    """Append this release to /var/lib/nuk/releases/<name>.jsonl.
+
+    Re-applying the SAME release (identical repo/branch/commit/digest) refreshes
+    the existing entry's timestamp instead of appending. The loop applies every
+    cycle whether or not anything changed, so appending unconditionally would
+    grow the file by ~4 entries a day per app and shift every `rollback --to`
+    index under the operator between one look and the next. The history records
+    releases, not cycles. Keeps the last RELEASE_LIMIT entries (spec §8).
 
     Raises on write failure; the caller (`cmd_apply`) treats this as best-effort
     and must not fail the deploy over it.
@@ -1789,14 +1855,24 @@ def write_provenance(
         commit: The full deployed commit sha, if resolvable.
         image_digest: The deployed image's digest, if resolvable.
     """
-    payload = {
+    entry = {
         "repo": repo,
         "branch": branch,
         "commit": commit,
         "imageDigest": image_digest,
         "appliedAt": _iso_utc_now(),
     }
-    _provenance_path(name).write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    history = read_provenance_history(name)
+    identity = ("repo", "branch", "commit", "imageDigest")
+    if history and all(history[-1].get(k) == entry[k] for k in identity):
+        history[-1] = entry
+    else:
+        history.append(entry)
+    RELEASES.mkdir(parents=True, exist_ok=True)
+    _releases_path(name).write_text(
+        "".join(json.dumps(e) + "\n" for e in history[-RELEASE_LIMIT:]),
+        encoding="utf-8",
+    )
 
 
 def _full_commit_sha(repo_dir: Path) -> str | None:

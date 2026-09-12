@@ -70,12 +70,14 @@ def _stand_up(  # noqa: PLR0913  # test fixture helper — one knob per axis und
     deploys = root / "deployments"
     dynamic = root / "traefik" / "dynamic"
     secrets = root / "secrets"
+    releases = tmp_path / "releases"
     dynamic.mkdir(parents=True)
     secrets.mkdir(parents=True)
     monkeypatch.setattr(nuk, "ROOT", root)
     monkeypatch.setattr(nuk, "DEPLOYS", deploys)
     monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
     monkeypatch.setattr(nuk, "SECRETS", secrets)
+    monkeypatch.setattr(nuk, "RELEASES", releases)
 
     pdir = deploys / name
     pdir.mkdir(parents=True)
@@ -429,10 +431,12 @@ def _apply_manifest(tmp_path, monkeypatch, *, name="app"):
     git/docker — the pre-seeded repo/ checkout is what provenance reads.
     """
     root = tmp_path / "opt-nuklaut"
+    releases = tmp_path / "releases"
     monkeypatch.setattr(nuk, "ROOT", root)
     monkeypatch.setattr(nuk, "DEPLOYS", root / "deployments")
     monkeypatch.setattr(nuk, "DYNAMIC", root / "traefik" / "dynamic")
     monkeypatch.setattr(nuk, "SECRETS", root / "secrets")
+    monkeypatch.setattr(nuk, "RELEASES", releases)
 
     manifest_path = tmp_path / "deployment.yml"
     manifest = {
