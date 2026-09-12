@@ -299,3 +299,13 @@ def test_declaration_only_facility_without_spec_applies(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "load_org", lambda _p: object())
     monkeypatch.setattr(nuk, "write_provenance", lambda *_a, **_k: None)
     nuk.cmd_apply(doc, None)  # must not raise
+
+
+def test_is_privileged_false_when_nss_is_broken(monkeypatch):
+    monkeypatch.setattr(nuk.os, "geteuid", lambda: 1000)
+
+    def boom(_name):
+        raise OSError("NSS unavailable")
+
+    monkeypatch.setattr(nuk.grp, "getgrnam", boom)
+    assert nuk._is_privileged() is False

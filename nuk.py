@@ -214,7 +214,7 @@ class Placement(BaseModel):
 
     Shared by both kinds (spec §4.2). Replaces the two implicit placement
     mechanisms it supersedes: "whichever host someone ran `nuk apply` on", and
-    converge.sh's `APPS="a.yml b.yml"` environment variable.
+    converge.sh's retired APPS environment variable.
     """
 
     role: Literal["edge", "data", "app", "hypervisor", "all-in-one"]
@@ -1162,7 +1162,7 @@ def env_facility(facilities: list[Facility], capability: str) -> Facility | None
 
 # App deployments live in <tree>/deployments/*.yml. The edge enumerates this dir
 # to render a router for every one of them; before this, placement was implicit —
-# "whichever host someone ran `nuk apply` on", or converge.sh's APPS= variable.
+# "whichever host someone ran `nuk apply` on", or converge.sh's retired APPS variable.
 DEPLOYMENT_DIR = "deployments"
 
 
@@ -1239,7 +1239,7 @@ def backend_address(org: Org, manifest: Deployment, ing: dict) -> str:
 _LEGACY_ROUTER_PREFIX = "worker-"
 
 
-def reap_legacy_worker_routers() -> list[str]:
+def reap_legacy_worker_routers(protected: set[str] | None = None) -> list[str]:
     """Remove routers the retired cross-host delivery path left on the edge.
 
     Bounded and one-time: scoped to the `worker-` prefix, so the edge's native
@@ -1250,13 +1250,21 @@ def reap_legacy_worker_routers() -> list[str]:
     This is the single documented exception to "report, never delete"
     (spec §7.4). Everything else stale is reported and left for a human.
 
+    Args:
+        protected: Router filenames to keep even if they match the legacy
+            prefix. The edge passes every current deployment's filename so an
+            app legitimately named `worker-*` is not deleted out from under it.
+
     Returns:
         The filenames removed, for the caller to log.
     """
     if not DYNAMIC.is_dir():
         return []
+    protected = protected or set()
     reaped = []
     for p in sorted(DYNAMIC.glob(f"{_LEGACY_ROUTER_PREFIX}*.yml")):
+        if p.name in protected:
+            continue
         p.unlink()
         reaped.append(p.name)
     return reaped
@@ -1281,11 +1289,13 @@ def render_edge_routers(tree: Path, org: Org) -> list[str]:
         The names of the deployments whose routers were written.
     """
     DYNAMIC.mkdir(parents=True, exist_ok=True)
-    for stale in reap_legacy_worker_routers():
+    deployments = load_deployments(tree)
+    protected = {f"{m.metadata.name}.yml" for m in deployments}
+    for stale in reap_legacy_worker_routers(protected):
         print(f"edge: reaped legacy router {stale} (cross-host delivery is retired)")
     vocab = route_vocabulary(load_facilities(tree))
     rendered: list[str] = []
-    for manifest in load_deployments(tree):
+    for manifest in deployments:
         ingress = manifest.raw.get("spec", {}).get("ingress") or []
         if not ingress:
             continue
@@ -2177,14 +2187,14 @@ def _is_privileged() -> bool:
     (spec §4.4). A second binary would give zero isolation: same host, same
     user, same filesystem.
 
-    Root, or membership in `nuk-facility`. A missing group is not an error —
-    it means nobody has been granted the capability, so only root qualifies.
+    Root, or membership in `nuk-facility`. A missing or broken group is not an
+    error — it means the capability cannot be resolved, so only root qualifies.
     """
     if os.geteuid() == 0:
         return True
     try:
         gid = grp.getgrnam(_FACILITY_GROUP).gr_gid
-    except KeyError:
+    except (KeyError, OSError):
         return False
     return gid in os.getgroups()
 

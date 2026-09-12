@@ -221,3 +221,12 @@ def test_edge_dynamic_staging_is_gone():
     """The staging dir and both writers are deleted, not deprecated."""
     for gone in ("EDGE_DYNAMIC", "write_edge_ingress", "rewrite_ingress_for_edge"):
         assert not hasattr(nuk, gone), f"{gone} should have been deleted"
+
+
+def test_reap_does_not_remove_a_current_worker_named_deployment(tmp_path, monkeypatch):
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    (dynamic / "worker-app.yml").write_text("http: {}\n", encoding="utf-8")
+    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    assert nuk.reap_legacy_worker_routers(protected={"worker-app.yml"}) == []
+    assert (dynamic / "worker-app.yml").exists()
