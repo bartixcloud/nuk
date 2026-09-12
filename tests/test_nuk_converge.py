@@ -649,3 +649,84 @@ def test_the_edge_refuses_when_the_org_manifest_is_missing(loop, monkeypatch, ca
     )
     assert code == 1
     assert "org manifest" in capsys.readouterr().err
+
+
+# --- the logging status line (spec §14.3, §15.7) --------------------------------
+
+
+def test_write_converge_status_records_an_optional_logging_line(tmp_path):
+    path = tmp_path / "converge-status.json"
+    nuk.write_converge_status(
+        path,
+        tag="v1.2.0",
+        commit="a" * 40,
+        role="edge",
+        results=[],
+        rendered=[],
+        warnings=[],
+        logging={"healthy": True, "detail": "ok"},
+    )
+    data = nuk.read_converge_status(path)
+    assert data["logging"] == {"healthy": True, "detail": "ok"}
+
+
+def test_write_converge_status_omits_logging_when_not_given(tmp_path):
+    """A pre-loop host, or a non-edge role, records no logging line at all."""
+    path = tmp_path / "converge-status.json"
+    nuk.write_converge_status(
+        path, tag="v1.2.0", commit="a" * 40, role="app", results=[], rendered=[], warnings=[]
+    )
+    data = nuk.read_converge_status(path)
+    assert "logging" not in data
+
+
+def test_the_edge_records_the_logging_facility_health(loop, monkeypatch):
+    """Spec §14.3: info-only — the line reflects the facility's health gate."""
+    repo, signers, state = loop
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "load_org", lambda path: "ORG")
+    monkeypatch.setattr(nuk, "render_edge_routers", lambda tree, org: [])
+    monkeypatch.setattr(
+        nuk, "env_facility",
+        lambda facilities, capability: facilities[0] if capability == "logs" else None,
+    )
+    monkeypatch.setattr(
+        nuk, "load_facilities",
+        lambda tree: [object()],  # any manifest — env_facility is stubbed
+    )
+    monkeypatch.setattr(nuk, "facility_health", lambda manifest: None)
+    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
+    data = nuk.read_converge_status(state / "converge-status.json")
+    assert data["logging"] == {"healthy": True, "detail": "ok"}
+
+
+def test_a_non_edge_host_records_no_logging_line(loop, monkeypatch):
+    """Loki lives on the edge; only the edge's cycle knows its health."""
+    repo, signers, state = loop
+    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
+    monkeypatch.setattr(
+        nuk, "env_facility",
+        lambda *a, **k: pytest.fail("must not resolve logging off the edge"),
+    )
+    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
+    data = nuk.read_converge_status(state / "converge-status.json")
+    assert "logging" not in data
+
+
+def test_an_unhealthy_logging_facility_is_recorded_not_refused(loop, monkeypatch):
+    """§14.3's fail-open: a dead Loki never blocks or fails the cycle."""
+    repo, signers, state = loop
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "load_org", lambda path: "ORG")
+    monkeypatch.setattr(nuk, "render_edge_routers", lambda tree, org: [])
+    monkeypatch.setattr(nuk, "env_facility", lambda facilities, capability: object())
+    monkeypatch.setattr(
+        nuk, "load_facilities", lambda tree: [object()]
+    )
+    monkeypatch.setattr(
+        nuk, "facility_health", lambda manifest: "container 'loki' is not running"
+    )
+    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
+    data = nuk.read_converge_status(state / "converge-status.json")
+    assert data["logging"]["healthy"] is False
+    assert "loki" in data["logging"]["detail"]

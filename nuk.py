@@ -1408,8 +1408,13 @@ def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a d
     results: list[dict],
     rendered: list[str],
     warnings: list[str],
+    logging: dict | None = None,
 ) -> None:
     """Record the cycle's outcome (spec §7.6).
+
+    `logging` is the LOGGING pipeline's own health — info-only (spec §14.3):
+    it is recorded, never a per-manifest result, and never a failure
+    condition. Absent for non-edge cycles and pre-loop hosts.
 
     Replaces bootstrap.sh's `write_status_json`, which described a one-shot
     first-boot run; this describes the last convergence. Consumed by `drift.sh`
@@ -1425,6 +1430,8 @@ def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a d
         "rendered": rendered,
         "reapWarnings": warnings,
     }
+    if logging is not None:
+        payload["logging"] = logging
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
 
 
@@ -1437,7 +1444,7 @@ def read_converge_status(path: Path = CONVERGE_STATUS) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def cmd_converge(  # noqa: PLR0911  # each early return is a distinct fail-closed refusal (spec §7.5)
+def cmd_converge(  # noqa: PLR0911, C901  # each early return is a distinct fail-closed refusal (spec §7.5); the logging block adds one more branch, keeping the status-line computation next to the write that consumes it
     *, repo: Path, signers: Path, state_dir: Path, org_file: str
 ) -> int:
     """Converge this host to the newest verifying tag of the manifest repo.
@@ -1499,6 +1506,20 @@ def cmd_converge(  # noqa: PLR0911  # each early return is a distinct fail-close
             results = apply_tree(tree, role)
             rendered = render_edge_routers(tree, org) if org is not None else []
             warnings = reap_report(tree)
+            # The LOGGING pipeline's own health (spec §14.3): info-only, computed
+            # on the edge alone — Loki lives there, and a facility placed
+            # elsewhere is not this host's job (spec §5.4). Never a per-manifest
+            # result, never a failure condition; apps fail on their own terms,
+            # logs fail silently on the collector's.
+            logging_status: dict | None = None
+            if role == "edge":
+                facility = env_facility(load_facilities(tree), "logs")
+                if facility is not None:
+                    reason = facility_health(facility)
+                    logging_status = {
+                        "healthy": reason is None,
+                        "detail": reason or "ok",
+                    }
         if warnings:
             print(
                 f"WARN: {len(warnings)} deployed app(s) not present at {tag}: "
@@ -1514,6 +1535,7 @@ def cmd_converge(  # noqa: PLR0911  # each early return is a distinct fail-close
             results=results,
             rendered=rendered,
             warnings=warnings,
+            logging=logging_status,
         )
         record_applied(tag, commit, last_applied)
         return 0
