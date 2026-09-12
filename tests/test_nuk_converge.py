@@ -514,3 +514,113 @@ def test_a_facility_placed_on_another_host_does_not_poison(tmp_path, monkeypatch
     results = nuk.apply_tree(tree, "app")
     assert [r["name"] for r in results] == ["hello"]
     assert results[0]["result"] == "ok"
+
+
+# --- reap, render, status -------------------------------------------------------
+
+
+def test_reap_reports_orphans_and_deletes_nothing(tmp_path, monkeypatch):
+    """Spec §7.4 — the loop never removes deployments."""
+    tree = _tree(tmp_path, deployments={"hello": DEPLOYMENT_YML})
+    deploys = tmp_path / "deployments"
+    for name in ("hello", "app-alpha", "oauth"):
+        (deploys / name).mkdir(parents=True)
+    monkeypatch.setattr(nuk, "DEPLOYS", deploys)
+    assert nuk.reap_report(tree) == ["app-alpha", "oauth"]
+    assert (deploys / "app-alpha").is_dir()
+    assert (deploys / "oauth").is_dir()
+
+
+def test_reap_counts_facilities_as_declared(tmp_path, monkeypatch):
+    """A facility deployed here is not an orphan just because it is not a Deployment."""
+    tree = _tree(
+        tmp_path,
+        facilities={"data-stack": FACILITY_YML},
+        deployments={"hello": DEPLOYMENT_YML},
+    )
+    deploys = tmp_path / "deployments"
+    for name in ("hello", "data-stack"):
+        (deploys / name).mkdir(parents=True)
+    monkeypatch.setattr(nuk, "DEPLOYS", deploys)
+    assert nuk.reap_report(tree) == []
+
+
+def test_reap_is_empty_when_nothing_is_deployed(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "absent")
+    assert nuk.reap_report(tmp_path / "tree") == []
+
+
+def test_status_file_records_the_cycle(tmp_path):
+    path = tmp_path / "converge-status.json"
+    nuk.write_converge_status(
+        path,
+        tag="v1.2.0",
+        commit="a" * 40,
+        role="app",
+        results=[{"name": "hello", "kind": "Deployment", "result": "ok", "error": None}],
+        rendered=[],
+        warnings=["oauth"],
+    )
+    data = nuk.read_converge_status(path)
+    assert data["tag"] == "v1.2.0"
+    assert data["role"] == "app"
+    assert data["manifests"][0]["name"] == "hello"
+    assert data["reapWarnings"] == ["oauth"]
+    assert data["appliedAt"].endswith("Z")
+
+
+def test_read_status_is_none_when_absent(tmp_path):
+    assert nuk.read_converge_status(tmp_path / "absent.json") is None
+
+
+def test_converge_writes_a_status_file(loop, monkeypatch):
+    repo, signers, state = loop
+    monkeypatch.setattr(
+        nuk, "apply_tree",
+        lambda tree, role: [{"name": "hello", "kind": "Deployment", "result": "ok", "error": None}],
+    )
+    monkeypatch.setattr(nuk, "reap_report", lambda tree: ["oauth"])
+    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
+    data = nuk.read_converge_status(state / "converge-status.json")
+    assert data["tag"] == "v1.0.0"
+    assert data["reapWarnings"] == ["oauth"]
+
+
+def test_converge_warns_about_orphans_on_stdout(loop, monkeypatch, capsys):
+    repo, signers, state = loop
+    monkeypatch.setattr(nuk, "reap_report", lambda tree: ["hello", "oauth"])
+    nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE)
+    out = capsys.readouterr().out
+    assert "WARN: 2 deployed app(s) not present at v1.0.0" in out
+    assert "nuk delete" in out
+
+
+def test_a_non_edge_host_renders_no_routers(loop, monkeypatch):
+    repo, signers, state = loop
+    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
+    monkeypatch.setattr(
+        nuk, "render_edge_routers", lambda tree, org: pytest.fail("only the edge renders")
+    )
+    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
+
+
+def test_the_edge_renders_every_router(loop, monkeypatch):
+    repo, signers, state = loop
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "load_org", lambda path: "ORG")
+    monkeypatch.setattr(nuk, "render_edge_routers", lambda tree, org: ["hello", "app-alpha"])
+    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
+    assert nuk.read_converge_status(state / "converge-status.json")["rendered"] == [
+        "hello", "app-alpha"
+    ]
+
+
+def test_the_edge_refuses_when_the_org_manifest_is_missing(loop, monkeypatch, capsys):
+    """Rendering resolves every backend IP from it; guessing is not an option."""
+    repo, signers, state = loop
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    code = nuk.cmd_converge(
+        repo=repo, signers=signers, state_dir=state, org_file="nuklaut.absent.org.yml"
+    )
+    assert code == 1
+    assert "org manifest" in capsys.readouterr().err

@@ -1368,8 +1368,59 @@ def apply_tree(tree: Path, role: str) -> list[dict]:
 
 
 def reap_report(tree: Path) -> list[str]:
-    """Deployments present here but absent from `tree`. Body lands in Task 6."""
-    return []
+    """Names deployed on this host but absent from `tree` (spec §7.4).
+
+    Reports; never deletes. Auto-prune would make an accidental `git rm hello.yml`
+    an outage, while an orphan stays visible via `nuk status` and `drift.sh` and
+    is recoverable — a pruned production app is not.
+
+    Facilities count as declared: a facility's project dir sits in DEPLOYS beside
+    the deployments, and calling it an orphan would warn on every cycle.
+    """
+    if not DEPLOYS.is_dir():
+        return []
+    declared = {m.metadata.name for m in load_deployments(tree)} | {
+        m.metadata.name for m in load_facilities(tree)
+    }
+    return sorted(p.name for p in DEPLOYS.iterdir() if p.is_dir() and p.name not in declared)
+
+
+def write_converge_status(
+    path: Path,
+    *,
+    tag: str,
+    commit: str,
+    role: str,
+    results: list[dict],
+    rendered: list[str],
+    warnings: list[str],
+) -> None:
+    """Record the cycle's outcome (spec §7.6).
+
+    Replaces bootstrap.sh's `write_status_json`, which described a one-shot
+    first-boot run; this describes the last convergence. Consumed by `drift.sh`
+    and by `nuk status`.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "tag": tag,
+        "commit": commit,
+        "role": role,
+        "appliedAt": _iso_utc_now(),
+        "manifests": results,
+        "rendered": rendered,
+        "reapWarnings": warnings,
+    }
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def read_converge_status(path: Path = CONVERGE_STATUS) -> dict | None:
+    """The last recorded cycle, or None if absent/unreadable/malformed."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def cmd_converge(*, repo: Path, signers: Path, state_dir: Path, org_file: str) -> int:
@@ -1418,9 +1469,36 @@ def cmd_converge(*, repo: Path, signers: Path, state_dir: Path, org_file: str) -
         with tempfile.TemporaryDirectory(dir=state_dir, prefix="run.") as scratch:
             tree = Path(scratch)
             archive_tree(repo, commit, tree)
+            org = None
+            if role in _ENTRY_ROLES:
+                org_path = tree / org_file
+                if not org_path.is_file():
+                    print(
+                        f"REFUSING: org manifest {org_file} is not in the tree at {tag} — "
+                        f"the edge resolves every backend IP from it and cannot guess",
+                        file=sys.stderr,
+                    )
+                    return 1
+                org = load_org(org_path)
             results = apply_tree(tree, role)
+            rendered = render_edge_routers(tree, org) if org is not None else []
             warnings = reap_report(tree)
-        print(f"applied {len(results)} manifest(s); {len(warnings)} orphan(s)")
+        if warnings:
+            print(
+                f"WARN: {len(warnings)} deployed app(s) not present at {tag}: "
+                f"{', '.join(warnings)}\n"
+                f"      This loop never removes deployments. Retire explicitly:  "
+                f"nuk delete <name>"
+            )
+        write_converge_status(
+            state_dir / "converge-status.json",
+            tag=tag,
+            commit=commit,
+            role=role,
+            results=results,
+            rendered=rendered,
+            warnings=warnings,
+        )
         record_applied(tag, commit, last_applied)
         return 0
 
@@ -2898,6 +2976,9 @@ def cmd_status_overview(
         probe: Best-effort outbound HTTPS probe per ingress host (off by default).
     """
     overview = build_overview(probe_enabled=probe)
+    converge = read_converge_status()
+    if converge:
+        overview["converge"] = converge
     if show_all:
         overview.update(_soll_vs_ist(overview, org_file))
     print(json.dumps(overview, indent=2 if pretty else None))
