@@ -2277,8 +2277,25 @@ def _is_privileged() -> bool:
     return gid in os.getgroups()
 
 
-def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline; splitting it would scatter the reconcile order
-    """Create or update a deployment from a manifest."""
+def cmd_apply(  # noqa: C901, PLR0912  # linear apply pipeline; splitting it would scatter the reconcile order
+    manifest_path: Path,
+    repo_path: str | None,
+    *,
+    pin_commit: str | None = None,
+    pin_digest: str | None = None,
+) -> None:
+    """Create or update a deployment from a manifest.
+
+    Args:
+        manifest_path: Path to the nuk/v1 manifest.
+        repo_path: Local checkout to mirror instead of cloning spec.source.repo.
+        pin_commit: Check the source repo out DETACHED at this commit instead of
+            following spec.source.branch. Set only by `cmd_rollback` (spec §8).
+        pin_digest: Pull this image digest and re-tag it over the compose file's
+            own image reference for the same repository, so `up -d` recreates
+            the service with exactly the recorded bits. Set only by
+            `cmd_rollback`; fails closed (spec §8).
+    """
     manifest_path = resolve_manifest(manifest_path)
     manifest = load(manifest_path)
     raw = manifest.raw
@@ -2339,8 +2356,15 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
             sh("git", "clone", "--branch", branch, source.repo, str(repo))
         else:
             sh("git", "-C", str(repo), "fetch", "--quiet")
-            sh("git", "-C", str(repo), "checkout", branch)
-            sh("git", "-C", str(repo), "pull", "--ff-only", "--quiet")
+            if not pin_commit:
+                sh("git", "-C", str(repo), "checkout", branch)
+                sh("git", "-C", str(repo), "pull", "--ff-only", "--quiet")
+        if pin_commit:
+            # Rollback. The branch checkout + ff-only pull above is skipped rather
+            # than followed by a detach, because pulling first would fetch the very
+            # tip we are rolling away from and leave the tree at it if the detach
+            # then failed.
+            sh("git", "-C", str(repo), "checkout", "--quiet", "--detach", pin_commit)
     elif declaration_only:
         pass  # nothing to mirror — the manifest IS the whole facility
     elif manifest.kind == "Facility":
@@ -2360,6 +2384,8 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
         sh("rsync", "-a", "--delete", f"{payload}/", str(repo) + "/")
     else:
         sys.exit(f"{manifest_path}: spec.source.repo is required unless --repo-path is given")
+    if pin_digest:
+        _pin_image(name, raw, pin_digest)
     ingress = raw_spec.get("ingress", []) or []
     db_env = provision_databases(name, raw_spec.get("databases") or {}, facilities)
     db_services = resolve_db_services(name, raw, db_env)
@@ -2548,6 +2574,130 @@ def cmd_rollout(name: str) -> None:
     # else: workflow-managed deployment — re-trigger the workflow to update the tree.
     sh(*compose_args(name, manifest.raw), "pull")
     sh(*compose_args(name, manifest.raw), "up", "-d")
+
+
+def _compose_images(name: str, raw: dict) -> list[str]:
+    """The image references the compose project resolves to, in service order."""
+    try:
+        proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            [*compose_args(name, raw), "config", "--images"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return []
+    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+
+
+def _pin_image(name: str, raw: dict, pin_digest: str) -> None:
+    """Point the app's compose image reference at the pinned digest (spec §8).
+
+    The digest is the identity of the re-applied release. Order matters:
+    resolve the retag targets from the (already detached) compose tree first,
+    then `docker pull` the digest — the pull IS the preflight, and its failure
+    aborts before anything is written or recreated, leaving the current state
+    running. The runner's pre-pull model (`nuk.py:1818-1820`) already treats the
+    daemon's tags as shared mutable state; this is the same move in the
+    opposite direction.
+
+    Raises:
+        SystemExit: If no compose image comes from the digest's repository, or
+            the pull fails.
+    """
+    repo_name = pin_digest.split("@")[0]
+    refs = [
+        ref
+        for ref in _compose_images(name, raw)
+        if ref.split("@")[0].split(":")[0] == repo_name
+    ]
+    if not refs:
+        sys.exit(
+            f"{name}: the pinned compose references no image from {repo_name} — "
+            f"cannot pin {pin_digest}"
+        )
+    sh("docker", "pull", pin_digest)
+    for ref in refs:
+        sh("docker", "tag", pin_digest, ref)
+
+
+def cmd_rollback(name: str, to: int | None, show: bool) -> None:
+    """Re-apply a previously recorded release of `name` (spec §8).
+
+    Rollback is a HUMAN act. The loop never rolls back on its own: apply is
+    idempotent and the previous stack keeps running, so an auto-rollback would
+    fight a human mid-incident (spec §7.5).
+
+    The selected entry is APPENDED as the new head (Helm-revision semantics,
+    never a pointer rewind): `cmd_apply` runs the ordinary pipeline, and its
+    provenance write records the release being re-applied with a fresh
+    timestamp.
+
+    Args:
+        name: The deployment name.
+        to: History index to restore; None means the entry before the current
+            one. Negative indices count from the end, so `-1` is the current
+            release (a re-apply) and `-2` is the previous one.
+        show: Print the history and apply nothing.
+
+    Raises:
+        SystemExit: If there is nothing to roll back to, the index is out of
+            range, the target entry lacks its imageDigest or its commit, the
+            persisted manifest is gone, it no longer validates under the
+            current schema, or it is a Facility (facility rollback is the tag,
+            §8).
+    """
+    history = read_provenance_history(name)
+    if show:
+        if not history:
+            print(f"{name}: no releases recorded")
+            return
+        for i, entry in enumerate(history):
+            commit = (entry.get("commit") or "-")[:12]
+            digest = (entry.get("imageDigest") or "-").split("@")[-1][:12]
+            marker = "  (current)" if i == len(history) - 1 else ""
+            print(f"{i:>3}  {commit}  {digest}  {entry.get('appliedAt', '?')}{marker}")
+        return
+    if to is None and len(history) < 2:  # noqa: PLR2004  # need a current AND a previous
+        sys.exit(f"{name}: no previous release recorded — nothing to roll back to")
+    index = -2 if to is None else to
+    try:
+        entry = history[index]
+    except IndexError:
+        sys.exit(f"{name}: no release at index {to} (history has {len(history)} entries)")
+    digest = entry.get("imageDigest")
+    if not digest:
+        sys.exit(
+            f"{name}: the release at index {index} has no recorded imageDigest "
+            f"(a source-built deploy, or one predating digest resolution) — it cannot "
+            f"be re-applied by digest (spec §8). Roll forward, or re-apply its commit by hand."
+        )
+    commit = entry.get("commit")
+    if not commit:
+        sys.exit(
+            f"{name}: the release at index {index} has no recorded commit "
+            f"(a workflow deploy from a .git-less tree) — its compose tree is "
+            f"unreproducible, cannot re-apply it"
+        )
+    manifest = project_dir(name) / "manifest.yml"
+    if not manifest.exists():
+        sys.exit(f"{name}: {manifest} is missing — nothing to re-apply")
+    try:
+        parsed = _MANIFEST_ADAPTER.validate_python(yaml.safe_load(manifest.read_text(encoding="utf-8")))
+    except ValidationError as e:
+        sys.exit(
+            f"{name}: the persisted manifest no longer validates under the current "
+            f"schema (a field was removed since; spec §8) — refusing to silently "
+            f"upgrade it into the new schema: {e}"
+        )
+    if parsed.kind != "Deployment":
+        sys.exit(
+            f"{name}: the persisted manifest is a {parsed.kind}, not a Deployment — "
+            f"facility rollback needs no mechanism, cut a new tag at the old tree (spec §8)"
+        )
+    print(f"{name}: rolling back to {digest} (applied {entry.get('appliedAt', '?')})")
+    cmd_apply(manifest, None, pin_commit=commit, pin_digest=digest)
 
 
 def cmd_delete(name: str, purge: bool) -> None:
@@ -2784,6 +2934,23 @@ def _rollout(
 ) -> None:
     """Git pull + compose pull + up -d."""
     cmd_rollout(name)
+
+
+@app.command("rollback")
+def _rollback(
+    name: Annotated[
+        str, typer.Argument(help="deployment name", autocompletion=complete_deployment_name)
+    ],
+    to: Annotated[
+        int | None,
+        typer.Option("--to", help="history index to restore (default: the previous release)"),
+    ] = None,
+    show: Annotated[
+        bool, typer.Option("--list", help="print the release history and apply nothing")
+    ] = False,
+) -> None:
+    """Re-apply a previously recorded release."""
+    cmd_rollback(name, to, show)
 
 
 @app.command("delete")

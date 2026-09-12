@@ -139,3 +139,232 @@ def test_malformed_lines_are_skipped(state):
 def test_an_absent_history_reads_as_empty(state):
     assert nuk.read_provenance_history("hello") == []
     assert nuk.read_provenance("hello") is None
+
+
+# --- rollback -----------------------------------------------------------------
+
+
+def _entry(commit, digest, i):
+    return {"repo": "r", "branch": "main", "commit": commit,
+            "imageDigest": digest, "appliedAt": f"2026-01-0{i}T00:00:00.000Z"}
+
+
+def _history(releases, deploys, name, entries):
+    """Seed name's release history (JSONL) and a VALID persisted manifest.
+
+    The manifest must validate under the current schema: cmd_rollback's schema
+    gate is under test in its own test below, and every other test needs a
+    manifest that PASSES it.
+    """
+    releases.mkdir(exist_ok=True)
+    (releases / f"{name}.jsonl").write_text(
+        "".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8"
+    )
+    (deploys / name).mkdir(exist_ok=True)
+    (deploys / name / "manifest.yml").write_text(
+        "apiVersion: nuk/v1\nkind: Deployment\nmetadata: {name: hello}\n",
+        encoding="utf-8",
+    )
+
+
+def test_rollback_reapplies_the_previous_release_by_digest(state, monkeypatch):
+    """Spec §8: the digest is the identity; the commit pins the compose tree."""
+    releases, deploys = state
+    _history(releases, deploys, "hello", [
+        _entry("a" * 40, "sha256:1", 1),
+        _entry("b" * 40, "sha256:2", 2),
+    ])
+    seen = {}
+
+    def fake_apply(path, repo_path, *, pin_commit=None, pin_digest=None):
+        seen.update(path=path, pin_commit=pin_commit, pin_digest=pin_digest)
+
+    monkeypatch.setattr(nuk, "cmd_apply", fake_apply)
+    nuk.cmd_rollback("hello", to=None, show=False)
+    assert seen["pin_commit"] == "a" * 40
+    assert seen["pin_digest"] == "sha256:1"
+    assert seen["path"] == deploys / "hello" / "manifest.yml"
+
+
+def test_rollback_to_an_explicit_index(state, monkeypatch):
+    releases, deploys = state
+    _history(releases, deploys, "hello", [
+        _entry("a" * 40, "sha256:1", 1),
+        _entry("b" * 40, "sha256:2", 2),
+        _entry("c" * 40, "sha256:3", 3),
+    ])
+    seen = {}
+    monkeypatch.setattr(
+        nuk, "cmd_apply",
+        lambda path, repo_path, *, pin_commit=None, pin_digest=None: seen.update(
+            pin_commit=pin_commit, pin_digest=pin_digest
+        ),
+    )
+    nuk.cmd_rollback("hello", to=0, show=False)
+    assert seen["pin_commit"] == "a" * 40
+    assert seen["pin_digest"] == "sha256:1"
+
+
+def test_rollback_refuses_without_a_previous_release(state, monkeypatch):
+    releases, deploys = state
+    _history(releases, deploys, "hello", [_entry("a" * 40, "sha256:1", 1)])
+    monkeypatch.setattr(
+        nuk, "cmd_apply",
+        lambda *a, **k: pytest.fail("must not apply with no previous release"),
+    )
+    with pytest.raises(SystemExit, match="no previous release"):
+        nuk.cmd_rollback("hello", to=None, show=False)
+
+
+def test_rollback_refuses_an_out_of_range_index(state, monkeypatch):
+    releases, deploys = state
+    _history(releases, deploys, "hello", [
+        _entry("a" * 40, "sha256:1", 1), _entry("b" * 40, "sha256:2", 2)
+    ])
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *a, **k: pytest.fail("must not apply"))
+    with pytest.raises(SystemExit, match="no release at index 7"):
+        nuk.cmd_rollback("hello", to=7, show=False)
+
+
+def test_rollback_refuses_an_entry_with_no_digest(state, monkeypatch):
+    """Spec §8: the digest is the identity — an entry without one is not re-appliable."""
+    releases, deploys = state
+    _history(releases, deploys, "hello", [
+        _entry("a" * 40, None, 1),
+        _entry("b" * 40, "sha256:2", 2),
+    ])
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *a, **k: pytest.fail("must not apply"))
+    with pytest.raises(SystemExit, match="no recorded imageDigest"):
+        nuk.cmd_rollback("hello", to=None, show=False)
+
+
+def test_rollback_refuses_an_entry_with_no_commit(state, monkeypatch):
+    """A workflow deploy from a .git-less tree records commit=None — the compose
+    tree is unreproducible, so the release is not re-appliable."""
+    releases, deploys = state
+    _history(releases, deploys, "hello", [
+        _entry(None, "sha256:1", 1),
+        _entry("b" * 40, "sha256:2", 2),
+    ])
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *a, **k: pytest.fail("must not apply"))
+    with pytest.raises(SystemExit, match="no recorded commit"):
+        nuk.cmd_rollback("hello", to=None, show=False)
+
+
+def test_rollback_refuses_when_the_manifest_is_gone(state, monkeypatch):
+    releases, deploys = state
+    _history(releases, deploys, "hello", [
+        _entry("a" * 40, "sha256:1", 1), _entry("b" * 40, "sha256:2", 2)
+    ])
+    (deploys / "hello" / "manifest.yml").unlink()
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *a, **k: pytest.fail("must not apply"))
+    with pytest.raises(SystemExit, match="manifest.yml"):
+        nuk.cmd_rollback("hello", to=None, show=False)
+
+
+def test_rollback_refuses_when_the_manifest_no_longer_validates(state, monkeypatch):
+    """Spec §8: schema refusal — never silently upgrade an entry into a new schema."""
+    releases, deploys = state
+    _history(releases, deploys, "hello", [
+        _entry("a" * 40, "sha256:1", 1), _entry("b" * 40, "sha256:2", 2)
+    ])
+
+    class OldSchema:
+        def validate_python(self, raw):
+            raise pydantic.ValidationError.from_exception_data("Manifest", [])
+
+    monkeypatch.setattr(nuk, "_MANIFEST_ADAPTER", OldSchema())
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *a, **k: pytest.fail("must not apply"))
+    with pytest.raises(SystemExit, match="no longer validates"):
+        nuk.cmd_rollback("hello", to=None, show=False)
+
+
+def test_rollback_refuses_a_persisted_facility(state, monkeypatch):
+    """Facility rollback is the tag, not this command (spec §8)."""
+    releases, deploys = state
+    _history(releases, deploys, "hello", [
+        _entry("a" * 40, "sha256:1", 1), _entry("b" * 40, "sha256:2", 2)
+    ])
+    (deploys / "hello" / "manifest.yml").write_text(
+        "apiVersion: nuk/v1\nkind: Facility\nmetadata: {name: hello}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *a, **k: pytest.fail("must not apply"))
+    with pytest.raises(SystemExit, match="Facility, not a Deployment"):
+        nuk.cmd_rollback("hello", to=None, show=False)
+
+
+def test_rollback_failure_leaves_current_state_running(state, monkeypatch):
+    """Spec §8: a failed re-apply (digest gone at pull time) aborts cleanly.
+
+    The pull failure propagates out of cmd_rollback — nothing was written or
+    recreated before it, so the current stack keeps running.
+    """
+    releases, deploys = state
+    _history(releases, deploys, "hello", [
+        _entry("a" * 40, "sha256:1", 1), _entry("b" * 40, "sha256:2", 2)
+    ])
+    monkeypatch.setattr(
+        nuk, "cmd_apply",
+        lambda *a, **k: (_ for _ in ()).throw(subprocess.CalledProcessError(1, ["docker", "pull"])),
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        nuk.cmd_rollback("hello", to=None, show=False)
+
+
+def test_rollback_list_prints_indices_digests_and_applies_nothing(
+    state, monkeypatch, capsys
+):
+    releases, deploys = state
+    _history(releases, deploys, "hello", [
+        _entry("a" * 40, "sha256:1", 1), _entry("b" * 40, "sha256:2", 2)
+    ])
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *a, **k: pytest.fail("must not apply"))
+    nuk.cmd_rollback("hello", to=None, show=True)
+    out = capsys.readouterr().out
+    assert "0" in out
+    assert "sha256:1" in out
+    assert "a" * 12 in out
+    assert "current" in out
+
+
+def test_pin_image_pulls_and_retags_the_matching_compose_ref(monkeypatch):
+    commands = []
+    monkeypatch.setattr(
+        nuk, "_compose_images",
+        lambda name, raw: ["ghcr.io/astrojones/hello:main", "ghcr.io/astrojones/hello:sidecar"],
+    )
+    monkeypatch.setattr(nuk, "sh", lambda *cmd: commands.append(cmd))
+    nuk._pin_image("hello", {"spec": {}}, "ghcr.io/astrojones/hello@sha256:abc")
+    assert ("docker", "pull", "ghcr.io/astrojones/hello@sha256:abc") in commands
+    assert ("docker", "tag", "ghcr.io/astrojones/hello@sha256:abc",
+            "ghcr.io/astrojones/hello:main") in commands
+    assert ("docker", "tag", "ghcr.io/astrojones/hello@sha256:abc",
+            "ghcr.io/astrojones/hello:sidecar") in commands
+
+
+def test_pin_image_refuses_when_no_compose_ref_matches(monkeypatch):
+    monkeypatch.setattr(
+        nuk, "_compose_images", lambda name, raw: ["quay.io/other/app:main"]
+    )
+    monkeypatch.setattr(nuk, "sh", lambda *cmd: pytest.fail("must not pull"))
+    with pytest.raises(SystemExit, match="references no image"):
+        nuk._pin_image("hello", {"spec": {}}, "ghcr.io/astrojones/hello@sha256:abc")
+
+
+def test_pin_image_fails_closed_when_the_digest_is_gone(monkeypatch):
+    """Spec §8: pull fails (digest GC'd / unreachable) -> abort BEFORE any retag."""
+    pulled = []
+
+    def sh(*cmd):
+        if cmd[:2] == ("docker", "pull"):
+            pulled.append(cmd)
+            raise subprocess.CalledProcessError(1, cmd)
+        pytest.fail("must not retag a digest that could not be pulled")
+
+    monkeypatch.setattr(
+        nuk, "_compose_images", lambda name, raw: ["ghcr.io/astrojones/hello:main"]
+    )
+    monkeypatch.setattr(nuk, "sh", sh)
+    with pytest.raises(subprocess.CalledProcessError):
+        nuk._pin_image("hello", {"spec": {}}, "ghcr.io/astrojones/hello@sha256:abc")
+    assert len(pulled) == 1
