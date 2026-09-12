@@ -709,10 +709,10 @@ def persist_manifest(spec: dict, src_path: Path, dest: Path, repo_path: str | No
         dest: Destination path on the controller.
         repo_path: The --repo-path checkout, if any.
     """
-    src = spec["spec"].get("source") or {}
+    src = (spec.get("spec") or {}).get("source") or {}
     origin = git_origin(repo_path) if repo_path else None
     if origin and not src.get("repo"):
-        spec["spec"]["source"] = {**src, "repo": origin}
+        spec.setdefault("spec", {})["source"] = {**src, "repo": origin}
         dest.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
     else:
         shutil.copy(src_path, dest)
@@ -736,12 +736,13 @@ def _compose_file(spec: dict) -> str:
 def compose_args(name: str, spec: dict) -> list[str]:
     """Build the `docker compose` base argv for an app from its raw spec."""
     repo = project_dir(name) / "repo"
-    cf = _compose_file(spec["spec"])
+    spec_body = spec.get("spec") or {}
+    cf = _compose_file(spec_body)
     override = project_dir(name) / "compose.override.yml"
     args = ["docker", "compose", "-p", name, "-f", str(repo / cf)]
     if override.exists():
         args += ["-f", str(override)]
-    for envfile in spec["spec"].get("envFrom", []):
+    for envfile in spec_body.get("envFrom", []):
         ref = envfile.get("secretRef") if isinstance(envfile, dict) else envfile
         if ref and Path(ref).exists():
             args += ["--env-file", ref]
@@ -1809,10 +1810,12 @@ def _parse_compose_images_json(text: str) -> list[dict]:
     try:
         if text.startswith("["):
             data = json.loads(text)
-            return data if isinstance(data, list) else []
-        return [json.loads(line) for line in text.splitlines() if line.strip()]
+            rows = data if isinstance(data, list) else []
+        else:
+            rows = [json.loads(line) for line in text.splitlines() if line.strip()]
     except (ValueError, json.JSONDecodeError):
         return []
+    return [row for row in rows if isinstance(row, dict)]
 
 
 def _resolve_image_digest(name: str, raw: dict) -> str | None:
@@ -2192,6 +2195,7 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
     manifest = load(manifest_path)
     raw = manifest.raw
     name = manifest.metadata.name
+    raw_spec = raw.get("spec") or {}
     if manifest.kind == "Facility" and not _is_privileged():
         print(
             f"{name}: Facility apply requires root or membership in group "
@@ -2223,7 +2227,7 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
         manifest.kind == "Facility"
         and not repo_path
         and not source.repo
-        and not raw["spec"].get("compose")
+        and not raw_spec.get("compose")
     )
     pdir = project_dir(name)
     pdir.mkdir(parents=True, exist_ok=True)
@@ -2268,8 +2272,8 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
         sh("rsync", "-a", "--delete", f"{payload}/", str(repo) + "/")
     else:
         sys.exit(f"{manifest_path}: spec.source.repo is required unless --repo-path is given")
-    ingress = raw["spec"].get("ingress", []) or []
-    db_env = provision_databases(name, raw["spec"].get("databases") or {}, facilities)
+    ingress = raw_spec.get("ingress", []) or []
+    db_env = provision_databases(name, raw_spec.get("databases") or {}, facilities)
     db_services = resolve_db_services(name, raw, db_env)
     if db_env and not db_services:
         print(
@@ -2277,7 +2281,7 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
             f"DATABASE_URL/REDIS_URL won't be injected. Add an ingress entry, or set "
             f"spec.databases.attachTo / attachAll to target a worker."
         )
-    env_from = resolve_env_from(raw["spec"])
+    env_from = resolve_env_from(raw_spec)
     if env_from and not ingress:
         print(
             f"{name}: spec.envFrom secrets resolved but no ingress service to "

@@ -283,3 +283,19 @@ def test_sourceless_facility_without_payload_refuses(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deployments")
     with pytest.raises(SystemExit, match="payload directory"):
         nuk.cmd_apply(manifest, None)
+
+
+def test_declaration_only_facility_without_spec_applies(tmp_path, monkeypatch):
+    """A Facility with no `spec:` at all is valid; cmd_apply must not KeyError on raw["spec"]."""
+    doc = tmp_path / "decl.yml"
+    doc.write_text(
+        "apiVersion: nuk/v1\nkind: Facility\nmetadata: {name: decl}\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deployments")
+    monkeypatch.setattr(nuk, "load_facilities", lambda _t: [])
+    monkeypatch.setattr(nuk, "load_org", lambda _p: object())
+    monkeypatch.setattr(nuk, "write_provenance", lambda *_a, **_k: None)
+    nuk.cmd_apply(doc, None)  # must not raise
