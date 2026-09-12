@@ -522,3 +522,39 @@ def test_apply_of_a_sourceless_facility_with_compose_still_needs_its_payload(tmp
     monkeypatch.setattr(nuk, "provision_databases", lambda *_a: None)
     with pytest.raises(SystemExit, match="nothing to apply"):
         nuk.cmd_apply(doc, None)
+
+
+# --- the logging facility (spec §14.1) -----------------------------------------------
+
+
+def test_shipped_logging_facility_validates_and_provides_logs(tmp_path):
+    """Spec §14.1: the shipped facility declares env capability `logs`.
+
+    Skipped in a standalone nuk checkout: this asserts a property of the
+    astrocloud checkout, not of nuk in isolation.
+    """
+    infra = Path(__file__).resolve().parents[2] / "infra"
+    manifest = infra / "facilities" / "logging.yml"
+    if not manifest.is_file():
+        pytest.skip("standalone nuk checkout — no superproject facilities/logging.yml")
+    f = nuk.load(manifest)
+    assert f.kind == "Facility"
+    assert f.spec.placement.role == "edge"
+    assert f.spec.provides.env.capability == "logs"
+    assert f.spec.provides.env.bind == "otlp"
+    assert f.spec.health.containers == ["loki"]
+    payload = manifest.parent / "logging" / f.spec.compose.file
+    assert payload.is_file(), "the compose payload must ship beside the manifest"
+
+
+def test_consumes_gains_no_row_for_logs():
+    """Spec §14.3: no manifest field requests logging — the static consumption
+    map stays exactly {auth, databases} so no apply path can couple to the
+    pipeline. The map is the literal §5.3 table; adding a row would be a
+    fail-closed coupling this spec forbids.
+    """
+    dep = nuk.Deployment.model_validate(
+        {"apiVersion": "nuk/v1", "kind": "Deployment", "metadata": {"name": "x"},
+         "spec": {"source": {"repo": "git@github.com:a/b.git"}}}
+    )
+    assert nuk.consumes(dep) == set()
