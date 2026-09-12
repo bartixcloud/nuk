@@ -175,7 +175,7 @@ wheels = [
 
 [[package]]
 name = "nuk"
-version = "0.24.1"
+version = "0.24.3"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
