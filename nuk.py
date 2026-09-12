@@ -709,10 +709,12 @@ def persist_manifest(spec: dict, src_path: Path, dest: Path, repo_path: str | No
         dest: Destination path on the controller.
         repo_path: The --repo-path checkout, if any.
     """
-    src = (spec.get("spec") or {}).get("source") or {}
+    spec_body = spec.get("spec") or {}
+    src = spec_body.get("source") or {}
     origin = git_origin(repo_path) if repo_path else None
     if origin and not src.get("repo"):
-        spec.setdefault("spec", {})["source"] = {**src, "repo": origin}
+        spec_body["source"] = {**src, "repo": origin}
+        spec["spec"] = spec_body
         dest.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
     else:
         shutil.copy(src_path, dest)

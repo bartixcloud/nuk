@@ -7,6 +7,8 @@ These need only pyyaml — no /opt/nuklaut, no docker, no controller.
 
 from __future__ import annotations
 
+import subprocess
+
 import nuk
 import pytest
 import yaml
@@ -892,6 +894,33 @@ def test_persist_manifest_verbatim_when_origin_unavailable(tmp_path, monkeypatch
     dest = tmp_path / "manifest.yml"
     nuk.persist_manifest(spec, src, dest, None)
     assert dest.read_text() == "verbatim"
+
+
+def test_persist_manifest_stamps_bare_spec_from_real_git_origin(tmp_path):
+    """Regression: a manifest with a bare `spec:` key (YAML null) plus a
+    --repo-path checkout with a github origin must stamp source.repo, not
+    crash on `spec.setdefault("spec", {})` returning the existing None.
+    """
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+
+    def run(*args: str) -> None:
+        subprocess.run(args, cwd=checkout, check=True, capture_output=True)  # noqa: S603  # fixed argv, no shell
+
+    run("git", "init", "-q")
+    run("git", "remote", "add", "origin", "https://github.com/astrojones/kolbe.git")
+    spec = {
+        "apiVersion": "nuk/v1",
+        "kind": "Deployment",
+        "metadata": {"name": "kolbe"},
+        "spec": None,
+    }
+    src = tmp_path / "deployment.yml"
+    src.write_text("spec:\n", encoding="utf-8")
+    dest = tmp_path / "manifest.yml"
+    nuk.persist_manifest(spec, src, dest, str(checkout))
+    out = yaml.safe_load(dest.read_text())
+    assert out["spec"]["source"]["repo"] == "https://github.com/astrojones/kolbe"
 
 
 # --- version flag (used by the controller CD smoke check) ---------------------

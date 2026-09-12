@@ -298,6 +298,7 @@ def test_declaration_only_facility_without_spec_applies(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "load_facilities", lambda _t: [])
     monkeypatch.setattr(nuk, "load_org", lambda _p: object())
     monkeypatch.setattr(nuk, "write_provenance", lambda *_a, **_k: None)
+    monkeypatch.setattr(nuk, "_resolve_image_digest", lambda *_a, **_k: None)
     nuk.cmd_apply(doc, None)  # must not raise
 
 
