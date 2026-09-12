@@ -2199,8 +2199,11 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
         sys.exit(1)
     role, self_ip = read_self()
     if not placement_matches(manifest, role):
+        # placement_matches returns False only when a placement is set and differs.
+        placement = manifest.spec.placement
+        assert placement is not None  # noqa: S101  # narrows the union for ty
         print(
-            f"{name}: spec.placement.role={manifest.spec.placement.role!r} but this host "
+            f"{name}: spec.placement.role={placement.role!r} but this host "
             f"is role={role!r} — nothing to do"
         )
         return
