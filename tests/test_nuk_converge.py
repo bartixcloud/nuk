@@ -15,9 +15,8 @@ from __future__ import annotations
 
 import subprocess
 
-import pytest
-
 import nuk
+import pytest
 
 
 @pytest.fixture(autouse=True)
@@ -70,8 +69,17 @@ def _commit(repo, text):
 def _sign_tag(repo, pubkey, tag):
     """Create an SSH-signed annotated tag at HEAD."""
     _run(
-        "git", "-c", "gpg.format=ssh", "-c", f"user.signingkey={pubkey}",
-        "tag", "-s", tag, "-m", tag, cwd=repo,
+        "git",
+        "-c",
+        "gpg.format=ssh",
+        "-c",
+        f"user.signingkey={pubkey}",
+        "tag",
+        "-s",
+        tag,
+        "-m",
+        tag,
+        cwd=repo,
     )
 
 
@@ -131,7 +139,7 @@ def test_resolve_prefers_the_topological_descendant_over_creatordate(repo, signe
 
 
 def test_downgrade_guard_passes_for_a_descendant(repo, signer, tmp_path):
-    pubkey, signers = signer
+    pubkey, _ = signer
     first = _run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip()
     state = tmp_path / "last-applied-tag"
     nuk.record_applied("v1.0.0", first, state)
@@ -142,7 +150,7 @@ def test_downgrade_guard_passes_for_a_descendant(repo, signer, tmp_path):
 
 def test_downgrade_guard_refuses_a_walk_backwards(repo, signer, tmp_path):
     """The attack IS tag deletion, so the guard compares SHAs, never tag names."""
-    pubkey, signers = signer
+    pubkey, _ = signer
     _sign_tag(repo, pubkey, "v1.0.0")
     newer = _commit(repo, "2")
     _sign_tag(repo, pubkey, "v1.1.0")
@@ -295,19 +303,21 @@ def test_converge_applies_a_new_tag_restoring_an_old_tree(loop, signer, monkeypa
     pubkey, _ = signer
     # v1.0.0 already exists (the loop fixture signed it); append a release on top.
     _commit(repo, "2")
-    _sign_tag(repo, pubkey, "v1.1.0")          # file "2" — recorded as applied
+    _sign_tag(repo, pubkey, "v1.1.0")  # file "2" — recorded as applied
     nuk.record_applied(
         "v1.1.0",
         _run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip(),
         state / "last-applied-tag",
     )
     _run("git", "revert", "--no-edit", "HEAD", cwd=repo)  # file "1" again
-    _sign_tag(repo, pubkey, "v1.2.0")         # the rollback tag
+    _sign_tag(repo, pubkey, "v1.2.0")  # the rollback tag
     _run("git", "push", "origin", "main", "--tags", cwd=repo)
     applied = []
+
     def mock_apply_tree(tree, role):
         applied.append((tree / "f").read_text())
         return []
+
     monkeypatch.setattr(nuk, "apply_tree", mock_apply_tree)
     monkeypatch.setattr(nuk, "reap_report", lambda tree: [])
     monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
@@ -341,8 +351,18 @@ def test_converge_refuses_a_new_tag_on_the_old_commit_itself(loop, signer, monke
     _run("git", "-C", origin, "tag", "-d", "v1.1.0")
     _run("git", "tag", "-d", "v1.1.0", cwd=repo)
     _run(
-        "git", "-c", "gpg.format=ssh", "-c", f"user.signingkey={pubkey}",
-        "tag", "-s", "v1.2.0", "-m", "v1.2.0", old_sha, cwd=repo,
+        "git",
+        "-c",
+        "gpg.format=ssh",
+        "-c",
+        f"user.signingkey={pubkey}",
+        "tag",
+        "-s",
+        "v1.2.0",
+        "-m",
+        "v1.2.0",
+        old_sha,
+        cwd=repo,
     )
     _run("git", "push", "origin", "--tags", cwd=repo)
     monkeypatch.setattr(nuk, "apply_tree", lambda tree, role: pytest.fail("must not apply"))
@@ -395,7 +415,7 @@ spec:
 
 
 def _tree(tmp_path, **files):
-    """Build a manifest tree: _tree(p, facilities={"a": YML}, deployments={...})."""
+    """Build a manifest tree under `tmp_path` from facilities=/deployments= YAML bodies."""
     root = tmp_path / "tree"
     root.mkdir(parents=True, exist_ok=True)
     for directory, docs in files.items():
@@ -440,7 +460,8 @@ def test_one_failing_deployment_does_not_stop_the_rest(tmp_path, monkeypatch):
 
     def flaky(path, _rp):
         if path.stem == "hello":
-            raise SystemExit("hello: image pull failed")
+            msg = "hello: image pull failed"
+            raise SystemExit(msg)
 
     monkeypatch.setattr(nuk, "cmd_apply", flaky)
     results = nuk.apply_tree(tree, "app")
@@ -475,7 +496,8 @@ def test_a_deployment_consuming_a_failed_facility_is_refused(tmp_path, monkeypat
 
     def flaky(path, _rp):
         if path.stem == "data-stack":
-            raise SystemExit("data-stack: container 'nuk-postgres' is not healthy")
+            msg = "data-stack: container 'nuk-postgres' is not healthy"
+            raise SystemExit(msg)
 
     monkeypatch.setattr(nuk, "cmd_apply", flaky)
     results = nuk.apply_tree(tree, "app")
@@ -495,7 +517,8 @@ def test_a_deployment_consuming_nothing_applies_despite_a_failed_facility(tmp_pa
 
     def flaky(path, _rp):
         if path.stem == "data-stack":
-            raise SystemExit("data-stack: not healthy")
+            msg = "data-stack: not healthy"
+            raise SystemExit(msg)
 
     monkeypatch.setattr(nuk, "cmd_apply", flaky)
     results = nuk.apply_tree(tree, "app")
@@ -576,7 +599,8 @@ def test_read_status_is_none_when_absent(tmp_path):
 def test_converge_writes_a_status_file(loop, monkeypatch):
     repo, signers, state = loop
     monkeypatch.setattr(
-        nuk, "apply_tree",
+        nuk,
+        "apply_tree",
         lambda tree, role: [{"name": "hello", "kind": "Deployment", "result": "ok", "error": None}],
     )
     monkeypatch.setattr(nuk, "reap_report", lambda tree: ["oauth"])
@@ -611,7 +635,8 @@ def test_the_edge_renders_every_router(loop, monkeypatch):
     monkeypatch.setattr(nuk, "render_edge_routers", lambda tree, org: ["hello", "app-alpha"])
     assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
     assert nuk.read_converge_status(state / "converge-status.json")["rendered"] == [
-        "hello", "app-alpha"
+        "hello",
+        "app-alpha",
     ]
 
 

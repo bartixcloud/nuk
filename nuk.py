@@ -21,11 +21,10 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Literal, cast
 from urllib.parse import urlparse
 
 import typer
@@ -40,6 +39,9 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
 
 __version__ = "0.25.0"  # bumped on release by .github/workflows/release.yml
 
@@ -1148,10 +1150,15 @@ def verify_tag(repo: Path, signers: Path, tag: str) -> bool:
     return (
         subprocess.run(  # noqa: S603  # fixed argv, no shell
             [  # noqa: S607  # git on PATH
-                "git", "-C", str(repo),
-                "-c", "gpg.format=ssh",
-                "-c", f"gpg.ssh.allowedSignersFile={signers}",
-                "verify-tag", tag,
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "gpg.format=ssh",
+                "-c",
+                f"gpg.ssh.allowedSignersFile={signers}",
+                "verify-tag",
+                tag,
             ],
             check=False,
             capture_output=True,
@@ -1323,7 +1330,7 @@ def apply_tree(tree: Path, role: str) -> list[dict]:
         role: This host's role, from /etc/nuklaut/host.env.
 
     Returns:
-        One `{\"name\", \"kind\", \"result\", \"error\"}` entry per manifest this host
+        One `{"name", "kind", "result", "error"}` entry per manifest this host
         owns, facilities first, each directory in filename order. `result` is
         "ok", "failed", or "refused".
     """
@@ -1385,7 +1392,7 @@ def reap_report(tree: Path) -> list[str]:
     return sorted(p.name for p in DEPLOYS.iterdir() if p.is_dir() and p.name not in declared)
 
 
-def write_converge_status(
+def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a dataclass buys nothing here
     path: Path,
     *,
     tag: str,
@@ -1423,7 +1430,9 @@ def read_converge_status(path: Path = CONVERGE_STATUS) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def cmd_converge(*, repo: Path, signers: Path, state_dir: Path, org_file: str) -> int:
+def cmd_converge(  # noqa: PLR0911  # each early return is a distinct fail-closed refusal (spec §7.5)
+    *, repo: Path, signers: Path, state_dir: Path, org_file: str
+) -> int:
     """Converge this host to the newest verifying tag of the manifest repo.
 
     Args:
@@ -2699,7 +2708,7 @@ def _is_privileged() -> bool:
     return gid in os.getgroups()
 
 
-def cmd_apply(  # noqa: C901, PLR0912  # linear apply pipeline; splitting it would scatter the reconcile order
+def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline; splitting it would scatter the reconcile order
     manifest_path: Path,
     repo_path: str | None,
     *,
@@ -2832,8 +2841,9 @@ def cmd_apply(  # noqa: C901, PLR0912  # linear apply pipeline; splitting it wou
             f"{name}: host is non-edge (role={role}) but /etc/nuklaut/host.env has no "
             f"PRIVATE_IP — cannot publish ingress for the edge to reach"
         )
-    write_override(name, ingress, db_env, env_from, db_services,
-                   publish_ip=self_ip if edge_term else None)
+    write_override(
+        name, ingress, db_env, env_from, db_services, publish_ip=self_ip if edge_term else None
+    )
     if edge_term:
         (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)  # inert here; the edge owns it
     else:
@@ -3031,11 +3041,9 @@ def _pin_image(name: str, raw: dict, pin_digest: str) -> None:
         SystemExit: If no compose image comes from the digest's repository, or
             the pull fails.
     """
-    repo_name = pin_digest.split("@")[0]
+    repo_name = pin_digest.split("@", maxsplit=1)[0]
     refs = [
-        ref
-        for ref in _compose_images(name, raw)
-        if ref.split("@")[0].split(":")[0] == repo_name
+        ref for ref in _compose_images(name, raw) if ref.split("@")[0].split(":")[0] == repo_name
     ]
     if not refs:
         sys.exit(
@@ -3047,7 +3055,7 @@ def _pin_image(name: str, raw: dict, pin_digest: str) -> None:
         sh("docker", "tag", pin_digest, ref)
 
 
-def cmd_rollback(name: str, to: int | None, show: bool) -> None:
+def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  # each branch is a distinct fail-closed refusal (spec §8)
     """Re-apply a previously recorded release of `name` (spec §8).
 
     Rollback is a HUMAN act. The loop never rolls back on its own: apply is
@@ -3109,7 +3117,8 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:
     if not manifest.exists():
         sys.exit(f"{name}: {manifest} is missing — nothing to re-apply")
     try:
-        parsed = _MANIFEST_ADAPTER.validate_python(yaml.safe_load(manifest.read_text(encoding="utf-8")))
+        raw = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+        parsed = _MANIFEST_ADAPTER.validate_python(raw)
     except ValidationError as e:
         sys.exit(
             f"{name}: the persisted manifest no longer validates under the current "
@@ -3394,7 +3403,9 @@ def _converge(
     ] = DEFAULT_ORG_FILE,
 ) -> None:
     """Converge this host to the newest verifying tag (spec §7)."""
-    raise typer.Exit(cmd_converge(repo=repo, signers=signers, state_dir=state_dir, org_file=org_file))
+    raise typer.Exit(
+        cmd_converge(repo=repo, signers=signers, state_dir=state_dir, org_file=org_file)
+    )
 
 
 @app.command("delete")
