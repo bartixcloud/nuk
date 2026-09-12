@@ -305,7 +305,8 @@ def test_is_privileged_false_when_nss_is_broken(monkeypatch):
     monkeypatch.setattr(nuk.os, "geteuid", lambda: 1000)
 
     def boom(_name):
-        raise OSError("NSS unavailable")
+        msg = "NSS unavailable"
+        raise OSError(msg)
 
     monkeypatch.setattr(nuk.grp, "getgrnam", boom)
     assert nuk._is_privileged() is False
