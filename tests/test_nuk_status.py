@@ -517,3 +517,35 @@ def test_resolve_image_digest_degrades_on_empty_images_output(monkeypatch):
         nuk.subprocess, "run", lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="")  # noqa: ARG005
     )
     assert nuk._resolve_image_digest("app", {"spec": {}}) is None
+
+
+# --- _parse_compose_images_json: tolerate null rows and malformed input --------
+# `docker compose images --format json` prints a bare `null` (exit 0) for an
+# empty project; the parser must drop non-dict rows rather than hand `[None]`
+# back to callers. Pure function — no docker, no shell.
+
+
+def test_parse_compose_images_json_null_scalar_is_empty():
+    assert nuk._parse_compose_images_json("null") == []
+
+
+def test_parse_compose_images_json_single_null_array_is_empty():
+    assert nuk._parse_compose_images_json("[null]") == []
+
+
+def test_parse_compose_images_json_drops_null_rows_keeps_dicts():
+    assert nuk._parse_compose_images_json('[{"Repository":"x"},null]') == [
+        {"Repository": "x"}
+    ]
+
+
+def test_parse_compose_images_json_parses_json_lines_skipping_blanks():
+    text = '{"Repository":"x"}\n\n{"Repository":"y"}\n'
+    assert nuk._parse_compose_images_json(text) == [
+        {"Repository": "x"},
+        {"Repository": "y"},
+    ]
+
+
+def test_parse_compose_images_json_invalid_json_is_empty():
+    assert nuk._parse_compose_images_json("not json") == []
