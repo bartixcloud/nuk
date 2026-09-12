@@ -55,7 +55,7 @@ def secrets_dir(tmp_path, monkeypatch):
 @pytest.fixture
 def provisioned(data_stack, secrets_dir):
     """Provision postgres+redis for APP, yield its creds, and purge after."""
-    nuk.provision_databases(APP, {"postgres": {"driver": "asyncpg"}, "redis": True})
+    nuk.provision_databases(APP, {"postgres": {"driver": "asyncpg"}, "redis": True}, [])
     try:
         yield nuk.read_db_env(APP)
     finally:
@@ -93,7 +93,7 @@ def test_provision_scopes_redis_acl_to_app_prefix(provisioned):
 def test_reapply_is_idempotent_and_reuses_password(provisioned):
     """#9: re-applying reuses the stored password rather than churning creds."""
     before = provisioned["DATABASE_URL"], provisioned["REDIS_URL"]
-    nuk.provision_databases(APP, {"postgres": {"driver": "asyncpg"}, "redis": True})
+    nuk.provision_databases(APP, {"postgres": {"driver": "asyncpg"}, "redis": True}, [])
     after = nuk.read_db_env(APP)
     assert (after["DATABASE_URL"], after["REDIS_URL"]) == before
 
@@ -121,7 +121,7 @@ def test_purge_drops_db_role_acl_user_and_creds(data_stack, secrets_dir):
     """#9: purge_databases drops the db + role, deletes the redis ACL user, and
     removes the creds file.
     """
-    nuk.provision_databases(APP, {"postgres": True, "redis": True})
+    nuk.provision_databases(APP, {"postgres": True, "redis": True}, [])
     assert (secrets_dir / f"{APP}-db.env").exists()
 
     nuk.purge_databases(APP)
