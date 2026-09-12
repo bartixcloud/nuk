@@ -59,6 +59,49 @@ DATA_FACILITY = """
 """
 
 
+ROUTE_ONLY_FACILITY = """
+    apiVersion: nuk/v1
+    kind: Facility
+    metadata: {name: oauth}
+    spec:
+      placement: {role: edge}
+      provides:
+        route: {capability: auth, middlewares: [oauth-errors@file, oauth-auth@file]}
+"""
+
+CUSTOM_AUTH_FACILITY = """
+    apiVersion: nuk/v1
+    kind: Facility
+    metadata: {name: auth}
+    spec:
+      placement: {role: edge}
+      provides:
+        route: {capability: auth, middlewares: [custom-gate@file]}
+"""
+
+DB_DEPLOYMENT = """
+    apiVersion: nuk/v1
+    kind: Deployment
+    metadata: {name: app}
+    spec:
+      placement: {role: app}
+      source: {repo: https://github.com/astrojones/app.git}
+      databases: {postgres: true}
+      ingress:
+        - {host: app.example.com, service: web, port: 8080}
+"""
+
+GATED_DEPLOYMENT = """
+    apiVersion: nuk/v1
+    kind: Deployment
+    metadata: {name: app}
+    spec:
+      source: {repo: https://github.com/astrojones/app.git}
+      ingress:
+        - {host: app.example.com, service: web, port: 8080, auth: oauth}
+"""
+
+
 def _tree(tmp_path: Path, **facilities: str) -> Path:
     """Build a manifest tree with <tree>/facilities/<name>.yml for each kwarg."""
     fdir = tmp_path / "facilities"
@@ -66,6 +109,32 @@ def _tree(tmp_path: Path, **facilities: str) -> Path:
     for name, body in facilities.items():
         (fdir / f"{name}.yml").write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
     return tmp_path
+
+
+def _manifest(tree: Path, subdir: str, filename: str, body: str) -> Path:
+    """Drop a manifest at <tree>/<subdir>/<filename> (subdir "" = the tree root)."""
+    d = tree / subdir if subdir else tree
+    d.mkdir(parents=True, exist_ok=True)
+    doc = d / filename
+    doc.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
+    return doc
+
+
+def _stub_apply(tmp_path: Path, monkeypatch, role: str = "app") -> None:
+    """Stub everything cmd_apply touches outside the tree — disk, docker, git."""
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
+    monkeypatch.setattr(nuk, "sh", lambda *_a, **_k: None)
+    monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
+    monkeypatch.setattr(nuk, "read_self", lambda: (role, "10.0.10.107"))
+    monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
+    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
+    monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
+    monkeypatch.setattr(nuk, "write_ingress", lambda *_a: None)
+    monkeypatch.setattr(nuk, "persist_manifest", lambda *_a: None)
+    monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["true"])
+    monkeypatch.setattr(nuk, "write_provenance", lambda *_a, **_k: None)
 
 
 def test_load_facilities_reads_every_manifest(tmp_path):
@@ -270,6 +339,25 @@ def test_env_bind_refuses_when_no_facility_declares_it(tmp_path, monkeypatch):
         nuk.provision_databases("hello", {"postgres": True}, facilities)
 
 
+def test_env_bind_proceeds_when_the_tree_ships_no_facilities_dir(tmp_path, monkeypatch):
+    """Legacy topology (spec §12): no facilities/ dir at all -> no facility concept.
+
+    An EMPTY list means the tree never opted into facilities, so there is nothing
+    to refuse against — the same asymmetry route_vocabulary already honours
+    (`route_vocabulary(facilities) if facilities else DEFAULT_ROUTE_VOCAB`).
+    Refusing here would break every single-host install that predates Task 6.
+    """
+    calls = []
+    monkeypatch.setattr(nuk, "preflight_data_stack", lambda *a: calls.append(a))
+    monkeypatch.setattr(nuk, "read_db_env", lambda _app: {})
+    monkeypatch.setattr(nuk, "ensure_postgres", lambda *_a, **_k: "postgresql://x")
+    monkeypatch.setattr(nuk, "write_db_env", lambda _app, _env: "/opt/nuklaut/secrets/hello-db.env")
+    assert nuk.load_facilities(tmp_path) == []  # the legacy tree, verbatim
+    out = nuk.provision_databases("hello", {"postgres": True}, [])
+    assert calls == [(True, False)]
+    assert out == "/opt/nuklaut/secrets/hello-db.env"
+
+
 def test_env_bind_is_a_noop_when_nothing_is_requested(tmp_path):
     """No databases requested = no capability needed. The guard must not fire."""
     facilities = nuk.load_facilities(_tree(tmp_path, oauth=OAUTH_FACILITY))
@@ -352,3 +440,85 @@ def test_unhealthy_facility_apply_does_not_append_provenance(tmp_path, monkeypat
 
     with pytest.raises(SystemExit, match="not healthy"):
         nuk.cmd_apply(doc, str(repo_src))
+
+
+def test_tree_root_walks_up_from_a_manifest_subdirectory(tmp_path):
+    """Production layout: <tree>/deployments/<x>.yml and <tree>/facilities/<x>.yml."""
+    assert nuk._tree_root(tmp_path / "deployments" / "app.yml") == tmp_path.resolve()
+    assert nuk._tree_root(tmp_path / "facilities" / "data-stack.yml") == tmp_path.resolve()
+
+
+def test_tree_root_of_a_bare_manifest_is_its_own_directory(tmp_path):
+    """A manifest applied bare sits IN the tree root — today's hand-run apply."""
+    assert nuk._tree_root(tmp_path / "m.yml") == tmp_path.resolve()
+
+
+def test_apply_loads_facilities_from_the_tree_root_not_the_manifest_dir(tmp_path, monkeypatch):
+    """<tree>/deployments/app.yml must see <tree>/facilities/, not deployments/facilities/."""
+    tree = _tree(tmp_path, data=DATA_FACILITY)
+    doc = _manifest(tree, "deployments", "app.yml", DB_DEPLOYMENT)
+    seen: list[list] = []
+    monkeypatch.setattr(
+        nuk, "provision_databases", lambda _n, _d, facilities: seen.append(facilities)
+    )
+    _stub_apply(tmp_path, monkeypatch)
+    nuk.cmd_apply(doc, None)
+    assert [f.metadata.name for f in seen[0]] == ["data-stack"]
+
+
+def test_apply_in_the_deployments_dir_does_not_refuse_its_databases(tmp_path, monkeypatch):
+    """The real guard, unstubbed: data-stack.yml is right there, so apply proceeds."""
+    tree = _tree(tmp_path, data=DATA_FACILITY)
+    doc = _manifest(tree, "deployments", "app.yml", DB_DEPLOYMENT)
+    monkeypatch.setattr(nuk, "preflight_data_stack", lambda *_a: None)
+    monkeypatch.setattr(nuk, "read_db_env", lambda _app: {})
+    monkeypatch.setattr(nuk, "ensure_postgres", lambda *_a, **_k: "postgresql://x")
+    monkeypatch.setattr(nuk, "write_db_env", lambda _app, _env: str(tmp_path / "app-db.env"))
+    _stub_apply(tmp_path, monkeypatch)
+    nuk.cmd_apply(doc, None)  # must not sys.exit("no facility provides 'databases'")
+
+
+def test_apply_resolves_the_route_vocabulary_from_the_tree_root(tmp_path, monkeypatch):
+    """The git-sourced vocabulary must reach build_ingress, not DEFAULT_ROUTE_VOCAB.
+
+    The facility declares a deliberately NON-default chain, so a silent fallback
+    to DEFAULT_ROUTE_VOCAB shows up in the middlewares handed to write_ingress.
+    """
+    tree = _tree(tmp_path, auth=CUSTOM_AUTH_FACILITY)
+    doc = _manifest(tree, "deployments", "app.yml", GATED_DEPLOYMENT)
+    seen: list[dict] = []
+    _stub_apply(tmp_path, monkeypatch, role="all-in-one")
+    monkeypatch.setattr(nuk, "provision_databases", lambda *_a: None)
+    monkeypatch.setattr(nuk, "write_ingress", lambda _n, _i, vocab: seen.append(vocab))
+    nuk.cmd_apply(doc, None)
+    assert seen == [{"auth": ["custom-gate@file"]}]
+    assert seen[0] != nuk.DEFAULT_ROUTE_VOCAB
+
+
+def test_apply_of_a_declaration_only_facility_runs_nothing(tmp_path, monkeypatch):
+    """oauth.yml/basic.yml declare only a route: no source, no compose, no payload.
+
+    There is nothing to mirror and nothing to compose up — the apply is a pure
+    vocabulary registration, so it must complete instead of refusing for a
+    payload directory it has no use for.
+    """
+    tree = _tree(tmp_path, oauth=ROUTE_ONLY_FACILITY)
+    doc = tree / "facilities" / "oauth.yml"
+    _stub_apply(tmp_path, monkeypatch, role="edge")
+    monkeypatch.setattr(nuk, "provision_databases", lambda *_a: None)
+
+    def _forbidden(*args, **_kw):
+        pytest.fail(f"a declaration-only facility must run no command, got {args}")
+
+    monkeypatch.setattr(nuk, "sh", _forbidden)
+    nuk.cmd_apply(doc, None)
+
+
+def test_apply_of_a_sourceless_facility_with_compose_still_needs_its_payload(tmp_path, monkeypatch):
+    """data-stack.yml DOES declare compose — a missing payload dir is still fatal."""
+    tree = _tree(tmp_path, **{"data-stack": DATA_FACILITY})
+    doc = tree / "facilities" / "data-stack.yml"
+    _stub_apply(tmp_path, monkeypatch, role="data")
+    monkeypatch.setattr(nuk, "provision_databases", lambda *_a: None)
+    with pytest.raises(SystemExit, match="nothing to apply"):
+        nuk.cmd_apply(doc, None)

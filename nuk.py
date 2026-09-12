@@ -1158,6 +1158,32 @@ def load_deployments(tree: Path) -> list[Deployment]:
     return [m for p in sorted(ddir.glob("*.yml")) if isinstance(m := load(p), Deployment)]
 
 
+def _tree_root(manifest_path: Path) -> Path:
+    """The manifest tree root that one manifest path belongs to.
+
+    The shipped layout puts manifests one level INSIDE the tree root:
+    `<tree>/facilities/<name>.yml` and `<tree>/deployments/<name>.yml`. Taking a
+    manifest's own parent as the tree root therefore looked for
+    `<tree>/deployments/facilities/` — a directory that never exists — so
+    load_facilities silently returned [], the git-sourced vocabulary was
+    unreachable in production, and the `databases` capability guard refused
+    every Deployment whose facility was sitting right there in
+    `<tree>/facilities/`.
+
+    A manifest applied bare (not under either directory) IS the tree root's own
+    child already — a hand-run `nuk apply ./deployment.yml`, and every
+    single-host tree predating the facilities layout.
+
+    Args:
+        manifest_path: Path to one manifest file.
+
+    Returns:
+        The resolved tree root to hand load_facilities / load_deployments.
+    """
+    parent = manifest_path.resolve().parent
+    return parent.parent if parent.name in {FACILITY_DIR, DEPLOYMENT_DIR} else parent
+
+
 def backend_address(org: Org, manifest: Deployment, ing: dict) -> str:
     """Where the edge should send traffic for one ingress entry.
 
@@ -1246,6 +1272,13 @@ def render_edge_routers(tree: Path, org: Org) -> list[str]:
     for manifest in load_deployments(tree):
         ingress = manifest.raw.get("spec", {}).get("ingress") or []
         if not ingress:
+            continue
+        # A deployment placed on an entry host runs ALONGSIDE Traefik, so
+        # cmd_apply already rendered its router there with a container-name
+        # backend. Re-rendering it from here would overwrite that working file
+        # with a `privateIp:port` backend nothing is listening on.
+        placement = manifest.spec.placement
+        if placement is not None and placement.role in _ENTRY_ROLES:
             continue
         resolved = [
             {k: v for k, v in ing.items() if k not in {"service", "port", "hostPort"}}
@@ -1637,7 +1670,13 @@ def provision_databases(app: str, databases: dict, facilities: list[Facility]) -
     # Fail closed before touching the data stack: binding against a facility the
     # org never declared writes half a per-app state (role, database, ACL user)
     # that nothing owns and nothing will tear down (spec §5.4).
-    if env_facility(facilities, _DATABASES_CAPABILITY) is None:
+    #
+    # An EMPTY list is not that case: it means the tree ships no facilities/ dir
+    # at all — the legacy single-host topology spec §12 protects, which never had
+    # a facility to declare. Same asymmetry route_vocabulary gets in cmd_apply
+    # (`route_vocabulary(facilities) if facilities else DEFAULT_ROUTE_VOCAB`):
+    # only a tree that opted INTO facilities and still omits this one is refused.
+    if facilities and env_facility(facilities, _DATABASES_CAPABILITY) is None:
         sys.exit(
             f"{app}: spec.databases requests {_DATABASES_CAPABILITY!r} but no facility "
             f"provides it. Apply facilities/data-stack.yml first, or drop spec.databases."
@@ -2151,13 +2190,23 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
             f"is role={role!r} — nothing to do"
         )
         return
-    # The manifest's own directory is the tree root for a hand-run apply; the
-    # convergence loop passes the archive root, whose facilities/ sits alongside.
-    facilities = load_facilities(manifest_path.resolve().parent)
+    facilities = load_facilities(_tree_root(manifest_path))
     vocab = route_vocabulary(facilities) if facilities else DEFAULT_ROUTE_VOCAB
     DYNAMIC.mkdir(parents=True, exist_ok=True)
     DEPLOYS.mkdir(parents=True, exist_ok=True)
     source = manifest.spec.source
+    # A declaration-only Facility (facilities/oauth.yml, facilities/basic.yml)
+    # provides a route capability and nothing else: no source to clone, no
+    # compose payload to mirror, no services to bring up. Applying it is pure
+    # vocabulary registration, so demanding a facilities/<name>/ payload it has
+    # no use for would refuse a perfectly valid manifest. A sourceless Facility
+    # that DOES declare spec.compose (data-stack, ingress) still needs one.
+    declaration_only = (
+        manifest.kind == "Facility"
+        and not repo_path
+        and not source.repo
+        and not raw["spec"].get("compose")
+    )
     pdir = project_dir(name)
     pdir.mkdir(parents=True, exist_ok=True)
     repo = pdir / "repo"
@@ -2182,6 +2231,8 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
             sh("git", "-C", str(repo), "fetch", "--quiet")
             sh("git", "-C", str(repo), "checkout", branch)
             sh("git", "-C", str(repo), "pull", "--ff-only", "--quiet")
+    elif declaration_only:
+        pass  # nothing to mirror — the manifest IS the whole facility
     elif manifest.kind == "Facility":
         # A sourceless Facility (data-stack, ingress): its compose payload ships
         # beside its manifest at <tree>/facilities/<name>/ — the manifest's own
@@ -2232,8 +2283,10 @@ def cmd_apply(manifest_path: Path, repo_path: str | None) -> None:  # noqa: C901
     persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
     # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
     # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
-    # whose image id changed.
-    sh(*compose_args(name, raw), "up", "-d")
+    # whose image id changed. A declaration-only Facility has no compose file at
+    # all — there is nothing to bring up.
+    if not declaration_only:
+        sh(*compose_args(name, raw), "up", "-d")
     # An unhealthy facility must not become "current": write_provenance is what
     # `nuk status`, `nuk rollback` and drift.sh read as the deployed state, so
     # appending here would both hide the breakage and put the last known-good

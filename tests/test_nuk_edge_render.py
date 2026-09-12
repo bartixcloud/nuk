@@ -163,6 +163,24 @@ def test_edge_render_skips_deployments_without_ingress(tmp_path, monkeypatch):
     assert not (dynamic / "hello.yml").exists()
 
 
+@pytest.mark.parametrize("role", ["edge", "all-in-one"])
+def test_edge_render_skips_deployments_placed_on_an_entry_host(tmp_path, monkeypatch, role):
+    """A deployment placed on the edge (or all-in-one) renders its OWN router.
+
+    cmd_apply writes it locally with a container-name backend, because it is
+    co-located with Traefik. Re-rendering it here would clobber that working
+    file with a `privateIp:port` nothing is listening on.
+    """
+    local = HELLO.replace("role: app", f"role: {role}")
+    tree = _tree(tmp_path, {"hello": local}, {"auth": OAUTH_FACILITY})
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    (dynamic / "hello.yml").write_text("http: {local: true}\n", encoding="utf-8")
+    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    assert nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml")) == []
+    assert yaml.safe_load((dynamic / "hello.yml").read_text()) == {"http": {"local": True}}
+
+
 def test_reap_removes_only_the_legacy_worker_prefix(tmp_path, monkeypatch):
     """Spec §11 step 6: the one-time reap, scoped exactly to what delivery wrote."""
     dynamic = tmp_path / "dynamic"
