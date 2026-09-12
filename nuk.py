@@ -8,6 +8,7 @@ compose project, optional ingress hosts, and env files. State lives entirely in
 
 from __future__ import annotations
 
+import fcntl
 import grp
 import ipaddress
 import json
@@ -17,8 +18,11 @@ import secrets
 import shutil
 import subprocess  # noqa: S404  # all calls use fixed argv, no shell (see per-call S603/S607)
 import sys
+import tempfile
 import urllib.error
 import urllib.request
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Literal, cast
@@ -54,6 +58,15 @@ CONVERGE_STATE = Path("/var/lib/nuk")
 # anchor is delivered OUT OF BAND (see infra/tf-incus/ALLOWED_SIGNERS.md), never
 # from the repo it protects — a repo carrying its own trust anchor does not have one.
 ALLOWED_SIGNERS = Path("/etc/nuklaut/allowed_signers")
+# The manifest tree every host converges against: a clone of astrojones/infra.
+CONVERGE_REPO = CONVERGE_STATE / "infra"
+# Only the CLI default: cmd_converge derives both files from its state_dir argument,
+# so the tests get a tmp_path and the host gets /var/lib/nuk.
+CONVERGE_STATUS = CONVERGE_STATE / "converge-status.json"
+# Named, never globbed: the infra tree also carries nuklaut.org.yml,
+# nuklaut.test.org.yml and nuklaut.min.org.yml, and a glob picking one of those
+# would have the edge resolve every backend IP from a template or a test fixture.
+DEFAULT_ORG_FILE = "nuklaut.astrocloud.org.yml"
 
 # Shared data stack — owned, reproducible source vendored at
 # files/docker-compose.data.yml (bring it up once on the controller). Apps reach
@@ -1229,6 +1242,118 @@ def record_applied(tag: str, commit: str, state: Path) -> None:
     """Record "<tag> <sha>" as the last applied state. The SHA is the guard's input."""
     state.parent.mkdir(parents=True, exist_ok=True)
     state.write_text(f"{tag} {commit}\n", encoding="utf-8")
+
+
+# --- the convergence loop ------------------------------------------------------
+# One per host, started by the poke (seconds) and by a 6-12 h liveness floor. The
+# floor is a LIVENESS GUARANTEE, not a control loop: without it a single lost poke
+# — host down during a deploy, service crash, network blip — leaves a host
+# silently stale forever (spec §7.2).
+
+
+@contextmanager
+def converge_lock(state_dir: Path) -> Iterator[bool]:
+    """Hold the whole-cycle lock, yielding False if another run already holds it.
+
+    Non-blocking, and contention is exit 0: a skipped cycle is harmless because
+    the next poke or floor picks it up, while a blocking wait would pile up
+    systemd jobs. A hand-run `nuk apply` mid-cycle is exactly the race this
+    closes — enabling a timer fires its service immediately, which collided with
+    a hand-run cycle during layer-1 verification (spec §7 step 1).
+    """
+    state_dir.mkdir(parents=True, exist_ok=True)
+    fd = os.open(state_dir / ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
+
+
+def archive_tree(repo: Path, commit: str, dest: Path) -> None:
+    """Extract `commit` into `dest` — never the live worktree.
+
+    The worktree can carry uncommitted edits mid-session; applying WIP against
+    real state on an unattended timer is a landmine (spec §7 step 4).
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    archive = subprocess.run(  # noqa: S603  # fixed argv, no shell
+        ["git", "-C", str(repo), "archive", commit],  # noqa: S607  # git on PATH
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(  # noqa: S603  # fixed argv, no shell
+        ["tar", "-x", "-C", str(dest)],  # noqa: S607  # tar on PATH
+        input=archive.stdout,
+        check=True,
+    )
+
+
+def apply_tree(tree: Path, role: str) -> list[dict]:
+    """Apply this host's manifests from `tree`. Body lands in Task 5."""
+    return []
+
+
+def reap_report(tree: Path) -> list[str]:
+    """Deployments present here but absent from `tree`. Body lands in Task 6."""
+    return []
+
+
+def cmd_converge(*, repo: Path, signers: Path, state_dir: Path, org_file: str) -> int:
+    """Converge this host to the newest verifying tag of the manifest repo.
+
+    Args:
+        repo: Local clone of the manifest repo (astrojones/infra).
+        signers: Allowed-signers file — the trust anchor.
+        state_dir: Where the lock, the last-applied record, and the status file live.
+        org_file: Org manifest filename inside the tree.
+
+    Returns:
+        0 when the cycle converged or the lock was held; 1 when it refused.
+    """
+    with converge_lock(state_dir) as acquired:
+        if not acquired:
+            print("another converge run holds the lock; skipping this cycle")
+            return 0
+        if not signers.is_file():
+            print(
+                f"REFUSING: trust anchor {signers} is missing or unreadable\n"
+                f"See infra/tf-incus/ALLOWED_SIGNERS.md",
+                file=sys.stderr,
+            )
+            return 1
+        # --prune-tags so a tag deleted upstream is deleted locally too; without it
+        # the downgrade guard would compare against a tag that exists nowhere else.
+        try:
+            _git(repo, "fetch", "--prune", "--prune-tags", "--tags", "--force", "origin")
+        except subprocess.CalledProcessError as e:
+            print(f"REFUSING: git fetch failed ({e}) — no network, no change", file=sys.stderr)
+            return 1
+        tag = resolve_signed_tag(repo, signers)
+        if tag is None:
+            print(f"REFUSING: no v* tag verifies against {signers}", file=sys.stderr)
+            return 1
+        last_applied = state_dir / "last-applied-tag"
+        try:
+            assert_not_downgrade(repo, tag, last_applied)
+        except ValueError as e:
+            print(f"REFUSING: {e}", file=sys.stderr)
+            return 1
+        commit = _git(repo, "rev-parse", f"{tag}^{{commit}}")
+        role, _ = read_self()
+        print(f"target: {tag} ({commit}) role={role}")
+        with tempfile.TemporaryDirectory(dir=state_dir, prefix="run.") as scratch:
+            tree = Path(scratch)
+            archive_tree(repo, commit, tree)
+            results = apply_tree(tree, role)
+            warnings = reap_report(tree)
+        print(f"applied {len(results)} manifest(s); {len(warnings)} orphan(s)")
+        record_applied(tag, commit, last_applied)
+        return 0
 
 
 def placement_matches(manifest: Deployment | Facility, role: str) -> bool:
@@ -3101,6 +3226,25 @@ def _rollback(
 ) -> None:
     """Re-apply a previously recorded release."""
     cmd_rollback(name, to, show)
+
+
+@app.command("converge")
+def _converge(
+    repo: Annotated[
+        Path, typer.Option("--repo", help="local clone of the manifest repo")
+    ] = CONVERGE_REPO,
+    signers: Annotated[
+        Path, typer.Option("--signers", help="allowed-signers file (the trust anchor)")
+    ] = ALLOWED_SIGNERS,
+    state_dir: Annotated[
+        Path, typer.Option("--state-dir", help="lock, last-applied record, status file")
+    ] = CONVERGE_STATE,
+    org_file: Annotated[
+        str, typer.Option("--org-file", help="org manifest filename inside the tree")
+    ] = DEFAULT_ORG_FILE,
+) -> None:
+    """Converge this host to the newest verifying tag (spec §7)."""
+    raise typer.Exit(cmd_converge(repo=repo, signers=signers, state_dir=state_dir, org_file=org_file))
 
 
 @app.command("delete")

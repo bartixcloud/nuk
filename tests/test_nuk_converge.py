@@ -169,3 +169,184 @@ def test_record_applied_writes_tag_and_sha(tmp_path):
     state = tmp_path / "nested" / "last-applied-tag"
     nuk.record_applied("v1.0.0", "a" * 40, state)
     assert state.read_text(encoding="utf-8") == f"v1.0.0 {'a' * 40}\n"
+
+
+# --- the loop: lock, fetch, verify, archive ------------------------------------
+
+
+ORG_FILE = "nuklaut.astrocloud.org.yml"
+
+
+@pytest.fixture
+def loop(repo, signer, tmp_path, monkeypatch):
+    """A signed repo plus a state dir, with apply/render/reap stubbed out.
+
+    The repo carries an org manifest at ORG_FILE because the edge refuses to
+    converge without one (Task 6). Its CONTENT is irrelevant here — the tests
+    that reach rendering stub `load_org` — but its PRESENCE is what the edge
+    checks, so it has to be in the archived tree.
+    """
+    pubkey, signers = signer
+    (repo / ORG_FILE).write_text("apiVersion: nukorg/v1\n", encoding="utf-8")
+    _run("git", "add", ORG_FILE, cwd=repo)
+    _run("git", "commit", "-qm", "org", cwd=repo)
+    _sign_tag(repo, pubkey, "v1.0.0")
+    # Set up a local origin remote so fetch doesn't fail
+    origin = tmp_path / "origin"
+    _run("git", "clone", "--bare", str(repo), str(origin))
+    _run("git", "remote", "add", "origin", str(origin), cwd=repo)
+    _run("git", "push", "origin", "main", "--tags", cwd=repo)
+    state = tmp_path / "state"
+    monkeypatch.setattr(nuk, "apply_tree", lambda tree, role: [])
+    monkeypatch.setattr(nuk, "reap_report", lambda tree: [])
+    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
+    return repo, signers, state
+
+
+def test_converge_refuses_without_a_trust_anchor(loop, tmp_path, capsys):
+    repo, _, state = loop
+    code = nuk.cmd_converge(
+        repo=repo, signers=tmp_path / "absent", state_dir=state, org_file=ORG_FILE
+    )
+    assert code == 1
+    assert "trust anchor" in capsys.readouterr().err
+
+
+def test_converge_refuses_when_no_tag_verifies(repo, signer, tmp_path, capsys, monkeypatch):
+    _, signers = signer
+    origin = tmp_path / "origin"
+    _run("git", "clone", "--bare", str(repo), str(origin))
+    _run("git", "remote", "add", "origin", str(origin), cwd=repo)
+    _plain_tag(repo, "v1.0.0")
+    monkeypatch.setattr(nuk, "apply_tree", lambda tree, role: pytest.fail("must not apply"))
+    code = nuk.cmd_converge(
+        repo=repo, signers=signers, state_dir=tmp_path / "state", org_file=ORG_FILE
+    )
+    assert code == 1
+    assert "no v* tag verifies" in capsys.readouterr().err
+
+
+def test_converge_refuses_a_downgrade(repo, signer, tmp_path, monkeypatch, capsys):
+    pubkey, signers = signer
+    origin = tmp_path / "origin"
+    _run("git", "clone", "--bare", str(repo), str(origin))
+    _run("git", "remote", "add", "origin", str(origin), cwd=repo)
+    _sign_tag(repo, pubkey, "v1.0.0")
+    newer = _commit(repo, "2")
+    _sign_tag(repo, pubkey, "v1.1.0")
+    _run("git", "push", "origin", "main", "--tags", cwd=repo)
+    state = tmp_path / "state"
+    state.mkdir()
+    nuk.record_applied("v1.1.0", newer, state / "last-applied-tag")
+    # Delete v1.1.0 from the origin (simulating the attack)
+    _run("git", "-C", str(origin), "tag", "-d", "v1.1.0")
+    _run("git", "tag", "-d", "v1.1.0", cwd=repo)
+    monkeypatch.setattr(nuk, "apply_tree", lambda tree, role: pytest.fail("must not apply"))
+    code = nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE)
+    assert code == 1
+    assert "not a descendant" in capsys.readouterr().err
+    # Spec §12, "loop — signature": prior state UNTOUCHED. A refusal that quietly
+    # rewrote last-applied-tag would let the very next cycle accept the downgrade.
+    assert (state / "last-applied-tag").read_text(encoding="utf-8").split()[0] == "v1.1.0"
+
+
+def test_converge_records_the_applied_tag(loop, capsys):
+    repo, signers, state = loop
+    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
+    recorded = (state / "last-applied-tag").read_text(encoding="utf-8").split()
+    assert recorded[0] == "v1.0.0"
+    assert recorded[1] == _run("git", "rev-parse", "v1.0.0^{commit}", cwd=repo).stdout.strip()
+
+
+def test_converge_exits_zero_and_applies_nothing_while_the_lock_is_held(loop, monkeypatch):
+    """Spec §7.5: a skipped cycle is harmless; the next poke or floor picks it up.
+
+    A blocking wait would instead pile up systemd jobs.
+    """
+    repo, signers, state = loop
+    monkeypatch.setattr(nuk, "apply_tree", lambda tree, role: pytest.fail("must not apply"))
+    with nuk.converge_lock(state) as acquired:
+        assert acquired is True
+        code = nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE)
+    assert code == 0
+    assert not (state / "last-applied-tag").exists()
+
+
+def test_archive_tree_extracts_the_commit_not_the_worktree(repo, tmp_path):
+    """Spec §7 step 4: never the live worktree, which can carry uncommitted edits."""
+    commit = _run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip()
+    (repo / "f").write_text("UNCOMMITTED\n", encoding="utf-8")
+    (repo / "untracked").write_text("junk\n", encoding="utf-8")
+    dest = tmp_path / "scratch"
+    nuk.archive_tree(repo, commit, dest)
+    assert (dest / "f").read_text(encoding="utf-8") == "1\n"
+    assert not (dest / "untracked").exists()
+
+
+def test_converge_applies_a_new_tag_restoring_an_old_tree(loop, signer, monkeypatch):
+    """Spec §12, 'loop — monotonic (§7.3a)': fleet rollback applies cleanly.
+
+    The guard is ancestry-based (Task 3), so 'a new tag on an old tree' means a
+    NEW commit whose tree restores the old one — a revert commit. Tagging the
+    OLD commit directly is refused by design; this test pins down the intended
+    forward-only shape.
+    """
+    repo, signers, state = loop
+    pubkey, _ = signer
+    # v1.0.0 already exists (the loop fixture signed it); append a release on top.
+    _commit(repo, "2")
+    _sign_tag(repo, pubkey, "v1.1.0")          # file "2" — recorded as applied
+    nuk.record_applied(
+        "v1.1.0",
+        _run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip(),
+        state / "last-applied-tag",
+    )
+    _run("git", "revert", "--no-edit", "HEAD", cwd=repo)  # file "1" again
+    _sign_tag(repo, pubkey, "v1.2.0")         # the rollback tag
+    _run("git", "push", "origin", "main", "--tags", cwd=repo)
+    applied = []
+    def mock_apply_tree(tree, role):
+        applied.append((tree / "f").read_text())
+        return []
+    monkeypatch.setattr(nuk, "apply_tree", mock_apply_tree)
+    monkeypatch.setattr(nuk, "reap_report", lambda tree: [])
+    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
+    code = nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE)
+    assert code == 0
+    assert applied == ["1\n"]
+    assert (state / "last-applied-tag").read_text(encoding="utf-8").split()[0] == "v1.2.0"
+
+
+def test_converge_refuses_a_new_tag_on_the_old_commit_itself(loop, signer, monkeypatch, capsys):
+    """§7.3a strengthening: 'old commit, new tag' is the deletion attack's shape.
+
+    The attack deletes the applied tag, then tags the OLD commit with a NEW
+    signed tag — which verifies and is creatordate-newest, so the resolver picks
+    it. The ancestry guard is the only thing standing between that and a silent
+    walk backwards, and it must refuse with the prior state untouched.
+    """
+    repo, signers, state = loop
+    pubkey, _ = signer
+    origin = _run("git", "config", "remote.origin.url", cwd=repo).stdout.strip()
+    old_sha = _run("git", "rev-parse", "v1.0.0^{commit}", cwd=repo).stdout.strip()
+    _commit(repo, "2")
+    _sign_tag(repo, pubkey, "v1.1.0")
+    _run("git", "push", "origin", "main", "--tags", cwd=repo)
+    nuk.record_applied(
+        "v1.1.0",
+        _run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip(),
+        state / "last-applied-tag",
+    )
+    # Delete v1.1.0 from the origin (simulating the attack)
+    _run("git", "-C", origin, "tag", "-d", "v1.1.0")
+    _run("git", "tag", "-d", "v1.1.0", cwd=repo)
+    _run(
+        "git", "-c", "gpg.format=ssh", "-c", f"user.signingkey={pubkey}",
+        "tag", "-s", "v1.2.0", "-m", "v1.2.0", old_sha, cwd=repo,
+    )
+    _run("git", "push", "origin", "--tags", cwd=repo)
+    monkeypatch.setattr(nuk, "apply_tree", lambda tree, role: pytest.fail("must not apply"))
+    code = nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE)
+    assert code == 1
+    assert "not a descendant" in capsys.readouterr().err
+    assert (state / "last-applied-tag").read_text(encoding="utf-8").split()[0] == "v1.1.0"
