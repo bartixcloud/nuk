@@ -1293,9 +1293,78 @@ def archive_tree(repo: Path, commit: str, dest: Path) -> None:
     )
 
 
+def _provided_capabilities(manifest: Facility) -> set[str]:
+    """The capabilities a Facility hands out (its `provides` block)."""
+    provides = manifest.spec.provides
+    return {p.capability for p in (provides.route, provides.env) if p is not None}
+
+
 def apply_tree(tree: Path, role: str) -> list[dict]:
-    """Apply this host's manifests from `tree`. Body lands in Task 5."""
-    return []
+    """Apply this host's Facilities, then its Deployments (spec §7 steps 6-7).
+
+    Facilities first within a cycle (§7.1): effect VOCABULARY is git-derived and
+    always resolvable regardless of order, but facility HEALTH needs the facility
+    up, and that is same-host. Cross-host ordering is eventual and covered by
+    `maintenance-errors@file`.
+
+    One failing manifest never stops the rest (§7.5). `cmd_apply` and `load` both
+    signal failure with SystemExit, so each manifest is isolated and its message
+    recorded for the status file — a malformed manifest must not take down the
+    cycle for every other manifest on the host.
+
+    A facility that fails this cycle POISONS the capabilities it declares:
+    a Deployment whose static `consumes()` (§5.3) intersects them is recorded
+    "refused" and never applied (§7.5: "Deployments consuming it refuse"). A
+    facility placed on another host is skipped before it can fail, and this host
+    cannot verify another host's liveness (§13) — only same-host failures refuse.
+
+    Args:
+        tree: Root of the archived manifest tree.
+        role: This host's role, from /etc/nuklaut/host.env.
+
+    Returns:
+        One `{\"name\", \"kind\", \"result\", \"error\"}` entry per manifest this host
+        owns, facilities first, each directory in filename order. `result` is
+        "ok", "failed", or "refused".
+    """
+    results: list[dict] = []
+    failed_caps: set[str] = set()
+    for kind, directory in (("Facility", FACILITY_DIR), ("Deployment", DEPLOYMENT_DIR)):
+        for path in sorted((tree / directory).glob("*.yml")):
+            try:
+                manifest = load(path)
+            except SystemExit as e:
+                results.append(
+                    {"name": path.name, "kind": kind, "result": "failed", "error": str(e.code)}
+                )
+                continue
+            if manifest.kind != kind or not placement_matches(manifest, role):
+                continue
+            if kind == "Deployment":
+                poisoned = consumes(manifest) & failed_caps
+                if poisoned:
+                    results.append(
+                        {
+                            "name": manifest.metadata.name,
+                            "kind": kind,
+                            "result": "refused",
+                            "error": (
+                                f"consumes {sorted(poisoned)} from a facility that "
+                                f"failed its health gate this cycle (spec §7.5)"
+                            ),
+                        }
+                    )
+                    continue
+            entry = {"name": manifest.metadata.name, "kind": kind, "result": "ok", "error": None}
+            try:
+                cmd_apply(path, None)
+            except SystemExit as e:
+                entry["result"] = "failed"
+                entry["error"] = str(e.code) if e.code else "apply failed"
+                if kind == "Facility":
+                    failed_caps |= _provided_capabilities(manifest)
+            results.append(entry)
+    return results
 
 
 def reap_report(tree: Path) -> list[str]:

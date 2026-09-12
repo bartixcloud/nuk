@@ -350,3 +350,167 @@ def test_converge_refuses_a_new_tag_on_the_old_commit_itself(loop, signer, monke
     assert code == 1
     assert "not a descendant" in capsys.readouterr().err
     assert (state / "last-applied-tag").read_text(encoding="utf-8").split()[0] == "v1.1.0"
+
+
+# --- apply order and isolation --------------------------------------------------
+
+FACILITY_YML = """\
+apiVersion: nuk/v1
+kind: Facility
+metadata: {name: data-stack}
+spec:
+  placement: {role: data}
+"""
+
+DEPLOYMENT_YML = """\
+apiVersion: nuk/v1
+kind: Deployment
+metadata: {name: hello}
+spec:
+  placement: {role: app}
+  source: {repo: "git@github.com:astrojones/hello.git"}
+"""
+
+# A facility that declares an env capability, and a Deployment that consumes it
+# through the §5.3 static map (spec.databases -> env capability "databases").
+DATA_FACILITY_YML = """\
+apiVersion: nuk/v1
+kind: Facility
+metadata: {name: data-stack}
+spec:
+  placement: {role: app}
+  provides:
+    env: {capability: databases, bind: postgres}
+"""
+
+DB_APP_YML = """\
+apiVersion: nuk/v1
+kind: Deployment
+metadata: {name: hello}
+spec:
+  placement: {role: app}
+  source: {repo: "git@github.com:astrojones/hello.git"}
+  databases: {postgres: true}
+"""
+
+
+def _tree(tmp_path, **files):
+    """Build a manifest tree: _tree(p, facilities={"a": YML}, deployments={...})."""
+    root = tmp_path / "tree"
+    root.mkdir(parents=True, exist_ok=True)
+    for directory, docs in files.items():
+        d = root / directory
+        d.mkdir(parents=True, exist_ok=True)
+        for name, body in docs.items():
+            (d / f"{name}.yml").write_text(body, encoding="utf-8")
+    return root
+
+
+def test_apply_tree_applies_facilities_before_deployments(tmp_path, monkeypatch):
+    """Spec §7.1 — only facility HEALTH needs ordering, and that is same-host."""
+    tree = _tree(
+        tmp_path,
+        facilities={"data-stack": FACILITY_YML.replace("role: data", "role: app")},
+        deployments={"hello": DEPLOYMENT_YML},
+    )
+    order = []
+    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp: order.append(path.stem))
+    results = nuk.apply_tree(tree, "app")
+    assert order == ["data-stack", "hello"]
+    assert [r["result"] for r in results] == ["ok", "ok"]
+    assert [r["kind"] for r in results] == ["Facility", "Deployment"]
+
+
+def test_apply_tree_skips_manifests_placed_on_another_host(tmp_path, monkeypatch):
+    """Spec §5.4 — placement.role != this host is a clean no-op, nothing applied."""
+    tree = _tree(
+        tmp_path, facilities={"data-stack": FACILITY_YML}, deployments={"hello": DEPLOYMENT_YML}
+    )
+    applied = []
+    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp: applied.append(path.stem))
+    results = nuk.apply_tree(tree, "app")
+    assert applied == ["hello"]
+    assert len(results) == 1
+
+
+def test_one_failing_deployment_does_not_stop_the_rest(tmp_path, monkeypatch):
+    """Spec §7.5 — log, continue, per-manifest result in status."""
+    second = DEPLOYMENT_YML.replace("name: hello", "name: zulu")
+    tree = _tree(tmp_path, deployments={"hello": DEPLOYMENT_YML, "zulu": second})
+
+    def flaky(path, _rp):
+        if path.stem == "hello":
+            raise SystemExit("hello: image pull failed")
+
+    monkeypatch.setattr(nuk, "cmd_apply", flaky)
+    results = nuk.apply_tree(tree, "app")
+    assert [(r["name"], r["result"]) for r in results] == [("hello", "failed"), ("zulu", "ok")]
+    assert "image pull failed" in results[0]["error"]
+
+
+def test_a_malformed_manifest_is_recorded_not_raised(tmp_path, monkeypatch):
+    tree = _tree(tmp_path, deployments={"hello": DEPLOYMENT_YML, "broken": "kind: Nonsense\n"})
+    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp: None)
+    results = nuk.apply_tree(tree, "app")
+    by_name = {r["name"]: r for r in results}
+    assert by_name["broken.yml"]["result"] == "failed"
+    assert by_name["hello"]["result"] == "ok"
+
+
+def test_apply_tree_tolerates_a_tree_with_neither_directory(tmp_path):
+    assert nuk.apply_tree(tmp_path / "empty", "app") == []
+
+
+def test_a_deployment_consuming_a_failed_facility_is_refused(tmp_path, monkeypatch):
+    """Spec §7.5: facility fails health -> Deployments consuming it refuse.
+
+    `consumes` is the REAL function — the static map (§5.3) is part of the
+    assertion, not the harness.
+    """
+    tree = _tree(
+        tmp_path,
+        facilities={"data-stack": DATA_FACILITY_YML},
+        deployments={"hello": DB_APP_YML},
+    )
+
+    def flaky(path, _rp):
+        if path.stem == "data-stack":
+            raise SystemExit("data-stack: container 'nuk-postgres' is not healthy")
+
+    monkeypatch.setattr(nuk, "cmd_apply", flaky)
+    results = nuk.apply_tree(tree, "app")
+    by_name = {r["name"]: r for r in results}
+    assert by_name["data-stack"]["result"] == "failed"
+    assert by_name["hello"]["result"] == "refused"
+    assert "databases" in by_name["hello"]["error"]
+
+
+def test_a_deployment_consuming_nothing_applies_despite_a_failed_facility(tmp_path, monkeypatch):
+    """A Deployment that consumes nothing is not coupled to any facility (§5.3)."""
+    tree = _tree(
+        tmp_path,
+        facilities={"data-stack": DATA_FACILITY_YML},
+        deployments={"hello": DEPLOYMENT_YML},
+    )
+
+    def flaky(path, _rp):
+        if path.stem == "data-stack":
+            raise SystemExit("data-stack: not healthy")
+
+    monkeypatch.setattr(nuk, "cmd_apply", flaky)
+    results = nuk.apply_tree(tree, "app")
+    by_name = {r["name"]: r for r in results}
+    assert by_name["hello"]["result"] == "ok"
+
+
+def test_a_facility_placed_on_another_host_does_not_poison(tmp_path, monkeypatch):
+    """Cross-host facility health is unknown (§13) — only same-host failures refuse."""
+    tree = _tree(
+        tmp_path,
+        facilities={"data-stack": DATA_FACILITY_YML.replace("role: app", "role: data")},
+        deployments={"hello": DB_APP_YML},
+    )
+    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp: None)
+    results = nuk.apply_tree(tree, "app")
+    assert [r["name"] for r in results] == ["hello"]
+    assert results[0]["result"] == "ok"
