@@ -718,10 +718,24 @@ def persist_manifest(spec: dict, src_path: Path, dest: Path, repo_path: str | No
         shutil.copy(src_path, dest)
 
 
+def _compose_file(spec: dict) -> str:
+    """Read `compose.file` from a raw `spec` dict.
+
+    Accepts either the bare string or `{file: ...}` form (mirrors
+    `Compose._coerce_string`'s normalization, which `manifest.spec.compose.file`
+    already benefits from — this is for call sites that read the raw manifest
+    dict directly instead of the validated model).
+    """
+    compose = spec.get("compose", "docker-compose.yml")
+    if isinstance(compose, str):
+        return compose
+    return compose.get("file", "docker-compose.yml")
+
+
 def compose_args(name: str, spec: dict) -> list[str]:
     """Build the `docker compose` base argv for an app from its raw spec."""
     repo = project_dir(name) / "repo"
-    cf = spec["spec"].get("compose", {}).get("file", "docker-compose.yml")
+    cf = _compose_file(spec["spec"])
     override = project_dir(name) / "compose.override.yml"
     args = ["docker", "compose", "-p", name, "-f", str(repo / cf)]
     if override.exists():
@@ -867,7 +881,7 @@ def compose_service_names(name: str, raw: dict) -> list[str]:
     Returns:
         The compose `services` keys, in file order.
     """
-    cf = raw["spec"].get("compose", {}).get("file", "docker-compose.yml")
+    cf = _compose_file(raw["spec"])
     path = project_dir(name) / "repo" / cf
     if not path.exists():
         return []

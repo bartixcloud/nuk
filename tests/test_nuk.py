@@ -487,6 +487,67 @@ def test_compose_service_names_reads_repo_compose(tmp_path, monkeypatch):
     assert sorted(nuk.compose_service_names("app", raw)) == ["web", "worker"]
 
 
+def test_compose_service_names_with_bare_string_compose(tmp_path, monkeypatch):
+    """spec.compose as a bare string (as shipped by data-stack.yml/ingress.yml)
+    must resolve the same as the {file: ...} dict form, not raise AttributeError.
+    """
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    repo = tmp_path / "app" / "repo"
+    repo.mkdir(parents=True)
+    (repo / "docker-compose.data.yml").write_text(
+        yaml.safe_dump({"services": {"db": {"image": "x"}}})
+    )
+    raw = {"spec": {"compose": "docker-compose.data.yml"}}
+    assert nuk.compose_service_names("app", raw) == ["db"]
+
+
+def test_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
+    """compose_args must not crash when spec.compose is a bare string."""
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    project_dir = tmp_path / "app" / "repo"
+    project_dir.mkdir(parents=True)
+    spec = {"spec": {"compose": "docker-compose.data.yml"}}
+    args = nuk.compose_args("app", spec)
+    assert str(project_dir / "docker-compose.data.yml") in args
+
+
+def test_compose_args_with_dict_compose_still_works(tmp_path, monkeypatch):
+    """Regression guard: the existing {file: ...} dict form is unaffected."""
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    project_dir = tmp_path / "app" / "repo"
+    project_dir.mkdir(parents=True)
+    spec = {"spec": {"compose": {"file": "docker-compose.data.yml"}}}
+    args = nuk.compose_args("app", spec)
+    assert str(project_dir / "docker-compose.data.yml") in args
+
+
+def test_load_then_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
+    """End-to-end: nuk.load() on a manifest with compose as a bare string
+    feeds compose_args via manifest.raw without crashing.
+    """
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    project_dir = tmp_path / "app" / "repo"
+    project_dir.mkdir(parents=True)
+    manifest_path = tmp_path / "app.yml"
+    manifest_path.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "nuk/v1",
+                "kind": "Deployment",
+                "metadata": {"name": "app"},
+                "spec": {
+                    "source": {"repo": "https://example.com/app.git"},
+                    "compose": "docker-compose.data.yml",
+                },
+            }
+        )
+    )
+    manifest = nuk.load(manifest_path)
+    args = nuk.compose_args("app", manifest.raw)
+    assert str(project_dir / "docker-compose.data.yml") in args
+    assert manifest.spec.compose.file == "docker-compose.data.yml"
+
+
 def test_resolve_db_services_empty_without_db_env():
     raw = {"spec": {"ingress": [{"host": "a", "service": "web", "port": 80}]}}
     assert nuk.resolve_db_services("app", raw, None) == []
