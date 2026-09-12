@@ -721,15 +721,16 @@ def persist_manifest(spec: dict, src_path: Path, dest: Path, repo_path: str | No
 def _compose_file(spec: dict) -> str:
     """Read `compose.file` from a raw `spec` dict.
 
-    Accepts either the bare string or `{file: ...}` form (mirrors
-    `Compose._coerce_string`'s normalization, which `manifest.spec.compose.file`
-    already benefits from — this is for call sites that read the raw manifest
-    dict directly instead of the validated model).
+    Accepts the bare-string form (`compose: foo.yml`), the mapping form
+    (`compose: {file: foo.yml}`), and a bare null key (`compose:`), which YAML
+    parses to None and which `_NullTolerant` treats as absent elsewhere.
     """
-    compose = spec.get("compose", "docker-compose.yml")
+    compose = spec.get("compose")
     if isinstance(compose, str):
         return compose
-    return compose.get("file", "docker-compose.yml")
+    if isinstance(compose, dict):
+        return compose.get("file", "docker-compose.yml")
+    return "docker-compose.yml"
 
 
 def compose_args(name: str, spec: dict) -> list[str]:

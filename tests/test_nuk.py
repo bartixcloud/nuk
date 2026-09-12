@@ -1159,3 +1159,14 @@ def test_host_port_overrides_publish_to_avoid_collision():
 def test_host_port_field_parses_via_alias():
     assert nuk.Ingress(host="h", service="s", port=8080, hostPort=8081).host_port == 8081
     assert nuk.Ingress(host="h", service="s", port=8080).host_port is None
+
+
+def test_compose_args_tolerates_null_compose(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "project_dir", lambda _n: tmp_path)
+    args = nuk.compose_args("app", {"spec": {"compose": None}})
+    assert args[0:2] == ["docker", "compose"]
+
+
+def test_compose_service_names_tolerates_null_compose(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "project_dir", lambda _n: tmp_path)
+    assert nuk.compose_service_names("app", {"spec": {"compose": None}}) == []
