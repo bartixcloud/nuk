@@ -46,6 +46,14 @@ SECRETS = ROOT / "secrets"
 # This host's identity, written world-readable (no secrets) by cloud-init. Absent on a
 # legacy single-host controller -> read_self() defaults to an entry role (byte-identical).
 HOST_ENV = Path("/etc/nuklaut/host.env")
+# The convergence loop's state (spec §7). /var/lib per the FHS: machine-local,
+# persistent, not configuration. Held apart from /opt/nuklaut so that wiping a
+# host's deployments does not also erase the downgrade guard's memory.
+CONVERGE_STATE = Path("/var/lib/nuk")
+# Same default path as infra/tf-incus/reconcile.sh's, and the same rule: the trust
+# anchor is delivered OUT OF BAND (see infra/tf-incus/ALLOWED_SIGNERS.md), never
+# from the repo it protects — a repo carrying its own trust anchor does not have one.
+ALLOWED_SIGNERS = Path("/etc/nuklaut/allowed_signers")
 
 # Shared data stack — owned, reproducible source vendored at
 # files/docker-compose.data.yml (bring it up once on the controller). Apps reach
@@ -1079,6 +1087,148 @@ def read_self() -> tuple[str, str | None]:
     except OSError:
         pass
     return role, private_ip
+
+
+# --- signed-tag trust ----------------------------------------------------------
+# Ported from infra/tf-incus/reconcile.sh:74-120, which guards the LAYER-1 loop
+# (terraform, nuroot only, bash). This is the LAYER-3 loop (nuk manifests, every
+# platform host, Python). The logic is duplicated on purpose — sharing it would
+# mean shipping bash into nuk or terraform onto the fleet — so keep the two in
+# step: a fix to either belongs in both. Both bugs the bash version grew during
+# host verification (2026-08-15) are re-encoded as tests here.
+
+
+def _git(repo: Path, *args: str) -> str:
+    """`git -C repo <args>` → stdout, stripped.
+
+    Raises:
+        subprocess.CalledProcessError: On non-zero exit.
+    """
+    out = subprocess.run(  # noqa: S603  # fixed argv, no shell
+        ["git", "-C", str(repo), *args],  # noqa: S607  # git on PATH
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return out.stdout.strip()
+
+
+def _is_ancestor(repo: Path, a: str, b: str) -> bool:
+    """Whether commit-ish `a` is an ancestor of commit-ish `b`."""
+    return (
+        subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["git", "-C", str(repo), "merge-base", "--is-ancestor", a, b],  # noqa: S607
+            check=False,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def verify_tag(repo: Path, signers: Path, tag: str) -> bool:
+    """Whether `tag`'s signature verifies against the allowed-signers file.
+
+    `gpg.format=ssh` and the signers file are passed with `-c` rather than read
+    from the repo's own config: a repo that names its own trust anchor does not
+    have one.
+    """
+    return (
+        subprocess.run(  # noqa: S603  # fixed argv, no shell
+            [  # noqa: S607  # git on PATH
+                "git", "-C", str(repo),
+                "-c", "gpg.format=ssh",
+                "-c", f"gpg.ssh.allowedSignersFile={signers}",
+                "verify-tag", tag,
+            ],
+            check=False,
+            capture_output=True,
+        ).returncode
+        == 0
+    )
+
+
+def resolve_signed_tag(repo: Path, signers: Path) -> str | None:
+    """The newest `v*` tag whose signature verifies, or None if none does.
+
+    Iterates ALL candidates rather than verifying only the newest: one unsigned
+    tag pushed by anyone with write access would otherwise be a denial of service
+    against the whole loop.
+
+    Among verifying candidates it prefers the topological DESCENDANT, not the
+    creatordate-newest. `creatordate` has one-second granularity and for-each-ref
+    breaks ties on refname, which is not release order — v2.10.0 sorts below
+    v2.9.0, and two tags cut in the same second resolve arbitrarily. Taking the
+    first verifying hit pinned the loop to an OLDER tag forever, reporting "no
+    changes" every cycle while a newer signed tag sat unapplied (found on the host
+    2026-08-15, v2.0.1 shadowing v2.1.0). Tags on unrelated histories fall back to
+    the creatordate-newest, which is the best available answer.
+    """
+    try:
+        refs = _git(
+            repo, "for-each-ref", "--sort=-creatordate", "--format=%(refname:short)", "refs/tags/v*"
+        ).splitlines()
+    except subprocess.CalledProcessError:
+        return None
+    best: str | None = None
+    for tag in (t.strip() for t in refs if t.strip()):
+        if not verify_tag(repo, signers, tag):
+            continue
+        if best is None:
+            best = tag
+            continue
+        if _is_ancestor(repo, f"{best}^{{commit}}", f"{tag}^{{commit}}") and not _is_ancestor(
+            repo, f"{tag}^{{commit}}", f"{best}^{{commit}}"
+        ):
+            best = tag
+    return best
+
+
+def assert_not_downgrade(repo: Path, tag: str, state: Path) -> None:
+    """Refuse to move to a tag that is not a descendant of the last applied one.
+
+    Signature verification alone does not prevent a downgrade: someone with write
+    access can DELETE newer tags, walking the fleet back onto older, legitimately
+    signed state.
+
+    The state file records "<tag> <sha>" and this compares the SHA, never the tag
+    name. Recording only the name was a hole: the downgrade attack IS tag
+    deletion, so resolving the previous tag by name fails exactly when the guard
+    is needed, and the guard then permitted the rollback it existed to stop.
+
+    An unresolvable previous SHA (rewritten history, gc'd commit) is ambiguous,
+    and ambiguity here is indistinguishable from an attack — so it refuses and
+    asks for a human.
+
+    Raises:
+        ValueError: On a downgrade or an unresolvable previous commit.
+    """
+    if not state.exists():
+        return
+    parts = state.read_text(encoding="utf-8").split()
+    if len(parts) < 2:  # noqa: PLR2004  # "<tag> <sha>"
+        return
+    prev_sha = parts[1]
+    try:
+        _git(repo, "rev-parse", "-q", "--verify", f"{prev_sha}^{{commit}}")
+    except subprocess.CalledProcessError:
+        msg = (
+            f"last applied commit {prev_sha} is unknown to this repo (rewritten history?) — "
+            f"resolve by hand"
+        )
+        raise ValueError(msg) from None
+    if not _is_ancestor(repo, prev_sha, f"{tag}^{{commit}}"):
+        msg = (
+            f"{tag} is not a descendant of last applied {prev_sha}: the newest verifying tag "
+            f"went BACKWARDS — a newer tag was deleted, or history was rewritten. "
+            f"A tag deletion can walk the fleet backwards. Resolve by hand."
+        )
+        raise ValueError(msg)
+
+
+def record_applied(tag: str, commit: str, state: Path) -> None:
+    """Record "<tag> <sha>" as the last applied state. The SHA is the guard's input."""
+    state.parent.mkdir(parents=True, exist_ok=True)
+    state.write_text(f"{tag} {commit}\n", encoding="utf-8")
 
 
 def placement_matches(manifest: Deployment | Facility, role: str) -> bool:

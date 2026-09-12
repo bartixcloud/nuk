@@ -1,0 +1,171 @@
+"""The convergence loop's trust boundary and mechanics (spec §7).
+
+Real git repos with real SSH-signed tags in tmp_path — no mocks on the crypto,
+because the crypto IS the security boundary (spec §7.3). No network, no docker,
+no /opt/nuklaut.
+
+HERMETICITY: every git invocation here runs with GIT_CONFIG_GLOBAL and
+GIT_CONFIG_SYSTEM pointed at a nonexistent path. Without that, a developer whose
+global config sets `tag.gpgsign = true` (this repo's own author does) silently
+SIGNS the tags these tests create as unsigned, and every negative case passes for
+the wrong reason.
+"""
+
+from __future__ import annotations
+
+import subprocess
+
+import pytest
+
+import nuk
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_git(tmp_path, monkeypatch):
+    """Neutralize the developer's global/system git config for every test."""
+    nowhere = str(tmp_path / "no-such-gitconfig")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", nowhere)
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", nowhere)
+
+
+def _run(*cmd, cwd=None):
+    """Run a command, raising with captured output on failure."""
+    return subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True)
+
+
+@pytest.fixture
+def signer(tmp_path):
+    """An ed25519 key plus an allowed-signers file naming it."""
+    key = tmp_path / "signing"
+    _run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "signer", "-f", str(key))
+    signers = tmp_path / "allowed_signers"
+    signers.write_text(
+        f"signer {key.with_suffix('.pub').read_text(encoding='utf-8').strip()}\n",
+        encoding="utf-8",
+    )
+    return key.with_suffix(".pub"), signers
+
+
+@pytest.fixture
+def repo(tmp_path):
+    """An initialized git repo with one commit."""
+    r = tmp_path / "repo"
+    r.mkdir()
+    _run("git", "init", "-q", "-b", "main", cwd=r)
+    _run("git", "config", "user.email", "t@example.invalid", cwd=r)
+    _run("git", "config", "user.name", "T", cwd=r)
+    (r / "f").write_text("1\n", encoding="utf-8")
+    _run("git", "add", "f", cwd=r)
+    _run("git", "commit", "-qm", "one", cwd=r)
+    return r
+
+
+def _commit(repo, text):
+    """Add a commit and return its sha."""
+    (repo / "f").write_text(text, encoding="utf-8")
+    _run("git", "commit", "-qam", text, cwd=repo)
+    return _run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip()
+
+
+def _sign_tag(repo, pubkey, tag):
+    """Create an SSH-signed annotated tag at HEAD."""
+    _run(
+        "git", "-c", "gpg.format=ssh", "-c", f"user.signingkey={pubkey}",
+        "tag", "-s", tag, "-m", tag, cwd=repo,
+    )
+
+
+def _plain_tag(repo, tag):
+    """Create an explicitly UNSIGNED annotated tag at HEAD."""
+    _run("git", "-c", "tag.gpgSign=false", "tag", "-a", tag, "-m", tag, cwd=repo)
+
+
+def test_a_signed_tag_verifies(repo, signer):
+    pubkey, signers = signer
+    _sign_tag(repo, pubkey, "v1.0.0")
+    assert nuk.verify_tag(repo, signers, "v1.0.0") is True
+
+
+def test_an_unsigned_tag_does_not_verify(repo, signer):
+    _, signers = signer
+    _plain_tag(repo, "v1.0.0")
+    assert nuk.verify_tag(repo, signers, "v1.0.0") is False
+
+
+def test_a_tag_signed_by_a_foreign_key_does_not_verify(repo, signer, tmp_path):
+    """Signed, valid, and not by anyone we trust."""
+    _, signers = signer
+    other = tmp_path / "other"
+    _run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "other", "-f", str(other))
+    _sign_tag(repo, other.with_suffix(".pub"), "v1.0.0")
+    assert nuk.verify_tag(repo, signers, "v1.0.0") is False
+
+
+def test_resolve_returns_none_when_nothing_verifies(repo, signer):
+    _, signers = signer
+    _plain_tag(repo, "v1.0.0")
+    assert nuk.resolve_signed_tag(repo, signers) is None
+
+
+def test_resolve_skips_an_unsigned_tag_rather_than_failing(repo, signer):
+    """One unsigned tag from anyone with write access must not be a DoS."""
+    pubkey, signers = signer
+    _sign_tag(repo, pubkey, "v1.0.0")
+    _commit(repo, "2")
+    _plain_tag(repo, "v1.1.0")
+    assert nuk.resolve_signed_tag(repo, signers) == "v1.0.0"
+
+
+def test_resolve_prefers_the_topological_descendant_over_creatordate(repo, signer):
+    """Regression: v2.0.1 shadowed v2.1.0 during host verification 2026-08-15.
+
+    Both tags are created inside the same second, so `--sort=-creatordate` ties
+    and for-each-ref breaks the tie on refname — where v2.1.0 sorts BELOW v2.0.1.
+    Taking the first verifying hit would pin the loop to the older tag forever.
+    """
+    pubkey, signers = signer
+    _sign_tag(repo, pubkey, "v2.0.1")
+    _commit(repo, "2")
+    _sign_tag(repo, pubkey, "v2.1.0")
+    assert nuk.resolve_signed_tag(repo, signers) == "v2.1.0"
+
+
+def test_downgrade_guard_passes_for_a_descendant(repo, signer, tmp_path):
+    pubkey, signers = signer
+    first = _run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip()
+    state = tmp_path / "last-applied-tag"
+    nuk.record_applied("v1.0.0", first, state)
+    _commit(repo, "2")
+    _sign_tag(repo, pubkey, "v1.1.0")
+    nuk.assert_not_downgrade(repo, "v1.1.0", state)  # must not raise
+
+
+def test_downgrade_guard_refuses_a_walk_backwards(repo, signer, tmp_path):
+    """The attack IS tag deletion, so the guard compares SHAs, never tag names."""
+    pubkey, signers = signer
+    _sign_tag(repo, pubkey, "v1.0.0")
+    newer = _commit(repo, "2")
+    _sign_tag(repo, pubkey, "v1.1.0")
+    state = tmp_path / "last-applied-tag"
+    nuk.record_applied("v1.1.0", newer, state)
+    _run("git", "tag", "-d", "v1.1.0", cwd=repo)  # the deletion
+    with pytest.raises(ValueError, match="not a descendant"):
+        nuk.assert_not_downgrade(repo, "v1.0.0", state)
+
+
+def test_downgrade_guard_refuses_an_unknown_previous_commit(repo, tmp_path):
+    """Rewritten history is indistinguishable from an attack — refuse."""
+    state = tmp_path / "last-applied-tag"
+    nuk.record_applied("v9.9.9", "f" * 40, state)
+    with pytest.raises(ValueError, match="unknown to this repo"):
+        nuk.assert_not_downgrade(repo, "HEAD", state)
+
+
+def test_downgrade_guard_is_a_no_op_on_first_run(repo, tmp_path):
+    nuk.assert_not_downgrade(repo, "HEAD", tmp_path / "never-written")
+
+
+def test_record_applied_writes_tag_and_sha(tmp_path):
+    state = tmp_path / "nested" / "last-applied-tag"
+    nuk.record_applied("v1.0.0", "a" * 40, state)
+    assert state.read_text(encoding="utf-8") == f"v1.0.0 {'a' * 40}\n"
