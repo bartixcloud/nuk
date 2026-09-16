@@ -77,6 +77,11 @@ DEFAULT_ORG_FILE = "nuklaut.astrocloud.org.yml"
 PG_CONTAINER = "nuk-postgres"
 REDIS_CONTAINER = "nuk-redis"
 
+# The fleet DB seed: delivered by converge.sh via the existing sops channel to
+# the data + app hosts only. Both hosts derive per-app passwords from it, so no
+# credential is ever transported (spec §3.1).
+DB_SEED_ENV = Path("/etc/nuklaut/secrets/db-seed.env")
+
 # The capability name a Deployment's `spec.databases` block asks for; the
 # data-stack facility declares it via spec.provides.env.capability.
 _DATABASES_CAPABILITY = "databases"
@@ -2068,6 +2073,50 @@ def _require_container(container: str, label: str) -> None:
         sys.exit(f"nuk: shared {label} container {container!r} not found — {_DATA_STACK_HINT}")
     if not healthy:
         sys.exit(f"nuk: shared {label} container {container!r} not healthy — {_DATA_STACK_HINT}")
+
+
+def load_db_seed() -> bytes | None:
+    """Read NUK_DB_SEED from the converge-delivered seed file, or None if absent.
+
+    Absent means a legacy single-host install: callers keep the random-password
+    behavior so old deploys are byte-identical.
+    """
+    if not DB_SEED_ENV.exists():
+        return None
+    for raw in DB_SEED_ENV.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if line.startswith("NUK_DB_SEED="):
+            return line[len("NUK_DB_SEED=") :].encode()
+    return None
+
+
+def derive_db_password(seed: bytes, kind: str, app: str) -> str:
+    """Derive an app's DB password deterministically from the fleet seed.
+
+    SPEC-STABLE (spec §3.1): HKDF-SHA-256, info `nuk-db:<kind>:<app>`, empty
+    salt, 32 bytes, base64url without padding. Both the data host (which sets the
+    role's password) and the app host (which builds DATABASE_URL) derive the same
+    value independently. Changing this is a fleet-wide password rotation.
+
+    Args:
+        seed: The fleet seed bytes.
+        kind: "pg" or "redis".
+        app: The app name.
+
+    Returns:
+        A URL-safe ASCII password.
+    """
+    import base64
+    import hashlib
+    import hmac
+
+    if kind not in {"pg", "redis"}:
+        sys.exit(f"nuk: derive_db_password kind must be 'pg' or 'redis', got {kind!r}")
+    info = f"nuk-db:{kind}:{app}".encode()
+    # RFC 5869 HKDF-SHA-256, salt = HashLen zeros (i.e. empty salt), one block.
+    prk = hmac.new(b"\x00" * 32, seed, hashlib.sha256).digest()
+    okm = hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
+    return base64.urlsafe_b64encode(okm).rstrip(b"=").decode()
 
 
 def ensure_postgres(app: str, prev_url: str | None, driver: str | None = None) -> str:
