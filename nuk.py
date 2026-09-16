@@ -2139,7 +2139,12 @@ def ensure_postgres(app: str, prev_url: str | None, driver: str | None = None) -
     """
     if driver and not re.fullmatch(r"[a-z][a-z0-9]*", driver):
         sys.exit(f"nuk: invalid postgres driver {driver!r}")
-    pw = _pw_from_url(prev_url) or secrets.token_urlsafe(24)
+    seed = load_db_seed()
+    pw = (
+        derive_db_password(seed, "pg", app)
+        if seed is not None
+        else (_pw_from_url(prev_url) or secrets.token_urlsafe(24))
+    )
     _psql(
         f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {_lit(app)}) "
         f'THEN CREATE ROLE "{app}" LOGIN; END IF; END $$;'  # noqa: S608  # app guarded by _safe_ident
@@ -2169,7 +2174,12 @@ def ensure_redis(app: str, prev_url: str | None) -> str:
     Returns:
         A REDIS_URL for the provisioned user.
     """
-    pw = _pw_from_url(prev_url) or secrets.token_urlsafe(24)
+    seed = load_db_seed()
+    pw = (
+        derive_db_password(seed, "redis", app)
+        if seed is not None
+        else (_pw_from_url(prev_url) or secrets.token_urlsafe(24))
+    )
     _redis_admin(
         "ACL",
         "SETUSER",
