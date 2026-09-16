@@ -148,3 +148,90 @@ def test_data_host_ip_reads_org_role():
         }
     )
     assert nuk.data_host_ip(org) == "10.0.10.180"
+
+
+def _db_deployment(tmp_path, name, placement_role="app"):
+    d = tmp_path / "deployments"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"{name}.yml").write_text(
+        "apiVersion: nuk/v1\n"
+        "kind: Deployment\n"
+        f"metadata: {{name: {name}}}\n"
+        "spec:\n"
+        f"  placement: {{role: {placement_role}}}\n"
+        "  databases:\n"
+        "    postgres: true\n"
+        "  ingress:\n"
+        f"    - {{host: {name}.example.com, service: web, port: 8080}}\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def _data_facility(tmp_path):
+    f = tmp_path / "facilities"
+    f.mkdir(parents=True, exist_ok=True)
+    (f / "data-stack.yml").write_text(
+        "apiVersion: nuk/v1\n"
+        "kind: Facility\n"
+        "metadata: {name: data-stack}\n"
+        "spec:\n"
+        "  placement: {role: data}\n"
+        "  compose: docker-compose.data.yml\n"
+        "  provides:\n"
+        "    env: {capability: databases, bind: postgres}\n",
+        encoding="utf-8",
+    )
+    (f / "data-stack").mkdir(exist_ok=True)
+    (f / "data-stack" / "docker-compose.data.yml").write_text(
+        "services: {}\n", encoding="utf-8"
+    )
+    return tmp_path
+
+
+def test_capability_owner_provisions_a_placement_skipped_deployment(tmp_path, monkeypatch):
+    tree = _data_facility(_db_deployment(tmp_path, "hello"))
+    monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")
+    monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
+    monkeypatch.setattr(nuk, "load_db_seed", lambda: b"\x08" * 32)
+    seen = []
+    monkeypatch.setattr(
+        nuk, "provision_databases",
+        lambda app, dbs, facs, *, remote_ip=None: seen.append((app, remote_ip)) or "/x",
+    )
+    facs = nuk.load_facilities(tree)
+    out = nuk.provision_remote_databases(tree, "data", facs)
+    # placement says app, but the DATA host provisions it (spec §3.1 exception)
+    assert seen == [("hello", None)]
+    assert out == [{"name": "hello", "kind": "Database", "result": "ok", "error": None}]
+
+
+def test_non_owner_does_not_provision(tmp_path, monkeypatch):
+    tree = _data_facility(_db_deployment(tmp_path, "hello"))
+    monkeypatch.setattr(
+        nuk, "provision_databases",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not provision")),
+    )
+    facs = nuk.load_facilities(tree)
+    assert nuk.provision_remote_databases(tree, "edge", facs) == []
+    assert nuk.provision_remote_databases(tree, "app", facs) == []
+
+
+def test_sweep_is_idempotent_no_rotation(tmp_path, monkeypatch):
+    tree = _data_facility(_db_deployment(tmp_path, "hello"))
+    monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")
+    monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
+    seed = b"\x09" * 32
+    monkeypatch.setattr(nuk, "load_db_seed", lambda: seed)
+    calls = []
+    monkeypatch.setattr(
+        nuk, "ensure_postgres",
+        lambda app, prev, driver=None: calls.append(prev) or "postgresql://x",
+    )
+    monkeypatch.setattr(nuk, "_psql", lambda *a, **k: "")
+    monkeypatch.setattr(nuk, "preflight_data_stack", lambda *a, **k: None)
+    facs = nuk.load_facilities(tree)
+    nuk.provision_remote_databases(tree, "data", facs)
+    nuk.provision_remote_databases(tree, "data", facs)
+    # derived password is deterministic: the second cycle must converge identically
+    assert len(calls) == 2

@@ -1318,6 +1318,46 @@ def _provided_capabilities(manifest: Facility) -> set[str]:
     return {p.capability for p in (provides.route, provides.env) if p is not None}
 
 
+def provision_remote_databases(tree: Path, role: str, facilities: list[Facility]) -> list[dict]:
+    """Provision every deployment's databases on this host IF it owns the capability.
+
+    The placement-gate exception (spec §3.1): a deployment placed `app` is a
+    no-op on the `data` host for containers and ingress, but its `spec.databases`
+    fragment must still be provisioned HERE — this is the only host with a local
+    `nuk-postgres`. Scoped to provisioning: nothing else about the manifest runs.
+
+    Deterministic derivation makes this loop-stable: the same seed yields the
+    same password, so re-running converges to a no-op rather than rotating.
+    """
+    provider = env_facility(facilities, _DATABASES_CAPABILITY)
+    if provider is None or not placement_matches(provider, role):
+        return []
+    out: list[dict] = []
+    for path in sorted((tree / DEPLOYMENT_DIR).glob("*.yml")):
+        try:
+            manifest = load(path)
+        except SystemExit as e:
+            out.append(
+                {"name": path.name, "kind": "Database", "result": "failed", "error": str(e.code)}
+            )
+            continue
+        if manifest.kind != "Deployment":
+            continue
+        dbs = manifest.raw.get("spec", {}).get("databases") or {}
+        if not (dbs.get("postgres") or dbs.get("redis")):
+            continue
+        name = manifest.metadata.name
+        entry = {"name": name, "kind": "Database", "result": "ok", "error": None}
+        try:
+            # remote_ip=None → the LOCAL data stack is provisioned, on this host.
+            provision_databases(name, dbs, facilities, remote_ip=None)
+        except SystemExit as e:
+            entry["result"] = "failed"
+            entry["error"] = str(e.code) if e.code else "provision failed"
+        out.append(entry)
+    return out
+
+
 def apply_tree(tree: Path, role: str) -> list[dict]:
     """Apply this host's Facilities, then its Deployments (spec §7 steps 6-7).
 
@@ -1383,6 +1423,17 @@ def apply_tree(tree: Path, role: str) -> list[dict]:
                 if kind == "Facility":
                     failed_caps |= _provided_capabilities(manifest)
             results.append(entry)
+    # The placement exception (spec §3.1) runs in addition to the filter above: a
+    # `{placement: app}` deployment is a container/ingress no-op here but its
+    # `spec.databases` fragment is still this host's job when it owns the
+    # facility. A deployment the loop already produced (applied, refused, failed)
+    # was provisioned by `cmd_apply` itself — the sweep must not double it.
+    handled = {r["name"] for r in results if r["kind"] == "Deployment"}
+    results.extend(
+        r
+        for r in provision_remote_databases(tree, role, load_facilities(tree))
+        if r["name"] not in handled
+    )
     return results
 
 
