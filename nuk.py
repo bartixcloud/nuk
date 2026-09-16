@@ -1360,9 +1360,16 @@ def provision_remote_databases(tree: Path, role: str, facilities: list[Facility]
         try:
             # remote_ip=None → the LOCAL data stack is provisioned, on this host.
             provision_databases(name, dbs, facilities, remote_ip=None)
-        except SystemExit as e:
+        except (SystemExit, subprocess.CalledProcessError) as e:
+            # One app's provisioning failure must not abort the cycle (spec §7.5):
+            # `_psql` uses check=True, so a SQL failure (disk full, role/db
+            # conflict, container hiccup) surfaces as CalledProcessError, not
+            # SystemExit. The data host still writes converge-status.json.
             entry["result"] = "failed"
-            entry["error"] = str(e.code) if e.code else "provision failed"
+            if isinstance(e, SystemExit):
+                entry["error"] = str(e.code) if e.code else "provision failed"
+            else:
+                entry["error"] = f"provision failed: {e}"
         out.append(entry)
     return out
 
@@ -1438,10 +1445,15 @@ def apply_tree(tree: Path, role: str) -> list[dict]:
     # facility. A deployment the loop already produced (applied, refused, failed)
     # was provisioned by `cmd_apply` itself — the sweep must not double it.
     handled = {r["name"] for r in results if r["kind"] == "Deployment"}
+    try:
+        facilities = load_facilities(tree)
+    except SystemExit:
+        # An unreadable tree must not fail the whole cycle (spec §7.5): a
+        # malformed facilities/*.yml makes `load` sys.exit, and an unguarded
+        # argument here would abort apply_tree for every other manifest.
+        facilities = []
     results.extend(
-        r
-        for r in provision_remote_databases(tree, role, load_facilities(tree))
-        if r["name"] not in handled
+        r for r in provision_remote_databases(tree, role, facilities) if r["name"] not in handled
     )
     return results
 
@@ -2310,7 +2322,7 @@ def provision_databases(
                 f"{app}: spec.databases needs the fleet DB seed at {DB_SEED_ENV} "
                 f"to derive remote credentials — deliver it via converge.sh"
             )
-        env: dict[str, str] = read_db_env(app)
+        env: dict[str, str] = {}  # remote mode derives fresh; never carry stale keys
         if want_pg:
             driver = pg.get("driver") if isinstance(pg, dict) else None
             scheme = f"postgresql+{driver}" if driver else "postgresql"
@@ -3002,8 +3014,16 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     if org_path.is_file():
         org = load_org(org_path)
     remote_ip = None
-    if org is not None and role != "data":
-        remote_ip = data_host_ip(org)
+    if org is not None:
+        # The remote decision mirrors provision_remote_databases's owner gate
+        # exactly (spec §3.1): this host provisions locally iff it owns the
+        # `databases` capability. Keying on `role != "data"` diverges for an
+        # all-in-one host, which placement_matches treats as owner of every
+        # facility — the two sides must never disagree.
+        owner = env_facility(facilities, _DATABASES_CAPABILITY)
+        owns_databases = owner is not None and placement_matches(owner, role)
+        if not owns_databases:
+            remote_ip = data_host_ip(org)
     db_env = provision_databases(
         name, raw_spec.get("databases") or {}, facilities, remote_ip=remote_ip
     )

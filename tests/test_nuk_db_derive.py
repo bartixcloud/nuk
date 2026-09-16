@@ -8,6 +8,7 @@ import base64
 import hashlib
 import hmac
 import pathlib
+import subprocess
 
 import nuk
 
@@ -18,19 +19,42 @@ def _hkdf_sha256(seed: bytes, info: bytes) -> bytes:
     return hmac.new(prk, info + b"\x01", hashlib.sha256).digest()
 
 
+def test_kdf_literal_vectors_are_pinned():
+    """Literal vectors: a change to BOTH helper and impl must still fail here.
+
+    The KDF is spec-stable (spec §3.1) — a change here is a fleet-wide password
+    rotation. These three values were frozen from the shipped implementation
+    (`derive_db_password`), never invented, so they pin the exact bytes an
+    independent HKDF reimplementation cannot vouch for.
+    """
+    seed32 = bytes(range(32))
+    assert (
+        nuk.derive_db_password(seed32, "pg", "hello")
+        == "Kzb_gLQpy18VnJOKB7B_Q704RbGqmptj24wy5weNanA"
+    )
+    assert (
+        nuk.derive_db_password(seed32, "redis", "hello")
+        == "F5lCHlI6iOlVHTrF549ScdXxRHx0qG0Jls5xzfq4N5o"
+    )
+    assert (
+        nuk.derive_db_password(b"\x00" * 32, "pg", "app-1")
+        == "h6Pg7fU4P9HuNzrhGswIMIpo7IvKCFyg4j9UEHOukfk"
+    )
+
+
 def test_derive_pg_vector_is_stable():
     seed = b"\x01" * 32
-    expected = base64.urlsafe_b64encode(
-        _hkdf_sha256(seed, b"nuk-db:pg:hello")
-    ).rstrip(b"=").decode()
+    expected = (
+        base64.urlsafe_b64encode(_hkdf_sha256(seed, b"nuk-db:pg:hello")).rstrip(b"=").decode()
+    )
     assert nuk.derive_db_password(seed, "pg", "hello") == expected
 
 
 def test_derive_redis_vector_is_stable():
     seed = b"\x02" * 32
-    expected = base64.urlsafe_b64encode(
-        _hkdf_sha256(seed, b"nuk-db:redis:hello")
-    ).rstrip(b"=").decode()
+    expected = (
+        base64.urlsafe_b64encode(_hkdf_sha256(seed, b"nuk-db:redis:hello")).rstrip(b"=").decode()
+    )
     assert nuk.derive_db_password(seed, "redis", "hello") == expected
 
 
@@ -131,18 +155,42 @@ def test_data_host_ip_reads_org_role():
                 "vswitchVlan": 4001,
             },
             "hosts": [
-                {"name": "nuroot-metal", "provider": "manual", "ip": "138.201.203.230",
-                 "role": "hypervisor", "privateIp": "10.0.2.2"},
-                {"name": "nuroot-db", "provider": "incus", "metal": "nuroot-metal",
-                 "privateIp": "10.0.10.180", "role": "data"},
-                {"name": "ingress", "provider": "incus", "metal": "nuroot-metal",
-                 "privateIp": "10.0.10.241", "role": "edge"},
-                {"name": "deploy", "provider": "incus", "metal": "nuroot-metal",
-                 "privateIp": "10.0.10.107", "role": "app"},
+                {
+                    "name": "nuroot-metal",
+                    "provider": "manual",
+                    "ip": "138.201.203.230",
+                    "role": "hypervisor",
+                    "privateIp": "10.0.2.2",
+                },
+                {
+                    "name": "nuroot-db",
+                    "provider": "incus",
+                    "metal": "nuroot-metal",
+                    "privateIp": "10.0.10.180",
+                    "role": "data",
+                },
+                {
+                    "name": "ingress",
+                    "provider": "incus",
+                    "metal": "nuroot-metal",
+                    "privateIp": "10.0.10.241",
+                    "role": "edge",
+                },
+                {
+                    "name": "deploy",
+                    "provider": "incus",
+                    "metal": "nuroot-metal",
+                    "privateIp": "10.0.10.107",
+                    "role": "app",
+                },
             ],
             "facilities": {
-                "dns": "wildcard", "tls": "dns01", "dnsProvider": "hetzner",
-                "secrets": "sops", "auth": "authentik", "runners": "ephemeral",
+                "dns": "wildcard",
+                "tls": "dns01",
+                "dnsProvider": "hetzner",
+                "secrets": "sops",
+                "auth": "authentik",
+                "runners": "ephemeral",
             },
             "mesh": "none",
         }
@@ -183,9 +231,7 @@ def _data_facility(tmp_path):
         encoding="utf-8",
     )
     (f / "data-stack").mkdir(exist_ok=True)
-    (f / "data-stack" / "docker-compose.data.yml").write_text(
-        "services: {}\n", encoding="utf-8"
-    )
+    (f / "data-stack" / "docker-compose.data.yml").write_text("services: {}\n", encoding="utf-8")
     return tmp_path
 
 
@@ -196,7 +242,8 @@ def test_capability_owner_provisions_a_placement_skipped_deployment(tmp_path, mo
     monkeypatch.setattr(nuk, "load_db_seed", lambda: b"\x08" * 32)
     seen = []
     monkeypatch.setattr(
-        nuk, "provision_databases",
+        nuk,
+        "provision_databases",
         lambda app, dbs, facs, *, remote_ip=None: seen.append((app, remote_ip)) or "/x",
     )
     facs = nuk.load_facilities(tree)
@@ -209,7 +256,8 @@ def test_capability_owner_provisions_a_placement_skipped_deployment(tmp_path, mo
 def test_non_owner_does_not_provision(tmp_path, monkeypatch):
     tree = _data_facility(_db_deployment(tmp_path, "hello"))
     monkeypatch.setattr(
-        nuk, "provision_databases",
+        nuk,
+        "provision_databases",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not provision")),
     )
     facs = nuk.load_facilities(tree)
@@ -225,7 +273,8 @@ def test_sweep_is_idempotent_no_rotation(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "load_db_seed", lambda: seed)
     calls = []
     monkeypatch.setattr(
-        nuk, "ensure_postgres",
+        nuk,
+        "ensure_postgres",
         lambda app, prev, driver=None: calls.append(prev) or "postgresql://x",
     )
     monkeypatch.setattr(nuk, "_psql", lambda *a, **k: "")
@@ -235,3 +284,111 @@ def test_sweep_is_idempotent_no_rotation(tmp_path, monkeypatch):
     nuk.provision_remote_databases(tree, "data", facs)
     # derived password is deterministic: the second cycle must converge identically
     assert len(calls) == 2
+
+
+# --- final-review robustness fixes (I-1, I-4, I-3) --------------------------------
+
+
+def test_sweep_catches_called_process_error_not_just_systemexit(tmp_path, monkeypatch):
+    """I-4: `_psql` uses check=True, so a SQL failure raises CalledProcessError.
+
+    The sweep must isolate it to this manifest's `failed` result (spec §7.5)
+    rather than propagate out of apply_tree and abort the data host's cycle.
+    """
+    tree = _data_facility(_db_deployment(tmp_path, "hello"))
+    monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")
+    monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
+    monkeypatch.setattr(nuk, "load_db_seed", lambda: b"\x0a" * 32)
+
+    def boom(*_a, **_k):
+        raise subprocess.CalledProcessError(1, ["docker", "exec", "nuk-postgres", "psql"])
+
+    monkeypatch.setattr(nuk, "provision_databases", boom)
+    out = nuk.provision_remote_databases(tree, "data", nuk.load_facilities(tree))
+    assert [r["name"] for r in out] == ["hello"]
+    assert out[0]["result"] == "failed"
+    assert out[0]["error"].startswith("provision failed:")
+
+
+def test_apply_tree_survives_a_malformed_facility(tmp_path, monkeypatch):
+    """I-1: a malformed facilities/*.yml must not abort apply_tree (spec §7.5).
+
+    The sweep loads facilities as an argument; unguarded, `load` sys.exit
+    propagates out of apply_tree and no converge-status.json is ever written —
+    on every host. The malformed file is recorded as a failed Facility and the
+    still-valid Facility is applied: results are still returned.
+    """
+    tree = _data_facility(_db_deployment(tmp_path, "hello"))
+    (tree / "facilities" / "broken.yml").write_text("kind: Nonsense\n", encoding="utf-8")
+    monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")
+    monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
+    applied = []
+    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp: applied.append(path.stem))
+    results = nuk.apply_tree(tree, "data")  # must not raise
+    by_name = {r["name"]: r for r in results}
+    assert by_name["broken.yml"]["result"] == "failed"
+    assert "not a nuk/v1" in by_name["broken.yml"]["error"]
+    assert by_name["data-stack"]["result"] == "ok"
+    assert applied == ["data-stack"]
+
+
+def _org_with_all_in_one_and_data(tmp_path):
+    (tmp_path / nuk.DEFAULT_ORG_FILE).write_text(
+        "apiVersion: nukorg/v1\n"
+        "kind: Org\n"
+        "metadata: {name: astrojones}\n"
+        "domains: [example.com]\n"
+        "platformDomain: example.com\n"
+        "acmeEmail: admin@example.com\n"
+        "hosts:\n"
+        "  - {name: aio, provider: manual, privateIp: 10.0.10.10, role: all-in-one}\n"
+        "  - {name: db, provider: manual, privateIp: 10.0.10.180, role: data}\n"
+        "facilities: {dns: manual, tls: http01, secrets: generate, auth: basic, runners: none}\n"
+        "mesh: tailscale\n",
+        encoding="utf-8",
+    )
+    return tmp_path
+
+
+def test_all_in_one_owner_derives_local_not_remote(tmp_path, monkeypatch):
+    """I-3: the remote gate is capability ownership, not `role != "data"`.
+
+    An `all-in-one` host owns every placement (placement_matches), so with a
+    separate `data` host in the org it must still provision LOCALLY
+    (remote_ip=None) — exactly mirroring provision_remote_databases's owner
+    gate. The old `role != "data"` predicate would have derived remote here.
+    """
+    tree = _data_facility(_db_deployment(tmp_path, "hello"))
+    _org_with_all_in_one_and_data(tree)
+    (tree / "deployments" / "hello.yml").write_text(
+        "apiVersion: nuk/v1\n"
+        "kind: Deployment\n"
+        "metadata: {name: hello}\n"
+        "spec:\n"
+        "  placement: {role: app}\n"
+        "  source: {repo: 'https://github.com/astrojones/hello.git'}\n"
+        "  databases: {postgres: true}\n"
+        "  ingress:\n"
+        "    - {host: hello.example.com, service: web, port: 8080}\n",
+        encoding="utf-8",
+    )
+    doc = tree / "deployments" / "hello.yml"
+    monkeypatch.setattr(nuk, "read_self", lambda: ("all-in-one", "10.0.10.10"))
+    monkeypatch.setattr(nuk, "DYNAMIC", tree / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tree / "deploys")
+    monkeypatch.setattr(nuk, "project_dir", lambda name: tree / "proj" / name)
+    monkeypatch.setattr(nuk, "sh", lambda *_a, **_k: None)
+    monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
+    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
+    monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
+    monkeypatch.setattr(nuk, "write_ingress", lambda *_a: None)
+    monkeypatch.setattr(nuk, "persist_manifest", lambda *_a: None)
+    monkeypatch.setattr(nuk, "write_provenance", lambda *_a, **_k: None)
+    seen = []
+    monkeypatch.setattr(
+        nuk,
+        "provision_databases",
+        lambda app, dbs, facs, *, remote_ip=None: seen.append(remote_ip) or None,
+    )
+    nuk.cmd_apply(doc, None)
+    assert seen == [None]
