@@ -7,6 +7,7 @@ These tests pin the exact vectors so that change is deliberate, never accidental
 import base64
 import hashlib
 import hmac
+import pathlib
 
 import nuk
 
@@ -79,3 +80,71 @@ def test_ensure_redis_uses_derived_password_when_seeded(monkeypatch):
     pw = nuk.derive_db_password(seed, "redis", "hello")
     assert pw in " ".join(" ".join(map(str, a)) for a in calls)
     assert url == f"redis://hello:{pw}@nuk-redis:6379/0"
+
+
+def test_remote_mode_writes_private_ip_urls(tmp_path, monkeypatch):
+    seed = b"\x07" * 32
+    monkeypatch.setattr(nuk, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk, "load_db_seed", lambda: seed)
+    monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
+
+    def _boom(*a, **k):
+        msg = "remote mode must not touch the local data stack"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(nuk, "preflight_data_stack", _boom)
+    monkeypatch.setattr(nuk, "ensure_postgres", _boom)
+    monkeypatch.setattr(nuk, "ensure_redis", _boom)
+
+    path = nuk.provision_databases(
+        "hello", {"postgres": True, "redis": True}, [], remote_ip="10.0.10.180"
+    )
+    body = pathlib.Path(path).read_text(encoding="utf-8")
+    pg = nuk.derive_db_password(seed, "pg", "hello")
+    rd = nuk.derive_db_password(seed, "redis", "hello")
+    assert f"DATABASE_URL=postgresql://hello:{pg}@10.0.10.180:5432/hello" in body
+    assert f"REDIS_URL=redis://hello:{rd}@10.0.10.180:6379/0" in body
+
+
+def test_remote_mode_without_seed_refuses(monkeypatch):
+    monkeypatch.setattr(nuk, "load_db_seed", lambda: None)
+    monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
+    import pytest
+
+    with pytest.raises(SystemExit, match="seed"):
+        nuk.provision_databases("hello", {"postgres": True}, [], remote_ip="10.0.10.180")
+
+
+def test_data_host_ip_reads_org_role():
+    org = nuk.Org.model_validate(
+        {
+            "apiVersion": "nukorg/v1",
+            "kind": "Org",
+            "metadata": {"name": "astrojones"},
+            "domains": ["jonaheidsick.de"],
+            "platformDomain": "jonaheidsick.de",
+            "acmeEmail": "admin@jonaheidsick.de",
+            "network": {
+                "cidr": "10.0.0.0/16",
+                "cloudSubnet": "10.0.1.0/24",
+                "vswitchSubnet": "10.0.10.0/24",
+                "vswitchVlan": 4001,
+            },
+            "hosts": [
+                {"name": "nuroot-metal", "provider": "manual", "ip": "138.201.203.230",
+                 "role": "hypervisor", "privateIp": "10.0.2.2"},
+                {"name": "nuroot-db", "provider": "incus", "metal": "nuroot-metal",
+                 "privateIp": "10.0.10.180", "role": "data"},
+                {"name": "ingress", "provider": "incus", "metal": "nuroot-metal",
+                 "privateIp": "10.0.10.241", "role": "edge"},
+                {"name": "deploy", "provider": "incus", "metal": "nuroot-metal",
+                 "privateIp": "10.0.10.107", "role": "app"},
+            ],
+            "facilities": {
+                "dns": "wildcard", "tls": "dns01", "dnsProvider": "hetzner",
+                "secrets": "sops", "auth": "authentik", "runners": "ephemeral",
+            },
+            "mesh": "none",
+        }
+    )
+    assert nuk.data_host_ip(org) == "10.0.10.180"

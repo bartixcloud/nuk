@@ -424,7 +424,7 @@ def test_unhealthy_facility_apply_does_not_append_provenance(tmp_path, monkeypat
     monkeypatch.setattr(nuk, "sh", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
     monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
-    monkeypatch.setattr(nuk, "provision_databases", lambda *_a: None)
+    monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
     monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
     monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
@@ -459,7 +459,7 @@ def test_apply_loads_facilities_from_the_tree_root_not_the_manifest_dir(tmp_path
     doc = _manifest(tree, "deployments", "app.yml", DB_DEPLOYMENT)
     seen: list[list] = []
     monkeypatch.setattr(
-        nuk, "provision_databases", lambda _n, _d, facilities: seen.append(facilities)
+        nuk, "provision_databases", lambda _n, _d, facilities, **_k: seen.append(facilities)
     )
     _stub_apply(tmp_path, monkeypatch)
     nuk.cmd_apply(doc, None)
@@ -488,7 +488,7 @@ def test_apply_resolves_the_route_vocabulary_from_the_tree_root(tmp_path, monkey
     doc = _manifest(tree, "deployments", "app.yml", GATED_DEPLOYMENT)
     seen: list[dict] = []
     _stub_apply(tmp_path, monkeypatch, role="all-in-one")
-    monkeypatch.setattr(nuk, "provision_databases", lambda *_a: None)
+    monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "write_ingress", lambda _n, _i, vocab: seen.append(vocab))
     nuk.cmd_apply(doc, None)
     assert seen == [{"auth": ["custom-gate@file"]}]
@@ -505,7 +505,7 @@ def test_apply_of_a_declaration_only_facility_runs_nothing(tmp_path, monkeypatch
     tree = _tree(tmp_path, oauth=ROUTE_ONLY_FACILITY)
     doc = tree / "facilities" / "oauth.yml"
     _stub_apply(tmp_path, monkeypatch, role="edge")
-    monkeypatch.setattr(nuk, "provision_databases", lambda *_a: None)
+    monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
 
     def _forbidden(*args, **_kw):
         pytest.fail(f"a declaration-only facility must run no command, got {args}")
@@ -519,7 +519,7 @@ def test_apply_of_a_sourceless_facility_with_compose_still_needs_its_payload(tmp
     tree = _tree(tmp_path, **{"data-stack": DATA_FACILITY})
     doc = tree / "facilities" / "data-stack.yml"
     _stub_apply(tmp_path, monkeypatch, role="data")
-    monkeypatch.setattr(nuk, "provision_databases", lambda *_a: None)
+    monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
     with pytest.raises(SystemExit, match="nothing to apply"):
         nuk.cmd_apply(doc, None)
 

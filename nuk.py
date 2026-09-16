@@ -77,6 +77,10 @@ DEFAULT_ORG_FILE = "nuklaut.astrocloud.org.yml"
 PG_CONTAINER = "nuk-postgres"
 REDIS_CONTAINER = "nuk-redis"
 
+# The data host's private IP — the port publishes bind here and app hosts point
+# their derived URLs at it (spec §3.1). Resolved from the org manifest at apply.
+DB_REMOTE_HOST = "10.0.10.180"
+
 # The fleet DB seed: delivered by converge.sh via the existing sops channel to
 # the data + app hosts only. Both hosts derive per-app passwords from it, so no
 # credential is ever transported (spec §3.1).
@@ -2196,7 +2200,17 @@ def ensure_redis(app: str, prev_url: str | None) -> str:
     return f"redis://{app}:{pw}@{REDIS_CONTAINER}:6379/0"
 
 
-def provision_databases(app: str, databases: dict, facilities: list[Facility]) -> str | None:
+def data_host_ip(org) -> str | None:
+    """Return the privateIp of the org's `data` host, or None if undeclared."""
+    for h in org.hosts:
+        if h.role == "data":
+            return h.private_ip
+    return None
+
+
+def provision_databases(
+    app: str, databases: dict, facilities: list[Facility], *, remote_ip: str | None = None
+) -> str | None:
     """Provision the databases a manifest requested.
 
     Args:
@@ -2204,6 +2218,9 @@ def provision_databases(app: str, databases: dict, facilities: list[Facility]) -
         databases: The raw `spec.databases` dict.
         facilities: The tree's Facility manifests, to check the `databases`
             env capability is actually declared before binding against it.
+        remote_ip: The data host's private IP when this host is NOT the data
+            host; then this host only derives creds (spec §3.1). None means the
+            local data stack is provisioned, exactly as before.
 
     Returns:
         The path to the creds env-file the override should inject, or None when
@@ -2229,6 +2246,24 @@ def provision_databases(app: str, databases: dict, facilities: list[Facility]) -
             f"provides it. Apply facilities/data-stack.yml first, or drop spec.databases."
         )
     _safe_ident(app)
+    if remote_ip is not None:
+        # The app host derives; it never provisions (spec §3.1 topology condition).
+        seed = load_db_seed()
+        if seed is None:
+            sys.exit(
+                f"{app}: spec.databases needs the fleet DB seed at {DB_SEED_ENV} "
+                f"to derive remote credentials — deliver it via converge.sh"
+            )
+        env: dict[str, str] = read_db_env(app)
+        if want_pg:
+            driver = pg.get("driver") if isinstance(pg, dict) else None
+            scheme = f"postgresql+{driver}" if driver else "postgresql"
+            pw = derive_db_password(seed, "pg", app)
+            env["DATABASE_URL"] = f"{scheme}://{app}:{pw}@{remote_ip}:5432/{app}"
+        if want_redis:
+            pw = derive_db_password(seed, "redis", app)
+            env["REDIS_URL"] = f"redis://{app}:{pw}@{remote_ip}:6379/0"
+        return write_db_env(app, env)
     preflight_data_stack(want_pg, want_redis)
     prev = read_db_env(app)
     env: dict[str, str] = {}
@@ -2906,7 +2941,16 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     if pin_digest:
         _pin_image(name, raw, pin_digest)
     ingress = raw_spec.get("ingress", []) or []
-    db_env = provision_databases(name, raw_spec.get("databases") or {}, facilities)
+    org = None
+    org_path = _tree_root(manifest_path) / DEFAULT_ORG_FILE
+    if org_path.is_file():
+        org = load_org(org_path)
+    remote_ip = None
+    if org is not None and role != "data":
+        remote_ip = data_host_ip(org)
+    db_env = provision_databases(
+        name, raw_spec.get("databases") or {}, facilities, remote_ip=remote_ip
+    )
     db_services = resolve_db_services(name, raw, db_env)
     if db_env and not db_services:
         print(
