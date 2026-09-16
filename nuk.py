@@ -77,10 +77,6 @@ DEFAULT_ORG_FILE = "nuklaut.astrocloud.org.yml"
 PG_CONTAINER = "nuk-postgres"
 REDIS_CONTAINER = "nuk-redis"
 
-# The data host's private IP — the port publishes bind here and app hosts point
-# their derived URLs at it (spec §3.1). Resolved from the org manifest at apply.
-DB_REMOTE_HOST = "10.0.10.180"
-
 # The fleet DB seed: delivered by converge.sh via the existing sops channel to
 # the data + app hosts only. Both hosts derive per-app passwords from it, so no
 # credential is ever transported (spec §3.1).
