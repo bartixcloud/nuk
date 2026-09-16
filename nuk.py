@@ -814,6 +814,7 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
     env_from: list[str] | None = None,
     db_services: list[str] | None = None,
     publish_ip: str | None = None,
+    local_data: bool = True,
 ) -> dict | None:
     """Compose override wiring services to the shared edge/data networks + secrets.
 
@@ -846,6 +847,11 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
             PUBLISH their port on this private IP (so the edge Traefik reaches
             them over the cloud-network) instead of joining the local `edge`
             network. None (the default) => unchanged, edge-network behavior.
+        local_data: True (default) joins the local external ``data`` docker
+            network for DB services — correct when the DB is colocated on this
+            host. False omits it: a CROSS-HOST database (spec §3.1) is reached
+            over TCP at the data host's private IP, and no local ``data``
+            network exists to join.
 
     Returns:
         The override doc, or None when no service needs any wiring.
@@ -873,7 +879,9 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
         is_ingress = svc_name in ingress_services
         is_db = svc_name in db_set
         # Publishing on a private IP replaces the (inert) local `edge` join.
-        nets = (["edge"] if is_ingress and not publish_ip else []) + (["data"] if is_db else [])
+        nets = (["edge"] if is_ingress and not publish_ip else []) + (
+            ["data"] if is_db and local_data else []
+        )
         env_files = [*env_from, *([db_env] if is_db else [])]
         svc: dict = {"networks": nets}
         if publish_ip and svc_name in publish_ports:
@@ -886,7 +894,7 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
     networks: dict = {}
     if not publish_ip and any(s in ingress_services for s in services):
         networks["edge"] = {"external": True}
-    if any(s in db_set for s in services):
+    if any(s in db_set for s in services) and local_data:
         networks["data"] = {"external": True}
     return {"services": services, "networks": networks}
 
@@ -898,9 +906,10 @@ def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override
     env_from: list[str] | None = None,
     db_services: list[str] | None = None,
     publish_ip: str | None = None,
+    local_data: bool = True,
 ) -> None:
     """Render and write `compose.override.yml` for an app (no-op when empty)."""
-    doc = build_override(name, ingress, db_env, env_from, db_services, publish_ip)
+    doc = build_override(name, ingress, db_env, env_from, db_services, publish_ip, local_data)
     if doc is None:
         return
     (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc))
@@ -3021,7 +3030,13 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             f"PRIVATE_IP — cannot publish ingress for the edge to reach"
         )
     write_override(
-        name, ingress, db_env, env_from, db_services, publish_ip=self_ip if edge_term else None
+        name,
+        ingress,
+        db_env,
+        env_from,
+        db_services,
+        publish_ip=self_ip if edge_term else None,
+        local_data=remote_ip is None,
     )
     if edge_term:
         (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)  # inert here; the edge owns it

@@ -478,6 +478,36 @@ def test_override_attach_to_excluding_ingress_keeps_secrets_but_not_db(tmp_path)
     assert ov["services"]["worker"] == {"networks": ["data"], "env_file": [str(secret), db_env]}
 
 
+def test_build_override_remote_db_skips_local_data_network(tmp_path):
+    db_env = str(tmp_path / "app-db.env")
+    ov = nuk.build_override(
+        "app",
+        [{"host": "app.example.com", "service": "web", "port": 8080}],
+        db_env,
+        db_services=["web"],
+        publish_ip="10.0.10.107",
+        local_data=False,
+    )
+    # The creds still reach the container (DATABASE_URL points at 10.0.10.180),
+    # but there is no `data` docker network to join on the app host (spec §3.1).
+    assert ov["services"]["web"]["env_file"] == [db_env]
+    assert "data" not in ov["services"]["web"]["networks"]
+    assert "data" not in (ov.get("networks") or {})
+
+
+def test_build_override_local_db_still_joins_data_network(tmp_path):
+    db_env = str(tmp_path / "app-db.env")
+    ov = nuk.build_override(
+        "app",
+        [{"host": "app.example.com", "service": "web", "port": 8080}],
+        db_env,
+        db_services=["web"],
+        local_data=True,
+    )
+    assert ov["services"]["web"]["networks"] == ["edge", "data"]
+    assert ov["networks"] == {"edge": {"external": True}, "data": {"external": True}}
+
+
 def test_compose_service_names_reads_repo_compose(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
     repo = tmp_path / "app" / "repo"
