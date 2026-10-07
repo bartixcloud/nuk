@@ -2,8 +2,9 @@ name: ci
 
 # Inlined from astrojones/.github's reusable ci.yml (python path, same pins).
 # nuk is a bartixcloud platform repo: its CI must not depend on a tenant org's
-# workflows or self-hosted runners (that one hard-codes [self-hosted, nuklaut],
-# which no bartixcloud runner carries). GitHub-hosted, like release.yml.
+# workflows or runners (that one hard-codes [self-hosted, nuklaut]).
+# Runs on an ephemeral runner from our runner-broker (tenant bartixcloud, tier
+# build). Exactly [self-hosted, build]: any extra label is denied by the broker.
 
 on:
   push:
@@ -15,7 +16,7 @@ permissions:
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, build]
     steps:
       - uses: actions/checkout@v7
 
