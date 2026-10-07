@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """nuk — minimal Kubernetes-shaped Docker Compose deployer.
 
-Manifest (apiVersion: nuk/v1, kind: Deployment) describes one git repo with a
-compose project, optional ingress hosts, and env files. State lives entirely in
-/opt/nuklaut/ on the host; no daemon, no database.
+Manifests (apiVersion: nuk/v1, kind: Deployment | Facility) describe one compose
+project each: its source, ingress, env files, databases, and placement. Deploy
+state lives in /opt/nuklaut/, the convergence loop's state and release history in
+/var/lib/nuk/, host identity and trust anchors in /etc/nuklaut/. No daemon.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
@@ -237,6 +239,10 @@ class Databases(_NullTolerant):
     attach_all: bool = Field(default=False, alias="attachAll")
 
 
+# The host roles a placement can target and an org host can carry (spec §3.1).
+Role = Literal["edge", "data", "app", "hypervisor", "all-in-one"]
+
+
 class Placement(BaseModel):
     """`spec.placement` — the role whose hosts run this manifest's containers.
 
@@ -245,7 +251,7 @@ class Placement(BaseModel):
     converge.sh's retired APPS environment variable.
     """
 
-    role: Literal["edge", "data", "app", "hypervisor", "all-in-one"]
+    role: Role
 
 
 class Health(_NullTolerant):
@@ -437,7 +443,7 @@ class Host(BaseModel):
 
     name: str
     provider: Literal["hcloud", "libvirt", "incus", "metal", "manual"]
-    role: Literal["edge", "data", "app", "hypervisor", "all-in-one"]
+    role: Role
     private_ip: str = Field(alias="privateIp")
     type: str | None = None  # hcloud server type, e.g. cx23
     ip: str | None = None  # public IP for manual/metal hosts
@@ -579,6 +585,10 @@ class Org(BaseModel):
             _check_subnets(self.hosts, self.network)
         return self
 
+    def host_for(self, role: str) -> Host | None:
+        """The host carrying `role`, or None (placement-target roles are singletons)."""
+        return next((h for h in self.hosts if h.role == role), None)
+
 
 def validate_ingress_hosts(org: Org, manifest: Deployment | Facility) -> None:
     """Assert every ingress host in `manifest` ends on one of the org's domains.
@@ -688,6 +698,33 @@ def project_dir(name: str) -> Path:
     return DEPLOYS / name
 
 
+def _manifest_file(name: str) -> Path:
+    """The persisted copy of an app's last applied manifest."""
+    return project_dir(name) / "manifest.yml"
+
+
+def _repo_dir(name: str) -> Path:
+    """An app's cloned or mirrored source tree."""
+    return project_dir(name) / "repo"
+
+
+def _router_file(name: str) -> Path:
+    """An app's Traefik file-provider doc."""
+    return DYNAMIC / f"{name}.yml"
+
+
+def _db_env_path(app: str) -> Path:
+    """An app's DB creds env-file — also the marker that nuk still tracks its database."""
+    return SECRETS / f"{app}-db.env"
+
+
+def _db_env_apps() -> list[str]:
+    """Apps with a DB creds file, deployed or retained."""
+    if not SECRETS.exists():
+        return []
+    return sorted(f.name.removesuffix("-db.env") for f in SECRETS.glob("*-db.env"))
+
+
 def github_url(remote: str) -> str | None:
     """Normalise a git remote (ssh or https) to its github.com web URL, or None."""
     remote = remote.strip()
@@ -699,16 +736,8 @@ def github_url(remote: str) -> str | None:
 
 def git_origin(repo_path: str) -> str | None:
     """github.com web URL for repo_path's origin remote, or None if unavailable."""
-    try:
-        out = subprocess.run(  # noqa: S603  # fixed argv, no shell
-            ["git", "-C", repo_path, "config", "--get", "remote.origin.url"],  # noqa: S607  # git on PATH
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-    except (subprocess.SubprocessError, OSError):
-        return None
-    return github_url(out)
+    out = _git_try(repo_path, "config", "--get", "remote.origin.url")
+    return github_url(out) if out else None
 
 
 def origin_org(repo_path: str = ".") -> str | None:
@@ -772,17 +801,15 @@ def _compose_file(spec: dict) -> str:
 
 def compose_args(name: str, spec: dict) -> list[str]:
     """Build the `docker compose` base argv for an app from its raw spec."""
-    repo = project_dir(name) / "repo"
+    repo = _repo_dir(name)
     spec_body = spec.get("spec") or {}
     cf = _compose_file(spec_body)
     override = project_dir(name) / "compose.override.yml"
     args = ["docker", "compose", "-p", name, "-f", str(repo / cf)]
     if override.exists():
         args += ["-f", str(override)]
-    for envfile in spec_body.get("envFrom", []):
-        ref = envfile.get("secretRef") if isinstance(envfile, dict) else envfile
-        if ref and Path(ref).exists():
-            args += ["--env-file", ref]
+    for ref in resolve_env_from(spec_body):
+        args += ["--env-file", ref]
     return args
 
 
@@ -800,7 +827,7 @@ def resolve_env_from(spec: dict) -> list[str]:
         The existing secret-file paths, in manifest order.
     """
     refs = []
-    for envfile in spec.get("envFrom", []):
+    for envfile in spec.get("envFrom") or []:
         ref = envfile.get("secretRef") if isinstance(envfile, dict) else envfile
         if ref and Path(ref).exists():
             refs.append(ref)
@@ -869,7 +896,7 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
         for ing in ingress:
             svc, port = ing.get("service"), ing.get("port")
             if svc and port is not None:
-                host_port = ing.get("hostPort") or port
+                host_port = _published_port(ing)
                 mapping = f"{publish_ip}:{host_port}:{port}"
                 publish_ports.setdefault(svc, [])
                 if mapping not in publish_ports[svc]:
@@ -897,6 +924,14 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
     if any(s in db_set for s in services) and local_data:
         networks["data"] = {"external": True}
     return {"services": services, "networks": networks}
+
+
+def _published_port(ing: dict) -> int:
+    """The host port a non-entry host publishes an ingress on: `hostPort`, else `port`.
+
+    The publish (build_override) and the edge's backend (backend_address) must agree.
+    """
+    return ing.get("hostPort") or ing["port"]
 
 
 def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override's frozen API
@@ -930,7 +965,7 @@ def compose_service_names(name: str, raw: dict) -> list[str]:
         The compose `services` keys, in file order.
     """
     cf = _compose_file(raw["spec"])
-    path = project_dir(name) / "repo" / cf
+    path = _repo_dir(name) / cf
     if not path.exists():
         return []
     doc = yaml.safe_load(path.read_text()) or {}
@@ -1000,9 +1035,9 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
       stripPrefix strip `path` before proxying (needs path)
       priority    explicit router priority (Traefik else ranks by rule length)
       www         also answer www.<host> with a 301 to <host> (opt-in; apex only)
-      auth        "oauth" -> gate via the oauth2-proxy GitHub forwardAuth chain
-                  (needs an oauth2-proxy /oauth2/ route for <host>)
-                  "basic" -> HTTP Basic Auth (auth@file middleware from global.yml)
+      auth        "oauth"/"basic" -> the middleware chain of the route capability
+                  it maps to (_ROUTE_CAPABILITY), as declared by the facilities in
+                  `vocab` — e.g. the org's oauth2-proxy or Authentik forwardAuth
 
     Args:
         name: The deployment name, used to prefix router/service ids.
@@ -1096,12 +1131,35 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
 
 def write_ingress(name: str, ingress: list[dict], vocab: dict[str, list[str]]) -> None:
     """Render and write the Traefik dynamic file for an app (removes it if empty)."""
-    target = DYNAMIC / f"{name}.yml"
+    target = _router_file(name)
     doc = build_ingress(name, ingress, vocab)
     if doc is None:
         target.unlink(missing_ok=True)
         return
-    target.write_text(yaml.safe_dump(doc))
+    text = yaml.safe_dump(doc)
+    # Every write is an fsnotify event that makes Traefik rebuild its whole dynamic
+    # config, and the loop re-applies every cycle — skip identical content.
+    try:
+        if target.read_text() == text:
+            return
+    except OSError:
+        pass
+    target.write_text(text)
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    """Parse a KEY=VALUE env-file (blank lines and `#` comments skipped).
+
+    Raises:
+        OSError: If the file cannot be read.
+    """
+    out: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, _, v = line.partition("=")
+            out[k.strip()] = v.strip()
+    return out
 
 
 def read_self() -> tuple[str, str | None]:
@@ -1112,17 +1170,11 @@ def read_self() -> tuple[str, str | None]:
     returns ("all-in-one", None): an entry role, so apply keeps writing ingress
     locally and every existing render stays byte-identical.
     """
-    role, private_ip = "all-in-one", None
     try:
-        for raw_line in HOST_ENV.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if line.startswith("ROLE="):
-                role = line[len("ROLE=") :].strip() or role
-            elif line.startswith("PRIVATE_IP="):
-                private_ip = line[len("PRIVATE_IP=") :].strip() or None
+        env = _read_env_file(HOST_ENV)
     except OSError:
-        pass
-    return role, private_ip
+        env = {}
+    return env.get("ROLE") or "all-in-one", env.get("PRIVATE_IP") or None
 
 
 # --- signed-tag trust ----------------------------------------------------------
@@ -1134,19 +1186,29 @@ def read_self() -> tuple[str, str | None]:
 # host verification (2026-08-15) are re-encoded as tests here.
 
 
-def _git(repo: Path, *args: str) -> str:
+def _git(repo: Path | str, *args: str, timeout: float | None = None) -> str:
     """`git -C repo <args>` → stdout, stripped.
 
     Raises:
         subprocess.CalledProcessError: On non-zero exit.
+        subprocess.TimeoutExpired: If `timeout` elapses.
     """
     out = subprocess.run(  # noqa: S603  # fixed argv, no shell
         ["git", "-C", str(repo), *args],  # noqa: S607  # git on PATH
         check=True,
         capture_output=True,
         text=True,
+        timeout=timeout,
     )
     return out.stdout.strip()
+
+
+def _git_try(repo: Path | str, *args: str) -> str | None:
+    """Best-effort `_git` for read-only lookups: None on failure or empty output."""
+    try:
+        return _git(repo, *args, timeout=4) or None
+    except (subprocess.SubprocessError, OSError):
+        return None
 
 
 def _is_ancestor(repo: Path, a: str, b: str) -> bool:
@@ -1346,9 +1408,7 @@ def provision_remote_databases(tree: Path, role: str, facilities: list[Facility]
         try:
             manifest = load(path)
         except SystemExit as e:
-            out.append(
-                {"name": path.name, "kind": "Database", "result": "failed", "error": str(e.code)}
-            )
+            out.append(_result(path.name, "Database", "failed", _exit_reason(e, "load failed")))
             continue
         if manifest.kind != "Deployment":
             continue
@@ -1356,7 +1416,7 @@ def provision_remote_databases(tree: Path, role: str, facilities: list[Facility]
         if not (dbs.get("postgres") or dbs.get("redis")):
             continue
         name = manifest.metadata.name
-        entry = {"name": name, "kind": "Database", "result": "ok", "error": None}
+        entry = _result(name, "Database")
         try:
             # remote_ip=None → the LOCAL data stack is provisioned, on this host.
             provision_databases(name, dbs, facilities, remote_ip=None)
@@ -1367,11 +1427,21 @@ def provision_remote_databases(tree: Path, role: str, facilities: list[Facility]
             # SystemExit. The data host still writes converge-status.json.
             entry["result"] = "failed"
             if isinstance(e, SystemExit):
-                entry["error"] = str(e.code) if e.code else "provision failed"
+                entry["error"] = _exit_reason(e, "provision failed")
             else:
                 entry["error"] = f"provision failed: {e}"
         out.append(entry)
     return out
+
+
+def _result(name: str, kind: str, result: str = "ok", error: str | None = None) -> dict:
+    """One converge-status manifest entry (spec §7.6)."""
+    return {"name": name, "kind": kind, "result": result, "error": error}
+
+
+def _exit_reason(e: SystemExit, default: str) -> str:
+    """The message a SystemExit carried, or `default` for a bare exit."""
+    return str(e.code) if e.code else default
 
 
 def apply_tree(tree: Path, role: str) -> list[dict]:
@@ -1409,34 +1479,26 @@ def apply_tree(tree: Path, role: str) -> list[dict]:
             try:
                 manifest = load(path)
             except SystemExit as e:
-                results.append(
-                    {"name": path.name, "kind": kind, "result": "failed", "error": str(e.code)}
-                )
+                results.append(_result(path.name, kind, "failed", _exit_reason(e, "load failed")))
                 continue
             if manifest.kind != kind or not placement_matches(manifest, role):
                 continue
-            if kind == "Deployment":
+            if isinstance(manifest, Deployment):
                 poisoned = consumes(manifest) & failed_caps
                 if poisoned:
-                    results.append(
-                        {
-                            "name": manifest.metadata.name,
-                            "kind": kind,
-                            "result": "refused",
-                            "error": (
-                                f"consumes {sorted(poisoned)} from a facility that "
-                                f"failed its health gate this cycle (spec §7.5)"
-                            ),
-                        }
+                    reason = (
+                        f"consumes {sorted(poisoned)} from a facility that "
+                        f"failed its health gate this cycle (spec §7.5)"
                     )
+                    results.append(_result(manifest.metadata.name, kind, "refused", reason))
                     continue
-            entry = {"name": manifest.metadata.name, "kind": kind, "result": "ok", "error": None}
+            entry = _result(manifest.metadata.name, kind)
             try:
                 cmd_apply(path, None)
             except SystemExit as e:
                 entry["result"] = "failed"
-                entry["error"] = str(e.code) if e.code else "apply failed"
-                if kind == "Facility":
+                entry["error"] = _exit_reason(e, "apply failed")
+                if isinstance(manifest, Facility):
                     failed_caps |= _provided_capabilities(manifest)
             results.append(entry)
     # The placement exception (spec §3.1) runs in addition to the filter above: a
@@ -1498,7 +1560,7 @@ def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a d
     and by `nuk status`.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
+    payload: dict[str, object] = {
         "tag": tag,
         "commit": commit,
         "role": role,
@@ -1514,10 +1576,7 @@ def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a d
 
 def read_converge_status(path: Path = CONVERGE_STATUS) -> dict | None:
     """The last recorded cycle, or None if absent/unreadable/malformed."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
+    data = _read_json_safe(path)
     return data if isinstance(data, dict) else None
 
 
@@ -1760,14 +1819,14 @@ def backend_address(org: Org, manifest: Deployment, ing: dict) -> str:
             f"cannot resolve a backend without knowing which host runs it."
         )
         raise ValueError(msg)
-    hosts = [h for h in org.hosts if h.role == placement.role]
-    if not hosts:
+    host = org.host_for(placement.role)
+    if host is None:
         msg = (
             f"{manifest.metadata.name}: placement.role={placement.role!r} but the org "
             f"manifest declares no host with role {placement.role!r}."
         )
         raise ValueError(msg)
-    return f"{hosts[0].private_ip}:{ing.get('hostPort') or ing['port']}"
+    return f"{host.private_ip}:{_published_port(ing)}"
 
 
 # The prefix the deleted delivery path used to scope its rsync --delete. Files
@@ -1851,10 +1910,7 @@ def render_edge_routers(tree: Path, org: Org) -> list[str]:
             for ing in ingress
         ]
         name = manifest.metadata.name
-        doc = build_ingress(name, resolved, vocab)
-        if doc is None:
-            continue
-        (DYNAMIC / f"{name}.yml").write_text(yaml.safe_dump(doc))
+        write_ingress(name, resolved, vocab)
         rendered.append(name)
     return rendered
 
@@ -1906,19 +1962,21 @@ def consumes(manifest: Deployment) -> set[str]:
     """
     caps: set[str] = set()
     if any(ing.auth == "oauth" for ing in manifest.spec.ingress):
-        caps.add("auth")
+        caps.add(_ROUTE_CAPABILITY["oauth"])
     db = manifest.spec.databases
     if db.postgres or db.redis:
-        caps.add("databases")
+        caps.add(_DATABASES_CAPABILITY)
     return caps
 
 
 # --- shared databases (postgres + redis) -------------------------------------
 # A deployment opts in via `spec.databases: {postgres: true, redis: true}`. nuk
 # provisions a per-app Postgres role+database (pgvector enabled) and/or a per-app
-# Redis ACL user against the shared data stack, generates credentials ONCE, and
-# stores them in /opt/nuklaut/secrets/<app>-db.env (600). The generated override
-# wires that file (env_file) + the data network onto the app's ingress services,
+# Redis ACL user against the shared data stack — on this host when it owns the
+# `databases` facility, else it only derives the creds for the remote data host
+# (§3.1). Passwords derive from the fleet seed (random-once without one) and land
+# in /opt/nuklaut/secrets/<app>-db.env (600). The generated override wires that
+# file (env_file) onto the DB services (ingress by default, or attachTo/attachAll),
 # so the container starts with DATABASE_URL / REDIS_URL set.
 #
 # Admin paths never need a TCP password: psql uses the container's local-socket
@@ -2002,21 +2060,14 @@ def _chown_deploy(path: Path) -> None:
 
 def read_db_env(app: str) -> dict[str, str]:
     """Read an app's persisted DB creds env-file into a dict (empty if absent)."""
-    path = SECRETS / f"{app}-db.env"
-    out: dict[str, str] = {}
-    if path.exists():
-        for raw_line in path.read_text().splitlines():
-            line = raw_line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, _, v = line.partition("=")
-                out[k.strip()] = v.strip()
-    return out
+    path = _db_env_path(app)
+    return _read_env_file(path) if path.exists() else {}
 
 
 def write_db_env(app: str, env: dict[str, str]) -> str:
     """Write an app's DB creds env-file (600, deploy-owned); return its path."""
     SECRETS.mkdir(parents=True, exist_ok=True)
-    path = SECRETS / f"{app}-db.env"
+    path = _db_env_path(app)
     path.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
     path.chmod(0o600)
     _chown_deploy(path)
@@ -2155,11 +2206,8 @@ def load_db_seed() -> bytes | None:
     """
     if not DB_SEED_ENV.exists():
         return None
-    for raw in DB_SEED_ENV.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if line.startswith("NUK_DB_SEED="):
-            return line[len("NUK_DB_SEED=") :].encode()
-    return None
+    seed = _read_env_file(DB_SEED_ENV).get("NUK_DB_SEED")
+    return seed.encode() if seed is not None else None
 
 
 def derive_db_password(seed: bytes, kind: str, app: str) -> str:
@@ -2191,6 +2239,31 @@ def derive_db_password(seed: bytes, kind: str, app: str) -> str:
     return base64.urlsafe_b64encode(okm).rstrip(b"=").decode()
 
 
+def _db_password(kind: str, app: str, prev_url: str | None) -> str:
+    """Seed-derived when the fleet seed is present, else the previously issued one, else new."""
+    seed = load_db_seed()
+    if seed is not None:
+        return derive_db_password(seed, kind, app)
+    return _pw_from_url(prev_url) or secrets.token_urlsafe(24)
+
+
+def _pg_driver(pg: object) -> str | None:
+    """The driver from raw `spec.databases.postgres` (bare `true` has none)."""
+    driver = pg.get("driver") if isinstance(pg, dict) else None
+    return driver if isinstance(driver, str) else None
+
+
+def _pg_url(app: str, pw: str, host: str, driver: str | None) -> str:
+    """DATABASE_URL for an app's database; `driver` picks the SQLAlchemy scheme suffix."""
+    scheme = f"postgresql+{driver}" if driver else "postgresql"
+    return f"{scheme}://{app}:{pw}@{host}:5432/{app}"
+
+
+def _redis_url(app: str, pw: str, host: str) -> str:
+    """REDIS_URL for an app's ACL user."""
+    return f"redis://{app}:{pw}@{host}:6379/0"
+
+
 def ensure_postgres(app: str, prev_url: str | None, driver: str | None = None) -> str:
     """Idempotently create role + database (pgvector enabled) for `app`.
 
@@ -2211,12 +2284,7 @@ def ensure_postgres(app: str, prev_url: str | None, driver: str | None = None) -
     """
     if driver and not re.fullmatch(r"[a-z][a-z0-9]*", driver):
         sys.exit(f"nuk: invalid postgres driver {driver!r}")
-    seed = load_db_seed()
-    pw = (
-        derive_db_password(seed, "pg", app)
-        if seed is not None
-        else (_pw_from_url(prev_url) or secrets.token_urlsafe(24))
-    )
+    pw = _db_password("pg", app, prev_url)
     _psql(
         f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {_lit(app)}) "
         f'THEN CREATE ROLE "{app}" LOGIN; END IF; END $$;'  # noqa: S608  # app guarded by _safe_ident
@@ -2228,8 +2296,7 @@ def ensure_postgres(app: str, prev_url: str | None, driver: str | None = None) -
     _psql(f'REVOKE CONNECT ON DATABASE "{app}" FROM PUBLIC;')  # noqa: S608  # app guarded
     _psql(f'GRANT CONNECT ON DATABASE "{app}" TO "{app}";')  # noqa: S608  # app guarded
     _psql("CREATE EXTENSION IF NOT EXISTS vector;", db=app)
-    scheme = f"postgresql+{driver}" if driver else "postgresql"
-    return f"{scheme}://{app}:{pw}@{PG_CONTAINER}:5432/{app}"
+    return _pg_url(app, pw, PG_CONTAINER, driver)
 
 
 def ensure_redis(app: str, prev_url: str | None) -> str:
@@ -2246,12 +2313,7 @@ def ensure_redis(app: str, prev_url: str | None) -> str:
     Returns:
         A REDIS_URL for the provisioned user.
     """
-    seed = load_db_seed()
-    pw = (
-        derive_db_password(seed, "redis", app)
-        if seed is not None
-        else (_pw_from_url(prev_url) or secrets.token_urlsafe(24))
-    )
+    pw = _db_password("redis", app, prev_url)
     _redis_admin(
         "ACL",
         "SETUSER",
@@ -2265,15 +2327,13 @@ def ensure_redis(app: str, prev_url: str | None) -> str:
         "-@dangerous",
     )
     _redis_admin("ACL", "SAVE")
-    return f"redis://{app}:{pw}@{REDIS_CONTAINER}:6379/0"
+    return _redis_url(app, pw, REDIS_CONTAINER)
 
 
-def data_host_ip(org) -> str | None:
+def data_host_ip(org: Org) -> str | None:
     """Return the privateIp of the org's `data` host, or None if undeclared."""
-    for h in org.hosts:
-        if h.role == "data":
-            return h.private_ip
-    return None
+    host = org.host_for("data")
+    return host.private_ip if host else None
 
 
 def provision_databases(
@@ -2324,20 +2384,16 @@ def provision_databases(
             )
         env: dict[str, str] = {}  # remote mode derives fresh; never carry stale keys
         if want_pg:
-            driver = pg.get("driver") if isinstance(pg, dict) else None
-            scheme = f"postgresql+{driver}" if driver else "postgresql"
             pw = derive_db_password(seed, "pg", app)
-            env["DATABASE_URL"] = f"{scheme}://{app}:{pw}@{remote_ip}:5432/{app}"
+            env["DATABASE_URL"] = _pg_url(app, pw, remote_ip, _pg_driver(pg))
         if want_redis:
-            pw = derive_db_password(seed, "redis", app)
-            env["REDIS_URL"] = f"redis://{app}:{pw}@{remote_ip}:6379/0"
+            env["REDIS_URL"] = _redis_url(app, derive_db_password(seed, "redis", app), remote_ip)
         return write_db_env(app, env)
     preflight_data_stack(want_pg, want_redis)
     prev = read_db_env(app)
-    env: dict[str, str] = {}
+    env = {}
     if want_pg:
-        driver = pg.get("driver") if isinstance(pg, dict) else None
-        env["DATABASE_URL"] = ensure_postgres(app, prev.get("DATABASE_URL"), driver)
+        env["DATABASE_URL"] = ensure_postgres(app, prev.get("DATABASE_URL"), _pg_driver(pg))
     if want_redis:
         env["REDIS_URL"] = ensure_redis(app, prev.get("REDIS_URL"))
     return write_db_env(app, env)
@@ -2364,7 +2420,7 @@ def purge_databases(app: str) -> None:
     if "REDIS_URL" in env:
         _redis_admin("ACL", "DELUSER", app)
         _redis_admin("ACL", "SAVE")
-    (SECRETS / f"{app}-db.env").unlink(missing_ok=True)
+    _db_env_path(app).unlink(missing_ok=True)
 
 
 # --- provenance-on-apply -------------------------------------------------------
@@ -2390,7 +2446,7 @@ RELEASE_LIMIT = 20
 # created by cloud-init and install_converge (Task 7) and defensively here, so a
 # hand-run `sudo nuk apply` on a pre-loop host still records (spec §8: survives
 # VM rebuild by living on the host's data volume).
-RELEASES = Path("/var/lib/nuk/releases")
+RELEASES = CONVERGE_STATE / "releases"
 
 
 def _iso_utc_now() -> str:
@@ -2420,13 +2476,7 @@ def read_provenance_history(name: str) -> list[dict]:
     """
     path = _releases_path(name)
     if not path.exists():
-        legacy = _provenance_path(name)
-        if not legacy.exists():
-            return []
-        try:
-            data = json.loads(legacy.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return []
+        data = _read_json_safe(_provenance_path(name))
         if isinstance(data, dict):
             return [data]
         if isinstance(data, list):
@@ -2499,17 +2549,7 @@ def write_provenance(
 
 def _full_commit_sha(repo_dir: Path) -> str | None:
     """Full HEAD sha of `repo_dir`'s checkout, or None if unavailable."""
-    try:
-        out = subprocess.run(  # noqa: S603  # fixed argv, no shell
-            ["git", "-C", str(repo_dir), "rev-parse", "HEAD"],  # noqa: S607  # git on PATH
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=4,
-        ).stdout.strip()
-    except (subprocess.SubprocessError, OSError):
-        return None
-    return out or None
+    return _git_try(repo_dir, "rev-parse", "HEAD")
 
 
 def _parse_compose_images_json(text: str) -> list[dict]:
@@ -2576,22 +2616,21 @@ def _read_yaml_safe(path: Path) -> dict | list | None:
         return None
 
 
+def _read_json_safe(path: Path) -> object:
+    """Best-effort JSON read: None on any I/O or parse error, never raises."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
 def _git_provenance(repo_dir: Path) -> dict:
     """Full commit sha + committer date + github web URL for `repo_dir`'s HEAD.
 
     Returns {} when there is no checkout / no commit — the caller degrades that
     field rather than failing.
     """
-    try:
-        out = subprocess.run(  # noqa: S603  # fixed argv, no shell
-            ["git", "-C", str(repo_dir), "log", "-1", "--format=%H%x09%cI"],  # noqa: S607  # git on PATH
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=4,
-        ).stdout.strip()
-    except (subprocess.SubprocessError, OSError):
-        return {}
+    out = _git_try(repo_dir, "log", "-1", "--format=%H%x09%cI")
     if not out:
         return {}
     full_commit, _, date = out.partition("\t")
@@ -2616,26 +2655,11 @@ def _read_version(repo_dir: Path) -> str | None:
         m = _VERSION_RE.search(pyproject.read_text(encoding="utf-8"))
         if m:
             return m.group(1)
-    package_json = repo_dir / "package.json"
-    if package_json.exists():
-        try:
-            data = json.loads(package_json.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            data = None
-        version = data.get("version") if isinstance(data, dict) else None
-        if isinstance(version, str):
-            return version
-    try:
-        out = subprocess.run(  # noqa: S603  # fixed argv, no shell
-            ["git", "-C", str(repo_dir), "describe", "--tags", "--always", "--abbrev=7"],  # noqa: S607
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=4,
-        ).stdout.strip()
-    except (subprocess.SubprocessError, OSError):
-        return None
-    return out or None
+    data = _read_json_safe(repo_dir / "package.json")
+    version = data.get("version") if isinstance(data, dict) else None
+    if isinstance(version, str):
+        return version
+    return _git_try(repo_dir, "describe", "--tags", "--always", "--abbrev=7")
 
 
 def _list_workflows(repo_dir: Path) -> list[dict]:
@@ -2669,7 +2693,7 @@ def _list_workflows(repo_dir: Path) -> list[dict]:
 
 def _dynamic_routers(name: str) -> list[dict] | None:
     """Router id/rule pairs nuk rendered into the Traefik file provider for `name`."""
-    doc = _read_yaml_safe(DYNAMIC / f"{name}.yml")
+    doc = _read_yaml_safe(_router_file(name))
     http = doc.get("http") if isinstance(doc, dict) else None
     routers = http.get("routers") if isinstance(http, dict) else None
     if not routers:
@@ -2700,7 +2724,8 @@ def _probe(host: str, timeout: float = 2.5) -> str | None:
 
 def _annotate_routers(routers: list[dict] | None, hosts: list[str]) -> list[dict]:
     """Attach a best-effort live probe to each router, matched by its rule's host."""
-    live_by_host = {h: _probe(h) for h in hosts}
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        live_by_host = dict(zip(hosts, pool.map(_probe, hosts), strict=True))
     out = []
     for r in routers or []:
         host = next((h for h in hosts if f"`{h}`" in r.get("rule", "")), None)
@@ -2749,7 +2774,7 @@ def _overview_features(spec: dict) -> dict:
     return {
         "postgres": bool(pg),
         "redis": bool(databases.get("redis")),
-        "postgresDriver": pg.get("driver") if isinstance(pg, dict) else None,
+        "postgresDriver": _pg_driver(pg),
     }
 
 
@@ -2762,7 +2787,7 @@ def _overview_provenance(
         (commit, commit_url, repo_url, last_commit, image_digest) — each None
         when its source is unavailable.
     """
-    repo_dir = project_dir(name) / "repo"
+    repo_dir = _repo_dir(name)
     provenance = read_provenance(name)
     git_prov = _git_provenance(repo_dir)
 
@@ -2786,7 +2811,7 @@ def _overview_provenance(
 def _read_app_overview(name: str, *, probe_enabled: bool = False) -> dict:
     """Build one app's Overview entry from on-disk state. Degrades; never raises."""
     notes: list[str] = []
-    manifest_raw = _read_yaml_safe(project_dir(name) / "manifest.yml")
+    manifest_raw = _read_yaml_safe(_manifest_file(name))
     if manifest_raw is None:
         notes.append("manifest.yml unreadable")
     spec = manifest_raw.get("spec") if isinstance(manifest_raw, dict) else None
@@ -2802,7 +2827,7 @@ def _read_app_overview(name: str, *, probe_enabled: bool = False) -> dict:
     if not commit:
         notes.append("no git checkout / commit unavailable")
 
-    repo_dir = project_dir(name) / "repo"
+    repo_dir = _repo_dir(name)
     routers = _dynamic_routers(name)
     routers_out = _annotate_routers(routers, hosts) if probe_enabled else (routers or [])
 
@@ -2976,11 +3001,11 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         if not (repo / ".git").exists():
             shutil.rmtree(repo, ignore_errors=True)
             sh("git", "clone", "--branch", branch, source.repo, str(repo))
-        else:
+        elif pin_commit:
             sh("git", "-C", str(repo), "fetch", "--quiet")
-            if not pin_commit:
-                sh("git", "-C", str(repo), "checkout", branch)
-                sh("git", "-C", str(repo), "pull", "--ff-only", "--quiet")
+        else:
+            sh("git", "-C", str(repo), "checkout", branch)
+            sh("git", "-C", str(repo), "pull", "--ff-only", "--quiet")
         if pin_commit:
             # Rollback. The branch checkout + ff-only pull above is skipped rather
             # than followed by a detach, because pulling first would fetch the very
@@ -3059,7 +3084,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         local_data=remote_ip is None,
     )
     if edge_term:
-        (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)  # inert here; the edge owns it
+        _router_file(name).unlink(missing_ok=True)  # inert here; the edge owns it
     else:
         write_ingress(name, ingress, vocab)
     persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
@@ -3090,28 +3115,27 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         print(f"{name}: provenance not recorded ({e})")
 
 
+def _compose_ps(name: str, fmt: str) -> list[str]:
+    """`docker compose ps` lines for an app's project, one per container."""
+    return (
+        subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["docker", "compose", "-p", name, "ps", "--format", fmt],  # noqa: S607  # docker on PATH
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        .stdout.strip()
+        .splitlines()
+    )
+
+
 def cmd_get() -> None:
     """List deployments with their container state and ingress hosts."""
-    if not DEPLOYS.exists():
-        return
-    for pdir in sorted(p for p in DEPLOYS.iterdir() if p.is_dir()):
-        manifest_file = pdir / "manifest.yml"
-        if not manifest_file.exists():
-            continue
-        manifest = load(manifest_file)
+    for name in _known_deployments():
+        manifest = load(_manifest_file(name))
         hosts = ",".join(i.host for i in manifest.spec.ingress)
-        ps = (
-            subprocess.run(  # noqa: S603  # fixed argv, no shell
-                ["docker", "compose", "-p", pdir.name, "ps", "--format", "{{.State}}"],  # noqa: S607  # docker on PATH
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            .stdout.strip()
-            .replace("\n", ",")
-            or "-"
-        )
-        print(f"{pdir.name:24} {ps:32} {hosts}")
+        ps = ",".join(_compose_ps(name, "{{.State}}")) or "-"
+        print(f"{name:24} {ps:32} {hosts}")
 
 
 def _applied_revision(name: str) -> str:
@@ -3120,16 +3144,10 @@ def _applied_revision(name: str) -> str:
     Workflow-managed deploys mirror their tree with rsync (no `.git`), so they
     have no local revision to report; `-` is returned rather than shelling out.
     """
-    repo = project_dir(name) / "repo"
+    repo = _repo_dir(name)
     if not (repo / ".git").exists():
         return "-"
-    proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
-        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],  # noqa: S607  # git on PATH
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    return proc.stdout.strip() or "-" if proc.returncode == 0 else "-"
+    return _git_try(repo, "rev-parse", "--short", "HEAD") or "-"
 
 
 def cmd_status(name: str) -> None:
@@ -3141,22 +3159,13 @@ def cmd_status(name: str) -> None:
     600 creds file via `read_db_env`, never the raw secret), and the source
     repo/branch plus the last applied git revision.
     """
-    manifest_file = project_dir(name) / "manifest.yml"
+    manifest_file = _manifest_file(name)
     if not manifest_file.exists():
         sys.exit(f"nuk: {name}: no such deployment ({manifest_file} not found)")
     manifest = load(manifest_file)
     source = manifest.spec.source
 
-    ps = (
-        subprocess.run(  # noqa: S603  # fixed argv, no shell
-            ["docker", "compose", "-p", name, "ps", "--format", "{{.Service}}: {{.State}}"],  # noqa: S607
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        .stdout.strip()
-        .splitlines()
-    )
+    ps = _compose_ps(name, "{{.Service}}: {{.State}}")
     print(f"deployment: {name}")
     print("containers:")
     for line in ps or ["(none running)"]:
@@ -3210,14 +3219,14 @@ def cmd_status_overview(
 
 def cmd_logs(name: str) -> None:
     """Follow compose logs for a deployment."""
-    manifest = load(project_dir(name) / "manifest.yml")
+    manifest = load(_manifest_file(name))
     sh(*compose_args(name, manifest.raw), "logs", "-f")
 
 
 def cmd_rollout(name: str) -> None:
     """Git pull + compose pull + up -d for a deployment."""
-    manifest = load(project_dir(name) / "manifest.yml")
-    repo = project_dir(name) / "repo"
+    manifest = load(_manifest_file(name))
+    repo = _repo_dir(name)
     if (repo / ".git").exists():
         sh("git", "-C", str(repo), "pull", "--ff-only")
     # else: workflow-managed deployment — re-trigger the workflow to update the tree.
@@ -3247,7 +3256,7 @@ def _pin_image(name: str, raw: dict, pin_digest: str) -> None:
     resolve the retag targets from the (already detached) compose tree first,
     then `docker pull` the digest — the pull IS the preflight, and its failure
     aborts before anything is written or recreated, leaving the current state
-    running. The runner's pre-pull model (`nuk.py:1818-1820`) already treats the
+    running. The runner's pre-pull model (cmd_apply's "No --pull here") already treats the
     daemon's tags as shared mutable state; this is the same move in the
     opposite direction.
 
@@ -3327,7 +3336,7 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
             f"(a workflow deploy from a .git-less tree) — its compose tree is "
             f"unreproducible, cannot re-apply it"
         )
-    manifest = project_dir(name) / "manifest.yml"
+    manifest = _manifest_file(name)
     if not manifest.exists():
         sys.exit(f"{name}: {manifest} is missing — nothing to re-apply")
     try:
@@ -3354,23 +3363,20 @@ def cmd_delete(name: str, purge: bool) -> None:
     if (pdir / "manifest.yml").exists():
         manifest = load(pdir / "manifest.yml")
         subprocess.run([*compose_args(name, manifest.raw), "down", "-v"], check=False)  # noqa: S603  # argv built from fixed verbs
-    (DYNAMIC / f"{name}.yml").unlink(missing_ok=True)
+    _router_file(name).unlink(missing_ok=True)
     shutil.rmtree(pdir, ignore_errors=True)
     # The app's database is kept by default — its creds file (in SECRETS, not
     # pdir) survives rmtree and keeps nuk aware of it (see `nuk db ls`). --purge
     # is the only path that destroys data.
     if purge:
         purge_databases(name)
-    elif (SECRETS / f"{name}-db.env").exists():
+    elif _db_env_path(name).exists():
         print(f"{name}: database retained. `nuk db ls` to view, `nuk db purge {name}` to drop it.")
 
 
 def cmd_db_ls() -> None:
     """List managed databases; flag retained ones with no live deployment."""
-    if not SECRETS.exists():
-        return
-    for f in sorted(SECRETS.glob("*-db.env")):
-        app = f.name[: -len("-db.env")]
+    for app in _db_env_apps():
         env = read_db_env(app)
         kinds = (
             ",".join(
@@ -3383,7 +3389,7 @@ def cmd_db_ls() -> None:
             )
             or "-"
         )
-        live = (DEPLOYS / app / "manifest.yml").exists()
+        live = (_manifest_file(app)).exists()
         status = "deployed" if live else "RETAINED (no deployment — nuk db purge to drop)"
         print(f"{app:24} {kinds:16} {status}")
 
@@ -3398,7 +3404,7 @@ def cmd_db_purge(name: str) -> None:
 
 
 def _known_deployments() -> list[str]:
-    """List deployment names — the same source `cmd_get` enumerates.
+    """List deployment names (dirs holding a persisted manifest); `cmd_get` iterates these.
 
     Returns empty (never raises) off the controller, where DEPLOYS is absent, so
     shell completion degrades gracefully.
@@ -3419,10 +3425,7 @@ def complete_db_name(incomplete: str) -> list[str]:
     Purge targets a database by its creds file, which outlives the deployment
     (see `cmd_db_ls`), so this enumerates SECRETS rather than live deployments.
     """
-    if not SECRETS.exists():
-        return []
-    names = sorted(f.name[: -len("-db.env")] for f in SECRETS.glob("*-db.env"))
-    return [n for n in names if n.startswith(incomplete)]
+    return [n for n in _db_env_apps() if n.startswith(incomplete)]
 
 
 # --- typer CLI ----------------------------------------------------------------
@@ -3433,7 +3436,7 @@ Manifest (apiVersion: nuk/v1, kind: Deployment):
   spec.ingress[].{host,service,port}, spec.envFrom[].secretRef
   spec.ingress[] also takes optional: path (PathPrefix), stripPrefix,
     priority, www (301 www.<host> -> <host>; apex domains only),
-    auth ("oauth" -> GitHub oauth2-proxy gate, "basic" -> HTTP Basic Auth)
+    auth ("oauth" -> the org's forwardAuth gate, "basic" -> HTTP Basic Auth)
   spec.envFrom[].secretRef -> existing env files injected into each
     ingress service's container env via the compose override (and also
     passed to `docker compose --env-file` for ${VAR} interpolation).
