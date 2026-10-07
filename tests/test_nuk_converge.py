@@ -500,6 +500,7 @@ def test_a_deployment_consuming_a_failed_facility_is_refused(tmp_path, monkeypat
             raise SystemExit(msg)
 
     monkeypatch.setattr(nuk, "cmd_apply", flaky)
+    monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")  # db env files land here
     results = nuk.apply_tree(tree, "app")
     by_name = {r["name"]: r for r in results}
     assert by_name["data-stack"]["result"] == "failed"
