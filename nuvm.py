@@ -59,14 +59,22 @@ def build_create_plan(
         ["qemu-img", "create", "-f", "qcow2", "-F", "qcow2", "-b", str(base), str(overlay)],
         [
             "virt-install",
-            "--name", name,
-            "--vcpus", str(vcpu),
-            "--memory", str(memory_mib),
-            "--disk", f"path={overlay},format=qcow2",
-            "--disk", f"path={seed_path(name)},device=cdrom",
-            "--network", f"network={net},model=virtio",
-            "--os-variant", "debian13",
-            "--graphics", "none",
+            "--name",
+            name,
+            "--vcpus",
+            str(vcpu),
+            "--memory",
+            str(memory_mib),
+            "--disk",
+            f"path={overlay},format=qcow2",
+            "--disk",
+            f"path={seed_path(name)},device=cdrom",
+            "--network",
+            f"network={net},model=virtio",
+            "--os-variant",
+            "debian13",
+            "--graphics",
+            "none",
             "--import",
             "--noautoconsole",
         ],
@@ -79,7 +87,8 @@ def build_seed_iso_plan(name: str) -> list[list[str]]:
     return [
         [
             "cloud-localds",
-            "--network-config", str(d / "network-config"),
+            "--network-config",
+            str(d / "network-config"),
             str(seed_path(name)),
             str(d / "user-data"),
             str(d / "meta-data"),
@@ -218,9 +227,7 @@ def create(
 
 
 @app.command()
-def destroy(
-    name: str, dry_run: Annotated[bool, typer.Option("--dry-run")] = False
-) -> None:
+def destroy(name: str, dry_run: Annotated[bool, typer.Option("--dry-run")] = False) -> None:
     """Destroy + undefine a VM and delete its state (tolerant)."""
     run_plan(build_destroy_plan(name), dry_run=dry_run, tolerant=True)
 

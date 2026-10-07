@@ -288,9 +288,7 @@ def test_sourceless_facility_without_payload_refuses(tmp_path, monkeypatch):
 def test_declaration_only_facility_without_spec_applies(tmp_path, monkeypatch):
     """A Facility with no `spec:` at all is valid; cmd_apply must not KeyError on raw["spec"]."""
     doc = tmp_path / "decl.yml"
-    doc.write_text(
-        "apiVersion: nuk/v1\nkind: Facility\nmetadata: {name: decl}\n", encoding="utf-8"
-    )
+    doc.write_text("apiVersion: nuk/v1\nkind: Facility\nmetadata: {name: decl}\n", encoding="utf-8")
     monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
     monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
     monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")

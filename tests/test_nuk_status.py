@@ -518,7 +518,9 @@ def test_resolve_image_digest_degrades_when_docker_unavailable(monkeypatch):
 
 def test_resolve_image_digest_degrades_on_empty_images_output(monkeypatch):
     monkeypatch.setattr(
-        nuk.subprocess, "run", lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout="")  # noqa: ARG005
+        nuk.subprocess,
+        "run",
+        lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout=""),  # noqa: ARG005
     )
     assert nuk._resolve_image_digest("app", {"spec": {}}) is None
 
@@ -538,9 +540,7 @@ def test_parse_compose_images_json_single_null_array_is_empty():
 
 
 def test_parse_compose_images_json_drops_null_rows_keeps_dicts():
-    assert nuk._parse_compose_images_json('[{"Repository":"x"},null]') == [
-        {"Repository": "x"}
-    ]
+    assert nuk._parse_compose_images_json('[{"Repository":"x"},null]') == [{"Repository": "x"}]
 
 
 def test_parse_compose_images_json_parses_json_lines_skipping_blanks():

@@ -23,9 +23,7 @@ def test_memory_to_mib_rejects_garbage() -> None:
 
 def test_is_placeholder_user_data() -> None:
     assert nuvm._is_placeholder_user_data("#cloud-config\n") is True
-    assert nuvm._is_placeholder_user_data(
-        "#cloud-config\nusers:\n  - name: ops\n"
-    ) is False
+    assert nuvm._is_placeholder_user_data("#cloud-config\nusers:\n  - name: ops\n") is False
 
 
 def test_build_create_plan_overlay_then_virtinstall() -> None:
@@ -56,15 +54,24 @@ def test_seed_iso_plan_uses_cloud_localds() -> None:
 
 
 def _host(**kw):
-    base = {"name": "nuroot-db", "provider": "libvirt", "metal": "nuroot-metal",
-            "role": "data", "privateIp": "10.10.2.3", "vcpu": 4, "memory": "16G"}
+    base = {
+        "name": "nuroot-db",
+        "provider": "libvirt",
+        "metal": "nuroot-metal",
+        "role": "data",
+        "privateIp": "10.10.2.3",
+        "vcpu": 4,
+        "memory": "16G",
+    }
     base.update(kw)
     return nuk.Host.model_validate(base)
 
 
 def test_render_substitutes_known_vars_only() -> None:
-    out = nuvm._render("host=${HOSTNAME} role=${ROLE} keep=${UNKNOWN} lit=$$X",
-                       {"HOSTNAME": "nuroot-db", "ROLE": "data"})
+    out = nuvm._render(
+        "host=${HOSTNAME} role=${ROLE} keep=${UNKNOWN} lit=$$X",
+        {"HOSTNAME": "nuroot-db", "ROLE": "data"},
+    )
     assert "host=nuroot-db" in out
     assert "role=data" in out
     assert "${UNKNOWN}" in out
@@ -86,27 +93,58 @@ def test_render_meta_data_has_hostname() -> None:
 
 
 ORG = {
-    "apiVersion": "nukorg/v1", "kind": "Org", "metadata": {"name": "astrojones"},
-    "domains": ["astrojones.guru"], "platformDomain": "astrojones.guru",
+    "apiVersion": "nukorg/v1",
+    "kind": "Org",
+    "metadata": {"name": "astrojones"},
+    "domains": ["astrojones.guru"],
+    "platformDomain": "astrojones.guru",
     "acmeEmail": "a@astrojones.guru",
-    "network": {"cidr": "10.10.0.0/16", "cloudSubnet": "10.10.1.0/24",
-                "vswitchSubnet": "10.10.2.0/24", "vswitchVlan": 4001},
+    "network": {
+        "cidr": "10.10.0.0/16",
+        "cloudSubnet": "10.10.1.0/24",
+        "vswitchSubnet": "10.10.2.0/24",
+        "vswitchVlan": 4001,
+    },
     "hosts": [
-        {"name": "hcbase", "provider": "hcloud", "type": "cx23", "role": "edge",
-         "privateIp": "10.10.1.2"},
-        {"name": "nuroot-metal", "provider": "manual", "ip": "1.2.3.4",
-         "role": "hypervisor", "privateIp": "10.10.2.2"},
-        {"name": "nuroot-db", "provider": "libvirt", "metal": "nuroot-metal",
-         "role": "data", "privateIp": "10.10.2.3", "vcpu": 4, "memory": "16G"},
+        {
+            "name": "hcbase",
+            "provider": "hcloud",
+            "type": "cx23",
+            "role": "edge",
+            "privateIp": "10.10.1.2",
+        },
+        {
+            "name": "nuroot-metal",
+            "provider": "manual",
+            "ip": "1.2.3.4",
+            "role": "hypervisor",
+            "privateIp": "10.10.2.2",
+        },
+        {
+            "name": "nuroot-db",
+            "provider": "libvirt",
+            "metal": "nuroot-metal",
+            "role": "data",
+            "privateIp": "10.10.2.3",
+            "vcpu": 4,
+            "memory": "16G",
+        },
     ],
-    "facilities": {"dns": "wildcard", "tls": "dns01", "dnsProvider": "hetzner",
-                   "secrets": "sops", "auth": "authentik", "runners": "ephemeral"},
+    "facilities": {
+        "dns": "wildcard",
+        "tls": "dns01",
+        "dnsProvider": "hetzner",
+        "secrets": "sops",
+        "auth": "authentik",
+        "runners": "ephemeral",
+    },
     "mesh": "tailscale",
 }
 
 
 def _org(tmp_path):
     import yaml
+
     p = tmp_path / "org.yml"
     p.write_text(yaml.safe_dump(ORG))
     return nuk.load_org(p)
@@ -130,6 +168,7 @@ def test_net_for_ephemeral_is_nat_ci(tmp_path) -> None:
 
 def test_cli_up_dry_run_prints_plan(tmp_path) -> None:
     import yaml
+
     org = tmp_path / "org.yml"
     org.write_text(yaml.safe_dump(ORG))
     r = runner.invoke(nuvm.app, ["up", "nuroot-db", "--org-file", str(org), "--dry-run"])
@@ -141,6 +180,7 @@ def test_cli_up_dry_run_prints_plan(tmp_path) -> None:
 
 def test_up_refuses_placeholder_real_run(tmp_path, monkeypatch) -> None:
     import yaml
+
     monkeypatch.setattr(nuvm, "INSTANCES", tmp_path)
     org = tmp_path / "org.yml"
     org.write_text(yaml.safe_dump(ORG))
@@ -150,7 +190,8 @@ def test_up_refuses_placeholder_real_run(tmp_path, monkeypatch) -> None:
 
 
 def test_cli_create_ephemeral_dry_run_uses_nat_ci(tmp_path) -> None:
-    r = runner.invoke(nuvm.app, ["create", "scratch1", "--cpu", "2", "--mem", "2G",
-                                 "--ephemeral", "--dry-run"])
+    r = runner.invoke(
+        nuvm.app, ["create", "scratch1", "--cpu", "2", "--mem", "2G", "--ephemeral", "--dry-run"]
+    )
     assert r.exit_code == 0, r.output
     assert "network=nat-ci" in r.output

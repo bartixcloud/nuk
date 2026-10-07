@@ -554,7 +554,11 @@ def test_consumes_gains_no_row_for_logs():
     fail-closed coupling this spec forbids.
     """
     dep = nuk.Deployment.model_validate(
-        {"apiVersion": "nuk/v1", "kind": "Deployment", "metadata": {"name": "x"},
-         "spec": {"source": {"repo": "git@github.com:a/b.git"}}}
+        {
+            "apiVersion": "nuk/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "x"},
+            "spec": {"source": {"repo": "git@github.com:a/b.git"}},
+        }
     )
     assert nuk.consumes(dep) == set()

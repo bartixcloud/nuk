@@ -688,11 +688,13 @@ def test_the_edge_records_the_logging_facility_health(loop, monkeypatch):
     monkeypatch.setattr(nuk, "load_org", lambda path: "ORG")
     monkeypatch.setattr(nuk, "render_edge_routers", lambda tree, org: [])
     monkeypatch.setattr(
-        nuk, "env_facility",
+        nuk,
+        "env_facility",
         lambda facilities, capability: facilities[0] if capability == "logs" else None,
     )
     monkeypatch.setattr(
-        nuk, "load_facilities",
+        nuk,
+        "load_facilities",
         lambda tree: [object()],  # any manifest — env_facility is stubbed
     )
     monkeypatch.setattr(nuk, "facility_health", lambda manifest: None)
@@ -706,7 +708,8 @@ def test_a_non_edge_host_records_no_logging_line(loop, monkeypatch):
     repo, signers, state = loop
     monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
     monkeypatch.setattr(
-        nuk, "env_facility",
+        nuk,
+        "env_facility",
         lambda *a, **k: pytest.fail("must not resolve logging off the edge"),
     )
     assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
@@ -721,12 +724,8 @@ def test_an_unhealthy_logging_facility_is_recorded_not_refused(loop, monkeypatch
     monkeypatch.setattr(nuk, "load_org", lambda path: "ORG")
     monkeypatch.setattr(nuk, "render_edge_routers", lambda tree, org: [])
     monkeypatch.setattr(nuk, "env_facility", lambda facilities, capability: object())
-    monkeypatch.setattr(
-        nuk, "load_facilities", lambda tree: [object()]
-    )
-    monkeypatch.setattr(
-        nuk, "facility_health", lambda manifest: "container 'loki' is not running"
-    )
+    monkeypatch.setattr(nuk, "load_facilities", lambda tree: [object()])
+    monkeypatch.setattr(nuk, "facility_health", lambda manifest: "container 'loki' is not running")
     assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
     data = nuk.read_converge_status(state / "converge-status.json")
     assert data["logging"]["healthy"] is False
