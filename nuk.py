@@ -675,6 +675,101 @@ def load_org(path: Path) -> Org:
         sys.exit(f"{path}: invalid nukorg/v1 Org\n{e}")
 
 
+# --- tenant registry (bartixcloud/infra/tenants.yml, contracts C2) ------------------
+# The platform repo owns the schema and its validator. nuk models only the fields it
+# consumes and re-checks the invariant its own isolation depends on: unique names and
+# no two tenants claiming the same domain (spec §4 anti-hijack).
+
+TENANTS_FILE = "tenants.yml"
+
+
+class TenantRow(BaseModel):
+    """One `tenants[]` row, as far as nuk reads it."""
+
+    name: str = Field(pattern=r"^[a-z0-9-]+$")
+    edge: Literal["shared", "passthrough"]
+    domains: list[str] = []
+    signer_principal: str = Field(pattern=r"^[a-z0-9-]+$")
+
+
+def _domains_overlap(x: str, y: str) -> bool:
+    """Whether two domain entries can name the same host (`*.` = any depth, never the apex)."""
+    x, y = x.lower(), y.lower()
+    if x.startswith("*.") and y.startswith("*."):
+        return x.endswith(y[1:]) or y.endswith(x[1:])
+    if x.startswith("*."):
+        return y.endswith(x[1:])
+    if y.startswith("*."):
+        return x.endswith(y[1:])
+    return x == y
+
+
+class TenantRegistry(BaseModel):
+    """The `tenants:` list of tenants.yml."""
+
+    tenants: list[TenantRow]
+
+    @model_validator(mode="after")
+    def _check_unique(self) -> TenantRegistry:
+        """Refuse duplicate tenant names and any domain two tenants could both match.
+
+        Raises:
+            ValueError: On either violation.
+        """
+        names = [t.name for t in self.tenants]
+        if len(names) != len(set(names)):
+            msg = "tenants[].name must be unique"
+            raise ValueError(msg)
+        for i, a in enumerate(self.tenants):
+            for b in self.tenants[i + 1 :]:
+                for da in a.domains:
+                    for db in b.domains:
+                        if _domains_overlap(da, db):
+                            msg = (
+                                f"domains overlap between tenants {a.name!r} and {b.name!r}: "
+                                f"{da!r} / {db!r}"
+                            )
+                            raise ValueError(msg)
+        return self
+
+    def get(self, name: str) -> TenantRow | None:
+        """The row for tenant `name`, or None."""
+        return next((t for t in self.tenants if t.name == name), None)
+
+
+def load_tenants(tree: Path) -> TenantRegistry:
+    """Parse `<tree>/tenants.yml` (the platform tree).
+
+    Raises:
+        SystemExit: If the file is unreadable or invalid.
+    """
+    path = tree / TENANTS_FILE
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        sys.exit(f"{path}: {e}")
+    try:
+        return TenantRegistry.model_validate(raw)
+    except ValidationError as e:
+        sys.exit(f"{path}: invalid tenants registry\n{e}")
+
+
+def host_in_domains(host: str, domains: list[str]) -> bool:
+    """Whether `host` is one of `domains` (spec §4 anti-hijack rule).
+
+    An entry matches exactly, or — written `*.example.com` — matches any subdomain
+    of example.com at any depth, never the apex itself.
+    """
+    h = host.lower()
+    for d in (x.lower() for x in domains):
+        if d.startswith("*."):
+            if h.endswith(d[1:]):
+                return True
+        elif h == d:
+            return True
+    return False
+
+
 def org_get(org: Org, dotted: str) -> object:
     """Return a value from an Org by dotted alias path (e.g. `facilities.auth`).
 
@@ -1809,8 +1904,10 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
 def _apply_source(src: SourceEntry, ctx: TreeContext, block: dict, state_dir: Path) -> None:
     """Apply a prepared source: manifests, then routes; record it applied only if all went well."""
     block["manifests"] = apply_tree(ctx)
-    if "routes" in src.apply and ctx.role in _ENTRY_ROLES and ctx.org is not None:
-        block["rendered"] = render_edge_routers(ctx.tree, ctx.org)
+    if "routes" in src.apply and ctx.role in _ENTRY_ROLES:
+        routes = render_routes(ctx)
+        block["rendered"] = routes.rendered
+        block["refusedRoutes"] = routes.refused
     record_applied(
         block["tag"], block["commit"], source_state_dir(state_dir, src.name) / "last-applied-tag"
     )
@@ -2141,6 +2238,7 @@ class TreeContext:
     apply: frozenset[str]
     facilities: list[Facility]
     org: Org | None
+    tenants: TenantRegistry | None
 
     @classmethod
     def build(  # noqa: PLR0913  # one field per attribute; a wrapper object buys nothing
@@ -2156,6 +2254,7 @@ class TreeContext:
         """Load the platform-wide inputs from `platform` (default: `tree` itself)."""
         base = platform or tree
         org_path = base / DEFAULT_ORG_FILE
+        tenants_path = base / TENANTS_FILE
         return cls(
             tree=tree,
             role=role,
@@ -2164,6 +2263,7 @@ class TreeContext:
             apply=apply,
             facilities=load_facilities(base, lenient=True),
             org=load_org(org_path) if org_path.is_file() else None,
+            tenants=load_tenants(base) if tenants_path.is_file() else None,
         )
 
     @classmethod
@@ -2243,8 +2343,18 @@ def reap_legacy_worker_routers(protected: set[str] | None = None) -> list[str]:
     return reaped
 
 
-def render_edge_routers(tree: Path, org: Org) -> list[str]:
-    """On the edge: render a router for EVERY Deployment with ingress.
+@dataclass(frozen=True)
+class RouteResult:
+    """What one source's edge rendering wrote, and what the tenant allowlist refused."""
+
+    rendered: list[str]
+    refused: list[str]
+
+
+def _render_routers(
+    tree: Path, org: Org, *, tenant: str | None, domains: list[str] | None
+) -> RouteResult:
+    """On the edge: render a router for EVERY Deployment with ingress (spec §6).
 
     Cross-host router delivery is gone. The edge reads the same git tree every
     host reads and resolves each backend from the org manifest, so the app host
@@ -2257,9 +2367,13 @@ def render_edge_routers(tree: Path, org: Org) -> list[str]:
     Args:
         tree: Root of the manifest tree the loop pulled.
         org: The validated org manifest, source of every backend private IP.
+        tenant: The source's tenant name, or None for the platform source.
+        domains: The tenant allowlist (spec §4 anti-hijack). When set, an ingress
+            whose host is in no allowed domain is REFUSED — recorded, never written.
+            None (the platform source) writes every host.
 
     Returns:
-        The names of the deployments whose routers were written.
+        The router names written and the refusal lines (one per foreign host).
     """
     DYNAMIC.mkdir(parents=True, exist_ok=True)
     deployments = load_deployments(tree)
@@ -2268,6 +2382,7 @@ def render_edge_routers(tree: Path, org: Org) -> list[str]:
         print(f"edge: reaped legacy router {stale} (cross-host delivery is retired)")
     vocab = route_vocabulary(load_facilities(tree))
     rendered: list[str] = []
+    refused: list[str] = []
     for manifest in deployments:
         ingress = manifest.raw.get("spec", {}).get("ingress") or []
         if not ingress:
@@ -2279,6 +2394,19 @@ def render_edge_routers(tree: Path, org: Org) -> list[str]:
         placement = manifest.spec.placement
         if placement is not None and placement.role in _ENTRY_ROLES:
             continue
+        if domains is not None:
+            allowed = []
+            for ing in ingress:
+                host = str(ing.get("host", ""))
+                if host_in_domains(host, domains):
+                    allowed.append(ing)
+                else:
+                    line = f"REFUSED route {host}: not in tenant {tenant} domains"
+                    refused.append(line)
+                    print(line, file=sys.stderr)
+            if not allowed:
+                continue
+            ingress = allowed
         resolved = [
             {k: v for k, v in ing.items() if k not in {"service", "port", "hostPort"}}
             | {"address": backend_address(org, manifest, ing)}
@@ -2287,7 +2415,30 @@ def render_edge_routers(tree: Path, org: Org) -> list[str]:
         name = manifest.metadata.name
         write_ingress(name, resolved, vocab)
         rendered.append(name)
-    return rendered
+    return RouteResult(rendered, refused)
+
+
+def render_edge_routers(tree: Path, org: Org) -> list[str]:
+    """The platform edge render: every host, no tenant allowlist. Returns the names written."""
+    return _render_routers(tree, org, tenant=None, domains=None).rendered
+
+
+def render_routes(ctx: TreeContext) -> RouteResult:
+    """On the edge: render ONE source's routers, applying the tenant domain allowlist.
+
+    The platform source (ctx.tenant is None) is unconstrained — it owns the platform
+    domains. A tenant source may only route hosts in its own `domains` from the
+    platform tenants.yml (spec §4 anti-hijack); a tenant missing from the registry, or
+    a platform tree with no tenants.yml, gets an empty allowlist and routes nothing
+    (fail-closed).
+    """
+    if ctx.org is None:
+        return RouteResult([], [])
+    domains: list[str] | None = None
+    if ctx.tenant is not None:
+        row = ctx.tenants.get(ctx.tenant) if ctx.tenants is not None else None
+        domains = row.domains if row is not None else []
+    return _render_routers(ctx.tree, ctx.org, tenant=ctx.tenant, domains=domains)
 
 
 def facility_health(manifest: Facility) -> str | None:
