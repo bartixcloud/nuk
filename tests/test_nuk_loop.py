@@ -60,6 +60,14 @@ facilities:
 mesh: tailscale
 """
 
+TENANTS = """\
+tenants:
+  - name: astrojones
+    edge: shared
+    domains: [hello.bitcoinalchemist.com, pd.jonaheidsick.de, fasdemo.jonaheidsick.de]
+    signer_principal: astrojones
+"""
+
 BASIC_FACILITY = """\
 apiVersion: nuk/v1
 kind: Facility
@@ -88,6 +96,7 @@ def platform_files() -> dict[str, str]:
     """The files of the platform (bartixcloud/infra) tree as relative path -> content."""
     return {
         nuk.DEFAULT_ORG_FILE: ORG,
+        "tenants.yml": TENANTS,
         "facilities/basic.yml": BASIC_FACILITY,
         "facilities/data-stack.yml": DATA_STACK,
     }
@@ -442,6 +451,59 @@ def test_a_non_edge_host_records_no_logging_line(fleet, monkeypatch):
     monkeypatch.setattr(nuk, "facility_health", lambda m: pytest.fail("not off the edge"))
     assert fleet.converge() == 0
     assert "logging" not in fleet.status()
+
+
+# --- the edge: the tenant domain allowlist (spec §4 anti-hijack) ------------------------
+
+
+def _edge_routes(fleet, monkeypatch):
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    fleet.use(("bartixcloud", ["facilities"]), ("astrojones", ["deployments", "routes"]))
+
+
+def test_a_tenant_route_in_its_domains_is_rendered(fleet, monkeypatch):
+    _edge_routes(fleet, monkeypatch)
+    assert fleet.converge() == 0
+    block = fleet.status()["sources"]["astrojones"]
+    assert block["rendered"] == ["hello"]
+    assert block["refusedRoutes"] == []
+    assert (nuk.DYNAMIC / "hello.yml").is_file()
+
+
+def test_a_tenant_route_for_a_foreign_host_is_refused(fleet, monkeypatch):
+    _edge_routes(fleet, monkeypatch)
+    fleet.origins["astrojones"].release(
+        "v1.1.0",
+        {
+            "deployments/steal.yml": HELLO.replace(
+                "hello.bitcoinalchemist.com", "kolbeapp.de"
+            ).replace("name: hello", "name: steal")
+        },
+    )
+    assert fleet.converge() == 0
+    block = fleet.status()["sources"]["astrojones"]
+    assert block["rendered"] == ["hello"]  # only the in-domain route
+    assert block["refusedRoutes"] == ["REFUSED route kolbeapp.de: not in tenant astrojones domains"]
+    assert not (nuk.DYNAMIC / "steal.yml").exists()
+    assert (nuk.DYNAMIC / "hello.yml").is_file()
+
+
+def test_a_tenant_missing_from_the_registry_routes_nothing(
+    tmp_path, monkeypatch, platform_files, signing_keys
+):
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
+    no_tenants = {k: v for k, v in platform_files.items() if k != "tenants.yml"}
+    f = Fleet(tmp_path, no_tenants, signing_keys)
+    f.use(("bartixcloud", ["facilities"]), ("astrojones", ["deployments", "routes"]))
+    assert f.converge() == 0
+    block = f.status()["sources"]["astrojones"]
+    assert block["rendered"] == []
+    assert block["refusedRoutes"] == [
+        "REFUSED route hello.bitcoinalchemist.com: not in tenant astrojones domains"
+    ]
 
 
 # --- reap -------------------------------------------------------------------------------
