@@ -18,7 +18,11 @@ permissions:
 
 jobs:
   release:
-    uses: astrojones/.github/.github/workflows/release.yml@main
+    # Pinned by SHA, not by a moving branch: astrojones is a tenant org, and its members must not
+    # be able to change what runs in this job — which holds contents: write on a
+    # platform repo — at a moment of their choosing (G23). Bump deliberately:
+    #   gh api repos/astrojones/.github/commits/main --jq .sha
+    uses: astrojones/.github/.github/workflows/release.yml@666b59db72c57051a7e15c453009f6696ffff07d
     secrets: inherit
     with:
       # The reusable workflow defaults to '["self-hosted","nuklaut"]', a runner only
