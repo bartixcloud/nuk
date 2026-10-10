@@ -13,7 +13,9 @@ the wrong reason.
 
 from __future__ import annotations
 
+import shlex
 import subprocess
+from pathlib import Path
 
 import nuk
 import pytest
@@ -730,3 +732,177 @@ def test_an_unhealthy_logging_facility_is_recorded_not_refused(loop, monkeypatch
     data = nuk.read_converge_status(state / "converge-status.json")
     assert data["logging"]["healthy"] is False
     assert "loki" in data["logging"]["detail"]
+
+
+# --- sources.yml and per-source sync (contracts C3) ---------------------------------
+
+SOURCES_YML = """\
+sources:
+  - name: astrojones
+    repo: git@github.com:astrojones/infra.git
+    deploy_key: /etc/nuklaut/keys/astrojones
+    apply: [routes]
+  - name: bartixcloud
+    repo: git@github.com:bartixcloud/infra.git
+    deploy_key: /etc/nuklaut/keys/bartixcloud
+    apply: [facilities, routes]
+"""
+
+
+def _sources(tmp_path, body):
+    p = tmp_path / "sources.yml"
+    p.write_text(body, encoding="utf-8")
+    return p
+
+
+def test_load_sources_orders_the_platform_first(tmp_path):
+    sources = nuk.load_sources(_sources(tmp_path, SOURCES_YML))
+    assert [s.name for s in sources.ordered()] == ["bartixcloud", "astrojones"]
+    assert sources.ordered()[0].is_platform is True
+
+
+@pytest.mark.parametrize(
+    ("old", "new", "match"),
+    [
+        ("apply: [routes]", "apply: [facilities]", "exactly one source"),
+        ("apply: [facilities, routes]", "apply: [routes]", "exactly one source"),
+        ("name: astrojones", "name: bartixcloud", "must be unique"),
+        ("apply: [routes]", "apply: [roles]", "apply"),
+        ("apply: [facilities, routes]", "apply: [facilities, databases]", "cannot apply"),
+        ("deploy_key: /etc/nuklaut/keys/astrojones", "deploy_key: /k\n    rogue: 1", "rogue"),
+    ],
+)
+def test_load_sources_refuses(tmp_path, old, new, match):
+    with pytest.raises(ValueError, match=match):
+        nuk.load_sources(_sources(tmp_path, SOURCES_YML.replace(old, new, 1)))
+
+
+def test_load_sources_refuses_a_missing_file(tmp_path):
+    with pytest.raises(ValueError, match=r"absent\.yml"):
+        nuk.load_sources(tmp_path / "absent.yml")
+
+
+def test_git_ssh_command_pins_the_deploy_key_and_the_host_key():
+    argv = shlex.split(nuk.git_ssh_command(Path("/k/with space")))
+    assert argv[:3] == ["ssh", "-i", "/k/with space"]
+    assert "IdentitiesOnly=yes" in argv
+    assert "StrictHostKeyChecking=yes" in argv
+    assert f"UserKnownHostsFile={nuk.KNOWN_HOSTS}" in argv
+    assert "BatchMode=yes" in argv
+
+
+@pytest.fixture
+def principals(tmp_path):
+    """Two signing keys (astrojones, kolbeapp-de) and a signers dir with one file per source."""
+    keys = {}
+    signers_dir = tmp_path / "allowed_signers.d"
+    signers_dir.mkdir()
+    for name in ("astrojones", "kolbeapp-de"):
+        key = tmp_path / f"key-{name}"
+        _run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", name, "-f", str(key))
+        keys[name] = key.with_suffix(".pub")
+        (signers_dir / name).write_text(
+            f"{name} {keys[name].read_text(encoding='utf-8').strip()}\n", encoding="utf-8"
+        )
+    return keys, signers_dir
+
+
+@pytest.fixture
+def tenant_origin(repo, principals, tmp_path):
+    keys, signers_dir = principals
+    _sign_tag(repo, keys["astrojones"], "v1.0.0")
+    origin = tmp_path / "origin.git"
+    _run("git", "clone", "--bare", "-q", str(repo), str(origin))
+    return repo, origin, keys, signers_dir
+
+
+def _src(origin, name="astrojones"):
+    return nuk.SourceEntry(
+        name=name, repo=str(origin), deploy_key="/nonexistent/key", apply=["deployments"]
+    )
+
+
+def test_sync_source_returns_the_verified_tag_and_commit(tenant_origin, tmp_path):
+    repo, origin, _, signers_dir = tenant_origin
+    tag, commit = nuk.sync_source(_src(origin), signers_dir, tmp_path / "state")
+    assert tag == "v1.0.0"
+    tip = _run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip()
+    assert commit == tip
+    assert (tmp_path / "state" / "sources" / "astrojones" / "repo" / "HEAD").is_file()
+
+
+def test_a_sources_signers_file_rejects_another_sources_key(tenant_origin, tmp_path):
+    """Astrojones signed the tag; the kolbeapp-de source trusts only kolbeapp-de's key."""
+    _, origin, _, signers_dir = tenant_origin
+    with pytest.raises(ValueError, match=r"no v\* tag verifies"):
+        nuk.sync_source(_src(origin, "kolbeapp-de"), signers_dir, tmp_path / "state")
+
+
+def test_sync_source_refuses_when_the_sources_signers_file_is_absent(tenant_origin, tmp_path):
+    _, origin, _, _ = tenant_origin
+    with pytest.raises(ValueError, match=r"allowed_signers\.d/astrojones"):
+        nuk.sync_source(_src(origin), tmp_path / "empty-signers-dir", tmp_path / "state")
+
+
+def test_sync_source_refuses_a_downgrade(tenant_origin, tmp_path):
+    repo, origin, keys, signers_dir = tenant_origin
+    _commit(repo, "2")
+    _sign_tag(repo, keys["astrojones"], "v1.1.0")
+    _run("git", "push", "-q", str(origin), "main", "--tags", cwd=repo)
+    state = tmp_path / "state"
+    tag, commit = nuk.sync_source(_src(origin), signers_dir, state)
+    assert tag == "v1.1.0"
+    nuk.record_applied(tag, commit, nuk.source_state_dir(state, "astrojones") / "last-applied-tag")
+    _run("git", "-C", str(origin), "tag", "-d", "v1.1.0")
+    with pytest.raises(ValueError, match="not a descendant"):
+        nuk.sync_source(_src(origin), signers_dir, state)
+
+
+def test_sync_source_refuses_when_the_fetch_fails(tmp_path, principals):
+    _, signers_dir = principals
+    with pytest.raises(ValueError, match="git fetch failed"):
+        nuk.sync_source(_src(tmp_path / "no-such-origin.git"), signers_dir, tmp_path / "state")
+
+
+def test_sync_source_follows_a_changed_repo_url(tenant_origin, tmp_path):
+    _, origin, _, signers_dir = tenant_origin
+    state = tmp_path / "state"
+    nuk.sync_source(_src(origin), signers_dir, state)
+    moved = tmp_path / "moved.git"
+    _run("git", "clone", "--bare", "-q", str(origin), str(moved))
+    assert nuk.sync_source(_src(moved), signers_dir, state)[0] == "v1.0.0"
+    bare = state / "sources" / "astrojones" / "repo"
+    assert _run("git", "-C", str(bare), "remote", "get-url", "origin").stdout.strip() == str(moved)
+
+
+def test_sync_source_fetches_with_the_deploy_key(tenant_origin, tmp_path, monkeypatch):
+    _, origin, _, signers_dir = tenant_origin
+    real = subprocess.run
+    seen = []
+
+    def spy(argv, **kw):
+        if "fetch" in argv:
+            seen.append((kw.get("env") or {}).get("GIT_SSH_COMMAND"))
+        return real(argv, **kw)
+
+    monkeypatch.setattr(nuk.subprocess, "run", spy)
+    nuk.sync_source(_src(origin), signers_dir, tmp_path / "state")
+    assert seen == [nuk.git_ssh_command(Path("/nonexistent/key"))]
+
+
+# --- archive_tree: a tenant repo is untrusted input to a root process ---------------
+
+
+def test_archive_tree_extracts_a_plain_tree(repo, tmp_path):
+    out = tmp_path / "out"
+    nuk.archive_tree(repo, "HEAD", out)
+    assert (out / "f").read_text(encoding="utf-8") == "1\n"
+
+
+def test_archive_tree_refuses_a_symlink_that_leaves_the_tree(repo, tmp_path):
+    (repo / "escape").symlink_to("/etc/passwd")
+    _run("git", "add", "escape", cwd=repo)
+    _run("git", "commit", "-qm", "link", cwd=repo)
+    with pytest.raises(ValueError, match="unsafe archive member"):
+        nuk.archive_tree(repo, "HEAD", tmp_path / "out")
+    assert not (tmp_path / "out" / "escape").exists()

@@ -11,14 +11,17 @@ from __future__ import annotations
 
 import fcntl
 import grp
+import io
 import ipaddress
 import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import subprocess  # noqa: S404  # all calls use fixed argv, no shell (see per-call S603/S607)
 import sys
+import tarfile
 import tempfile
 import urllib.error
 import urllib.request
@@ -62,8 +65,16 @@ CONVERGE_STATE = Path("/var/lib/nuk")
 # anchor is delivered OUT OF BAND (see infra/tf-incus/ALLOWED_SIGNERS.md), never
 # from the repo it protects — a repo carrying its own trust anchor does not have one.
 ALLOWED_SIGNERS = Path("/etc/nuklaut/allowed_signers")
-# The manifest tree every host converges against: a clone of bartixcloud/infra.
+# The manifest tree every host converges against: a clone of astrojones/infra.
 CONVERGE_REPO = CONVERGE_STATE / "infra"
+# Which repos this host converges from, each with its read-only deploy key and what it
+# may change here (contracts C3). Delivered by seed.sh, never by the repos it lists.
+SOURCES_FILE = Path("/etc/nuklaut/sources.yml")
+# One signers file per source, named after it: a tenant's key can verify that tenant's
+# tags and nobody else's (contracts C3). Plain `git verify-tag`, no principal flag.
+SIGNERS_DIR = Path("/etc/nuklaut/allowed_signers.d")
+# github.com's host key, pinned by cloud-init; the deploy-key fetch never trusts on first use.
+KNOWN_HOSTS = Path("/etc/nuklaut/known_hosts")
 # Only the CLI default: cmd_converge derives both files from its state_dir argument,
 # so the tests get a tmp_path and the host gets /var/lib/nuk.
 CONVERGE_STATUS = CONVERGE_STATE / "converge-status.json"
@@ -1334,6 +1345,151 @@ def record_applied(tag: str, commit: str, state: Path) -> None:
     state.write_text(f"{tag} {commit}\n", encoding="utf-8")
 
 
+# --- sources (contracts C3) ----------------------------------------------------------
+
+# The platform source is the one that applies `facilities`; every other source is a tenant
+# and its name is the tenant name.
+SourceApply = Literal["facilities", "deployments", "databases", "routes"]
+
+
+class SourceEntry(BaseModel):
+    """One `sources[]` entry of /etc/nuklaut/sources.yml."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(pattern=r"^[a-z0-9-]+$")
+    repo: str
+    deploy_key: Path
+    apply: list[SourceApply] = Field(min_length=1)
+
+    @property
+    def is_platform(self) -> bool:
+        """The platform source is the one source allowed to apply facilities."""
+        return "facilities" in self.apply
+
+
+class SourcesFile(BaseModel):
+    """/etc/nuklaut/sources.yml."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sources: list[SourceEntry] = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def _check(self) -> SourcesFile:
+        """Unique names; exactly one platform source, which never applies databases.
+
+        Raises:
+            ValueError: On a violated rule.
+        """
+        names = [s.name for s in self.sources]
+        if len(names) != len(set(names)):
+            msg = "sources[].name must be unique"
+            raise ValueError(msg)
+        platform = [s for s in self.sources if s.is_platform]
+        if len(platform) != 1:
+            msg = (
+                f"exactly one source must apply `facilities` (the platform source) — "
+                f"found {[s.name for s in platform] or 'none'}"
+            )
+            raise ValueError(msg)
+        if "databases" in platform[0].apply:
+            msg = "the platform source cannot apply `databases` (tenant sources only)"
+            raise ValueError(msg)
+        return self
+
+    def ordered(self) -> list[SourceEntry]:
+        """The platform source first, then tenants in file order."""
+        return sorted(self.sources, key=lambda s: not s.is_platform)
+
+
+def load_sources(path: Path) -> SourcesFile:
+    """Parse and validate sources.yml.
+
+    Raises:
+        ValueError: If the file is unreadable or invalid (the message names the file).
+    """
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+        return SourcesFile.model_validate(raw)
+    except (OSError, ValidationError, yaml.YAMLError) as e:
+        msg = f"{path}: {e}"
+        raise ValueError(msg) from None
+
+
+def git_ssh_command(key: Path) -> str:
+    """GIT_SSH_COMMAND that authenticates with exactly one deploy key.
+
+    IdentitiesOnly stops ssh offering agent or default keys; the host key comes from
+    KNOWN_HOSTS only, so a fetch never trusts on first use.
+    """
+    return (
+        f"ssh -i {shlex.quote(str(key))} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "
+        f"-o UserKnownHostsFile={shlex.quote(str(KNOWN_HOSTS))} -o BatchMode=yes"
+    )
+
+
+def source_state_dir(state_dir: Path, name: str) -> Path:
+    """`<state_dir>/sources/<name>` — the bare repo and last-applied-tag."""
+    return state_dir / "sources" / name
+
+
+def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[str, str]:
+    """Fetch one source, verify it against its own signers file, guard against downgrade.
+
+    The repo is bare: the tree is only ever read through `git archive` of a verified
+    commit, never from a worktree.
+
+    Returns:
+        The verified tag and its commit SHA.
+
+    Raises:
+        ValueError: With the refusal reason; nothing but fetched objects changes.
+    """
+    signers = signers_dir / src.name
+    if not signers.is_file():
+        msg = f"trust anchor {signers} (allowed_signers.d/{src.name}) is missing or unreadable"
+        raise ValueError(msg)
+    sdir = source_state_dir(state_dir, src.name)
+    repo = sdir / "repo"
+    if not (repo / "HEAD").is_file():
+        repo.mkdir(parents=True, exist_ok=True)
+        _git(repo, "init", "--bare", "-q")
+    try:
+        _git(repo, "remote", "set-url", "origin", src.repo)
+    except subprocess.CalledProcessError:
+        _git(repo, "remote", "add", "origin", src.repo)
+    # --prune-tags so a tag deleted upstream is deleted locally too; without it the
+    # downgrade guard would compare against a tag that exists nowhere else.
+    proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
+        [  # noqa: S607  # git on PATH
+            "git",
+            "-C",
+            str(repo),
+            "fetch",
+            "--prune",
+            "--prune-tags",
+            "--tags",
+            "--force",
+            "origin",
+        ],
+        env={**os.environ, "GIT_SSH_COMMAND": git_ssh_command(src.deploy_key)},
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[-1]
+        msg = f"git fetch failed ({detail}) — no network, no change"
+        raise ValueError(msg)
+    tag = resolve_signed_tag(repo, signers)
+    if tag is None:
+        msg = f"no v* tag verifies against {signers}"
+        raise ValueError(msg)
+    assert_not_downgrade(repo, tag, sdir / "last-applied-tag")
+    return tag, _git(repo, "rev-parse", f"{tag}^{{commit}}")
+
+
 # --- the convergence loop ------------------------------------------------------
 # One per host, started by the poke (seconds) and by a 6-12 h liveness floor. The
 # floor is a LIVENESS GUARANTEE, not a control loop: without it a single lost poke
@@ -1368,7 +1524,12 @@ def archive_tree(repo: Path, commit: str, dest: Path) -> None:
     """Extract `commit` into `dest` — never the live worktree.
 
     The worktree can carry uncommitted edits mid-session; applying WIP against
-    real state on an unattended timer is a landmine (spec §7 step 4).
+    real state on an unattended timer is a landmine (spec §7 step 4). Extraction
+    uses tarfile's `data` filter: a tenant repo is untrusted input to a root
+    process, and a symlink or `..` member that leaves `dest` must not be created.
+
+    Raises:
+        ValueError: If the archive holds a member the `data` filter refuses.
     """
     dest.mkdir(parents=True, exist_ok=True)
     archive = subprocess.run(  # noqa: S603  # fixed argv, no shell
@@ -1376,11 +1537,12 @@ def archive_tree(repo: Path, commit: str, dest: Path) -> None:
         check=True,
         capture_output=True,
     )
-    subprocess.run(  # noqa: S603  # fixed argv, no shell
-        ["tar", "-x", "-C", str(dest)],  # noqa: S607  # tar on PATH
-        input=archive.stdout,
-        check=True,
-    )
+    try:
+        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tar:
+            tar.extractall(dest, filter="data")
+    except tarfile.TarError as e:
+        msg = f"unsafe archive member: {e}"
+        raise ValueError(msg) from None
 
 
 def _provided_capabilities(manifest: Facility) -> set[str]:
