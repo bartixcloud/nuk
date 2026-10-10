@@ -684,12 +684,19 @@ TENANTS_FILE = "tenants.yml"
 
 
 class TenantRow(BaseModel):
-    """One `tenants[]` row, as far as nuk reads it."""
+    """One `tenants[]` row, as far as nuk reads it.
+
+    `tenants.yml` is the shared platform registry (the runner broker's
+    `bcx-gen-tenant-env` reads the same file and tolerates unknown keys). nuk models
+    only `name` + the edge allowlist `domains`; any other field is ignored.
+    """
+
+    model_config = ConfigDict(extra="ignore")
 
     name: str = Field(pattern=r"^[a-z0-9-]+$")
-    edge: Literal["shared", "passthrough"]
     domains: list[str] = []
-    signer_principal: str = Field(pattern=r"^[a-z0-9-]+$")
+    edge: Literal["shared", "passthrough"] | None = None
+    signer_principal: str | None = None
 
 
 def _domains_overlap(x: str, y: str) -> bool:
