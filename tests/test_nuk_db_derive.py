@@ -216,6 +216,10 @@ def _db_deployment(tmp_path, name, placement_role="app"):
     return tmp_path
 
 
+def _ctx(tree, role):
+    return nuk.TreeContext.build(tree, role, None, None, nuk.APPLY_ALL)
+
+
 def _data_facility(tmp_path):
     f = tmp_path / "facilities"
     f.mkdir(parents=True, exist_ok=True)
@@ -323,8 +327,8 @@ def test_apply_tree_survives_a_malformed_facility(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")
     monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
     applied = []
-    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp: applied.append(path.stem))
-    results = nuk.apply_tree(tree, "data")  # must not raise
+    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp, **_k: applied.append(path.stem))
+    results = nuk.apply_tree(_ctx(tree, "data"))  # must not raise
     by_name = {r["name"]: r for r in results}
     assert by_name["broken.yml"]["result"] == "failed"
     assert "not a nuk/v1" in by_name["broken.yml"]["error"]
