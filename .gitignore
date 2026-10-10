@@ -15,3 +15,7 @@ node_modules/
 .opencode/
 nukview/
 
+# OS / agent scratch
+.DS_Store
+.claude/
+
