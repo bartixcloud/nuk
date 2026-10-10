@@ -27,6 +27,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, cast
@@ -61,12 +62,6 @@ HOST_ENV = Path("/etc/nuklaut/host.env")
 # persistent, not configuration. Held apart from /opt/nuklaut so that wiping a
 # host's deployments does not also erase the downgrade guard's memory.
 CONVERGE_STATE = Path("/var/lib/nuk")
-# Same default path as infra/tf-incus/reconcile.sh's, and the same rule: the trust
-# anchor is delivered OUT OF BAND (see infra/tf-incus/ALLOWED_SIGNERS.md), never
-# from the repo it protects — a repo carrying its own trust anchor does not have one.
-ALLOWED_SIGNERS = Path("/etc/nuklaut/allowed_signers")
-# The manifest tree every host converges against: a clone of astrojones/infra.
-CONVERGE_REPO = CONVERGE_STATE / "infra"
 # Which repos this host converges from, each with its read-only deploy key and what it
 # may change here (contracts C3). Delivered by seed.sh, never by the repos it lists.
 SOURCES_FILE = Path("/etc/nuklaut/sources.yml")
@@ -1188,6 +1183,18 @@ def read_self() -> tuple[str, str | None]:
     return env.get("ROLE") or "all-in-one", env.get("PRIVATE_IP") or None
 
 
+def read_tenant() -> str | None:
+    """Return TENANT from /etc/nuklaut/host.env (contracts C3).
+
+    None for platform VMs (`TENANT=` empty) and for hosts without the key or the file.
+    """
+    try:
+        env = _read_env_file(HOST_ENV)
+    except OSError:
+        env = {}
+    return env.get("TENANT") or None
+
+
 # --- signed-tag trust ----------------------------------------------------------
 # Ported from infra/tf-incus/reconcile.sh:74-120, which guards the LAYER-1 loop
 # (terraform, nuroot only, bash). This is the LAYER-3 loop (nuk manifests, every
@@ -1606,7 +1613,7 @@ def _exit_reason(e: SystemExit, default: str) -> str:
     return str(e.code) if e.code else default
 
 
-def apply_tree(tree: Path, role: str) -> list[dict]:
+def apply_tree(ctx: TreeContext) -> list[dict]:
     """Apply this host's Facilities, then its Deployments (spec §7 steps 6-7).
 
     Facilities first within a cycle (§7.1): effect VOCABULARY is git-derived and
@@ -1625,18 +1632,23 @@ def apply_tree(tree: Path, role: str) -> list[dict]:
     facility placed on another host is skipped before it can fail, and this host
     cannot verify another host's liveness (§13) — only same-host failures refuse.
 
+    Only the kinds named in `ctx.apply` run: a tenant source's `facilities/` is
+    never looked at, whatever it contains.
+
     Args:
-        tree: Root of the archived manifest tree.
-        role: This host's role, from /etc/nuklaut/host.env.
+        ctx: The source's tree, this host's identity and what the source may change.
 
     Returns:
         One `{"name", "kind", "result", "error"}` entry per manifest this host
         owns, facilities first, each directory in filename order. `result` is
         "ok", "failed", or "refused".
     """
+    tree, role = ctx.tree, ctx.role
     results: list[dict] = []
     failed_caps: set[str] = set()
     for kind, directory in (("Facility", FACILITY_DIR), ("Deployment", DEPLOYMENT_DIR)):
+        if directory not in ctx.apply:
+            continue
         for path in sorted((tree / directory).glob("*.yml")):
             try:
                 manifest = load(path)
@@ -1656,10 +1668,12 @@ def apply_tree(tree: Path, role: str) -> list[dict]:
                     continue
             entry = _result(manifest.metadata.name, kind)
             try:
-                cmd_apply(path, None)
-            except SystemExit as e:
+                cmd_apply(path, None, ctx=ctx)
+            except (SystemExit, ValueError, subprocess.CalledProcessError, OSError) as e:
                 entry["result"] = "failed"
-                entry["error"] = _exit_reason(e, "apply failed")
+                entry["error"] = (
+                    _exit_reason(e, "apply failed") if isinstance(e, SystemExit) else str(e)
+                )
                 if isinstance(manifest, Facility):
                     failed_caps |= _provided_capabilities(manifest)
             results.append(entry)
@@ -1669,71 +1683,87 @@ def apply_tree(tree: Path, role: str) -> list[dict]:
     # facility. A deployment the loop already produced (applied, refused, failed)
     # was provisioned by `cmd_apply` itself — the sweep must not double it.
     handled = {r["name"] for r in results if r["kind"] == "Deployment"}
-    try:
-        facilities = load_facilities(tree)
-    except SystemExit:
-        # An unreadable tree must not fail the whole cycle (spec §7.5): a
-        # malformed facilities/*.yml makes `load` sys.exit, and an unguarded
-        # argument here would abort apply_tree for every other manifest.
-        facilities = []
     results.extend(
-        r for r in provision_remote_databases(tree, role, facilities) if r["name"] not in handled
+        r
+        for r in provision_remote_databases(tree, role, ctx.facilities)
+        if r["name"] not in handled
     )
     return results
 
 
-def reap_report(tree: Path) -> list[str]:
-    """Names deployed on this host but absent from `tree` (spec §7.4).
+def _declared_names(tree: Path) -> set[str]:
+    """`metadata.name` of every manifest file under `tree`, tolerating unreadable ones."""
+    names: set[str] = set()
+    for directory in (FACILITY_DIR, DEPLOYMENT_DIR):
+        for path in (tree / directory).glob("*.yml"):
+            raw = _read_yaml_safe(path)
+            meta = raw.get("metadata") if isinstance(raw, dict) else None
+            if isinstance(meta, dict) and meta.get("name"):
+                names.add(str(meta["name"]))
+    return names
+
+
+def reap_report(*trees: Path) -> list[str]:
+    """Names deployed on this host but declared by none of `trees` (spec §7.4).
 
     Reports; never deletes. Auto-prune would make an accidental `git rm hello.yml`
     an outage, while an orphan stays visible via `nuk status` and `drift.sh` and
     is recoverable — a pruned production app is not.
 
     Facilities count as declared: a facility's project dir sits in DEPLOYS beside
-    the deployments, and calling it an orphan would warn on every cycle.
+    the deployments, and calling it an orphan would warn on every cycle. Pass every
+    source's tree of the cycle — a host runs the platform's facilities AND its own
+    tenant's deployments.
     """
     if not DEPLOYS.is_dir():
         return []
-    declared = {m.metadata.name for m in load_deployments(tree)} | {
-        m.metadata.name for m in load_facilities(tree)
-    }
+    declared: set[str] = set()
+    for tree in trees:
+        declared |= _declared_names(tree)
     return sorted(p.name for p in DEPLOYS.iterdir() if p.is_dir() and p.name not in declared)
+
+
+def _atomic_write(path: Path, text: str) -> None:
+    """Write `text` so a reader never sees a half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.chmod(0o644)
+    tmp.replace(path)
 
 
 def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a dataclass buys nothing here
     path: Path,
     *,
-    tag: str,
-    commit: str,
     role: str,
-    results: list[dict],
-    rendered: list[str],
+    tenant: str | None,
+    sources: dict[str, dict],
     warnings: list[str],
     logging: dict | None = None,
+    error: str | None = None,
 ) -> None:
-    """Record the cycle's outcome (spec §7.6).
+    """Record the cycle's outcome (spec §7.6, contracts C3).
 
-    `logging` is the LOGGING pipeline's own health — info-only (spec §14.3):
-    it is recorded, never a per-manifest result, and never a failure
-    condition. Absent for non-edge cycles and pre-loop hosts.
+    `sources` maps each source name to its block `{result, error, tag, commit, apply,
+    manifests, rendered, refusedRoutes}`. `logging` is the LOGGING pipeline's own health —
+    info-only (spec §14.3): recorded, never a per-manifest result, never a failure
+    condition; absent for non-edge cycles. `error` is set when the cycle could not even
+    start (an unreadable sources.yml), so a failure is still a status, not silence.
 
-    Replaces bootstrap.sh's `write_status_json`, which described a one-shot
-    first-boot run; this describes the last convergence. Consumed by `drift.sh`
-    and by `nuk status`.
+    Consumed by `drift.sh` and by `nuk status`.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload: dict[str, object] = {
-        "tag": tag,
-        "commit": commit,
+    payload: dict = {
         "role": role,
+        "tenant": tenant,
         "appliedAt": _iso_utc_now(),
-        "manifests": results,
-        "rendered": rendered,
         "reapWarnings": warnings,
+        "sources": sources,
     }
     if logging is not None:
         payload["logging"] = logging
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    if error is not None:
+        payload["error"] = error
+    _atomic_write(path, json.dumps(payload, indent=2) + "\n")
 
 
 def read_converge_status(path: Path = CONVERGE_STATUS) -> dict | None:
@@ -1742,101 +1772,218 @@ def read_converge_status(path: Path = CONVERGE_STATUS) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def cmd_converge(  # noqa: PLR0911, C901  # each early return is a distinct fail-closed refusal (spec §7.5); the logging block adds one more branch, keeping the status-line computation next to the write that consumes it
-    *, repo: Path, signers: Path, state_dir: Path, org_file: str
-) -> int:
-    """Converge this host to the newest verifying tag of the manifest repo.
+_SOURCE_FAILURES = (ValueError, SystemExit, subprocess.CalledProcessError, OSError)
 
-    Args:
-        repo: Local clone of the manifest repo (bartixcloud/infra).
-        signers: Allowed-signers file — the trust anchor.
-        state_dir: Where the lock, the last-applied record, and the status file live.
-        org_file: Org manifest filename inside the tree.
+
+def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are all read, none derived
+    src: SourceEntry,
+    block: dict,
+    *,
+    role: str,
+    self_ip: str | None,
+    signers_dir: Path,
+    state_dir: Path,
+    scratch: Path,
+    platform: Path | None,
+) -> TreeContext:
+    """Sync, verify and archive one source and build its context; fill tag/commit in `block`.
+
+    Raises:
+        ValueError: With the refusal reason (also CalledProcessError/OSError/SystemExit from
+            the git and manifest layers — `_SOURCE_FAILURES`).
+    """
+    if not src.is_platform and platform is None:
+        msg = (
+            "the platform source did not verify this cycle — no facilities or org to apply against"
+        )
+        raise ValueError(msg)
+    tag, commit = sync_source(src, signers_dir, state_dir)
+    block.update(tag=tag, commit=commit)
+    print(f"target: {src.name} {tag} ({commit[:12]}) role={role}")
+    tree = scratch / src.name
+    archive_tree(source_state_dir(state_dir, src.name) / "repo", commit, tree)
+    tenant = None if src.is_platform else src.name
+    return TreeContext.build(tree, role, self_ip, tenant, frozenset(src.apply), platform=platform)
+
+
+def _apply_source(src: SourceEntry, ctx: TreeContext, block: dict, state_dir: Path) -> None:
+    """Apply a prepared source: manifests, then routes; record it applied only if all went well."""
+    block["manifests"] = apply_tree(ctx)
+    if "routes" in src.apply and ctx.role in _ENTRY_ROLES and ctx.org is not None:
+        block["rendered"] = render_edge_routers(ctx.tree, ctx.org)
+    record_applied(
+        block["tag"], block["commit"], source_state_dir(state_dir, src.name) / "last-applied-tag"
+    )
+
+
+def _refuse(src: SourceEntry, block: dict, e: BaseException) -> None:
+    block["result"] = "refused"
+    block["error"] = _exit_reason(e, "converge refused") if isinstance(e, SystemExit) else str(e)
+    print(f"REFUSING source {src.name}: {block['error']}", file=sys.stderr)
+
+
+def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are all read, none derived
+    src: SourceEntry,
+    *,
+    role: str,
+    self_ip: str | None,
+    signers_dir: Path,
+    state_dir: Path,
+    scratch: Path,
+    platform: Path | None,
+) -> tuple[dict, TreeContext | None]:
+    """Converge ONE source; never raises for a source-level failure.
 
     Returns:
-        0 when the cycle converged or the lock was held; 1 when it refused.
+        The source's status block, and its TreeContext once the tree is verified and archived
+        (None when that failed, or when the platform tree is incomplete) — the platform's
+        context is what tenant sources build on. `result` is "refused" on any failure here;
+        manifests that fail individually inside `apply_tree` are recorded in `manifests` and do
+        not refuse the source (spec §7.5). `last-applied-tag` moves only when the whole source
+        succeeded.
+    """
+    block: dict = {
+        "result": "ok",
+        "error": None,
+        "tag": None,
+        "commit": None,
+        "apply": list(src.apply),
+        "manifests": [],
+        "rendered": [],
+        "refusedRoutes": [],
+    }
+    try:
+        ctx = _prepare_source(
+            src,
+            block,
+            role=role,
+            self_ip=self_ip,
+            signers_dir=signers_dir,
+            state_dir=state_dir,
+            scratch=scratch,
+            platform=platform,
+        )
+        if src.is_platform and ctx.org is None:
+            msg = (
+                f"the platform tree at {block['tag']} lacks {DEFAULT_ORG_FILE} — "
+                f"backends and routes resolve from it and cannot be guessed"
+            )
+            raise ValueError(msg)  # noqa: TRY301  # same refusal path as every other failure here
+    except _SOURCE_FAILURES as e:
+        _refuse(src, block, e)
+        return block, None
+    try:
+        _apply_source(src, ctx, block, state_dir)
+    except _SOURCE_FAILURES as e:
+        _refuse(src, block, e)
+    return block, ctx
+
+
+def _logging_status(role: str, platform_ctx: TreeContext | None) -> dict | None:
+    """The LOGGING pipeline's own health (spec §14.3): info-only, edge cycles only."""
+    if role != "edge" or platform_ctx is None:
+        return None
+    facility = env_facility(platform_ctx.facilities, "logs")
+    if facility is None:
+        return None
+    reason = facility_health(facility)
+    return {"healthy": reason is None, "detail": reason or "ok"}
+
+
+def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
+    sources: list[SourceEntry],
+    blocks: dict[str, dict],
+    *,
+    role: str,
+    self_ip: str | None,
+    signers_dir: Path,
+    state_dir: Path,
+) -> tuple[list[str], dict | None, bool]:
+    """Converge every source, platform first; fill `blocks`.
+
+    Returns:
+        (orphan warnings, logging status, whether every source converged).
+    """
+    with tempfile.TemporaryDirectory(dir=state_dir, prefix="run.") as scratch:
+        platform_ctx: TreeContext | None = None
+        trees: list[Path] = []
+        for src in sources:
+            blocks[src.name], ctx = _converge_source(
+                src,
+                role=role,
+                self_ip=self_ip,
+                signers_dir=signers_dir,
+                state_dir=state_dir,
+                scratch=Path(scratch),
+                platform=platform_ctx.tree if platform_ctx else None,
+            )
+            if ctx is not None:
+                trees.append(ctx.tree)
+                platform_ctx = ctx if src.is_platform else platform_ctx
+        clean = all(b["result"] == "ok" for b in blocks.values())
+        # A refused source has no tree this cycle, so its apps would all read as orphans;
+        # only a clean cycle can tell what is really undeclared.
+        warnings = reap_report(*trees) if clean else []
+        return warnings, _logging_status(role, platform_ctx), clean
+
+
+def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> int:
+    """Converge this host from every source in `sources_file` (contracts C3).
+
+    The platform source goes first. Each source is fetched with its own deploy key, verified
+    against its own signers file, downgrade-guarded and archived separately; one source
+    refusing never stops another — except that tenant sources build on the platform tree, so
+    they are refused (with that reason) when the platform source did not verify.
+    The status file is written on every exit path after the lock, including a failure.
+
+    Returns:
+        0 when every source converged or the lock was held; 1 when any source was refused.
     """
     with converge_lock(state_dir) as acquired:
         if not acquired:
             print("another converge run holds the lock; skipping this cycle")
             return 0
-        if not signers.is_file():
-            print(
-                f"REFUSING: trust anchor {signers} is missing or unreadable\n"
-                f"See infra/tf-incus/ALLOWED_SIGNERS.md",
-                file=sys.stderr,
-            )
-            return 1
-        # --prune-tags so a tag deleted upstream is deleted locally too; without it
-        # the downgrade guard would compare against a tag that exists nowhere else.
+        role, self_ip = read_self()
+        blocks: dict[str, dict] = {}
+        warnings: list[str] = []
+        logging_status: dict | None = None
+        error: str | None = None
+        code = 1
+        sources: list[SourceEntry] = []
         try:
-            _git(repo, "fetch", "--prune", "--prune-tags", "--tags", "--force", "origin")
-        except subprocess.CalledProcessError as e:
-            print(f"REFUSING: git fetch failed ({e}) — no network, no change", file=sys.stderr)
-            return 1
-        tag = resolve_signed_tag(repo, signers)
-        if tag is None:
-            print(f"REFUSING: no v* tag verifies against {signers}", file=sys.stderr)
-            return 1
-        last_applied = state_dir / "last-applied-tag"
-        try:
-            assert_not_downgrade(repo, tag, last_applied)
+            sources = load_sources(sources_file).ordered()
         except ValueError as e:
-            print(f"REFUSING: {e}", file=sys.stderr)
-            return 1
-        commit = _git(repo, "rev-parse", f"{tag}^{{commit}}")
-        role, _ = read_self()
-        print(f"target: {tag} ({commit}) role={role}")
-        with tempfile.TemporaryDirectory(dir=state_dir, prefix="run.") as scratch:
-            tree = Path(scratch)
-            archive_tree(repo, commit, tree)
-            org = None
-            if role in _ENTRY_ROLES:
-                org_path = tree / org_file
-                if not org_path.is_file():
-                    print(
-                        f"REFUSING: org manifest {org_file} is not in the tree at {tag} — "
-                        f"the edge resolves every backend IP from it and cannot guess",
-                        file=sys.stderr,
-                    )
-                    return 1
-                org = load_org(org_path)
-            results = apply_tree(tree, role)
-            rendered = render_edge_routers(tree, org) if org is not None else []
-            warnings = reap_report(tree)
-            # The LOGGING pipeline's own health (spec §14.3): info-only, computed
-            # on the edge alone — Loki lives there, and a facility placed
-            # elsewhere is not this host's job (spec §5.4). Never a per-manifest
-            # result, never a failure condition; apps fail on their own terms,
-            # logs fail silently on the collector's.
-            logging_status: dict | None = None
-            if role == "edge":
-                facility = env_facility(load_facilities(tree), "logs")
-                if facility is not None:
-                    reason = facility_health(facility)
-                    logging_status = {
-                        "healthy": reason is None,
-                        "detail": reason or "ok",
-                    }
+            error = str(e)
+            print(f"REFUSING: {error}", file=sys.stderr)
+        try:
+            if sources:
+                warnings, logging_status, clean = _run_cycle(
+                    sources,
+                    blocks,
+                    role=role,
+                    self_ip=self_ip,
+                    signers_dir=signers_dir,
+                    state_dir=state_dir,
+                )
+                code = 0 if clean else 1
+        finally:
+            write_converge_status(
+                state_dir / "converge-status.json",
+                role=role,
+                tenant=read_tenant(),
+                sources=blocks,
+                warnings=warnings,
+                logging=logging_status,
+                error=error,
+            )
         if warnings:
             print(
-                f"WARN: {len(warnings)} deployed app(s) not present at {tag}: "
+                f"WARN: {len(warnings)} deployed app(s) not declared by any source: "
                 f"{', '.join(warnings)}\n"
                 f"      This loop never removes deployments. Retire explicitly:  "
                 f"nuk delete <name>"
             )
-        write_converge_status(
-            state_dir / "converge-status.json",
-            tag=tag,
-            commit=commit,
-            role=role,
-            results=results,
-            rendered=rendered,
-            warnings=warnings,
-            logging=logging_status,
-        )
-        record_applied(tag, commit, last_applied)
-        return 0
+        return code
 
 
 def placement_matches(manifest: Deployment | Facility, role: str) -> bool:
@@ -1866,7 +2013,7 @@ def placement_matches(manifest: Deployment | Facility, role: str) -> bool:
 FACILITY_DIR = "facilities"
 
 
-def load_facilities(tree: Path) -> list[Facility]:
+def load_facilities(tree: Path, *, lenient: bool = False) -> list[Facility]:
     """Load every `kind: Facility` manifest in `<tree>/facilities/*.yml`.
 
     A tree with no facilities dir yields no facilities — the empty vocabulary.
@@ -1875,6 +2022,9 @@ def load_facilities(tree: Path) -> list[Facility]:
 
     Args:
         tree: Root of the manifest tree (the git checkout the loop pulled).
+        lenient: Skip a malformed file instead of exiting. The converge loop builds
+            its context this way so one broken facility is recorded as that
+            manifest's failure by `apply_tree` and does not stop the rest (spec §7.5).
 
     Returns:
         The facilities, ordered by filename for a deterministic vocabulary.
@@ -1882,7 +2032,17 @@ def load_facilities(tree: Path) -> list[Facility]:
     fdir = tree / FACILITY_DIR
     if not fdir.is_dir():
         return []
-    return [m for p in sorted(fdir.glob("*.yml")) if isinstance(m := load(p), Facility)]
+    out: list[Facility] = []
+    for p in sorted(fdir.glob("*.yml")):
+        try:
+            m = load(p)
+        except SystemExit:
+            if not lenient:
+                raise
+            continue
+        if isinstance(m, Facility):
+            out.append(m)
+    return out
 
 
 def route_vocabulary(facilities: list[Facility]) -> dict[str, list[str]]:
@@ -1958,6 +2118,59 @@ def _tree_root(manifest_path: Path) -> Path:
     """
     parent = manifest_path.resolve().parent
     return parent.parent if parent.name in {FACILITY_DIR, DEPLOYMENT_DIR} else parent
+
+
+# What one source may change on this host (contracts C3 `sources[].apply`).
+APPLY_ALL = frozenset({"facilities", "deployments", "databases", "routes"})
+
+
+@dataclass(frozen=True)
+class TreeContext:
+    """Everything one source's apply needs besides its own manifests.
+
+    `facilities` and `org` always come from the PLATFORM tree (a tenant source
+    ships neither — it must not be able to redefine the route vocabulary or the
+    topology); `tree`, `tenant` and `apply` describe the source being applied.
+    `tenant` is None for the platform source.
+    """
+
+    tree: Path
+    role: str
+    self_ip: str | None
+    tenant: str | None
+    apply: frozenset[str]
+    facilities: list[Facility]
+    org: Org | None
+
+    @classmethod
+    def build(  # noqa: PLR0913  # one field per attribute; a wrapper object buys nothing
+        cls,
+        tree: Path,
+        role: str,
+        self_ip: str | None,
+        tenant: str | None,
+        apply: frozenset[str],
+        *,
+        platform: Path | None = None,
+    ) -> TreeContext:
+        """Load the platform-wide inputs from `platform` (default: `tree` itself)."""
+        base = platform or tree
+        org_path = base / DEFAULT_ORG_FILE
+        return cls(
+            tree=tree,
+            role=role,
+            self_ip=self_ip,
+            tenant=tenant,
+            apply=apply,
+            facilities=load_facilities(base, lenient=True),
+            org=load_org(org_path) if org_path.is_file() else None,
+        )
+
+    @classmethod
+    def for_path(cls, manifest_path: Path) -> TreeContext:
+        """The context of a hand-run `nuk apply <manifest>`: this host, the manifest's own tree."""
+        role, self_ip = read_self()
+        return cls.build(_tree_root(manifest_path), role, self_ip, None, APPLY_ALL)
 
 
 def backend_address(org: Org, manifest: Deployment, ing: dict) -> str:
@@ -3090,6 +3303,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     manifest_path: Path,
     repo_path: str | None,
     *,
+    ctx: TreeContext | None = None,
     pin_commit: str | None = None,
     pin_digest: str | None = None,
 ) -> None:
@@ -3098,6 +3312,8 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     Args:
         manifest_path: Path to the nuk/v1 manifest.
         repo_path: Local checkout to mirror instead of cloning spec.source.repo.
+        ctx: The converge loop's prepared context; a hand-run apply builds its own
+            from the manifest's tree and this host's identity.
         pin_commit: Check the source repo out DETACHED at this commit instead of
             following spec.source.branch. Set only by `cmd_rollback` (spec §8).
         pin_digest: Pull this image digest and re-tag it over the compose file's
@@ -3116,7 +3332,8 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             f"{_FACILITY_GROUP!r} (spec §4.4). Refusing."
         )
         sys.exit(1)
-    role, self_ip = read_self()
+    ctx = ctx or TreeContext.for_path(manifest_path)
+    role, self_ip = ctx.role, ctx.self_ip
     if not placement_matches(manifest, role):
         # placement_matches returns False only when a placement is set and differs.
         placement = manifest.spec.placement
@@ -3126,7 +3343,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             f"is role={role!r} — nothing to do"
         )
         return
-    facilities = load_facilities(_tree_root(manifest_path))
+    facilities = ctx.facilities
     vocab = route_vocabulary(facilities) if facilities else DEFAULT_ROUTE_VOCAB
     DYNAMIC.mkdir(parents=True, exist_ok=True)
     DEPLOYS.mkdir(parents=True, exist_ok=True)
@@ -3196,10 +3413,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     if pin_digest:
         _pin_image(name, raw, pin_digest)
     ingress = raw_spec.get("ingress", []) or []
-    org = None
-    org_path = _tree_root(manifest_path) / DEFAULT_ORG_FILE
-    if org_path.is_file():
-        org = load_org(org_path)
+    org = ctx.org
     remote_ip = None
     if org is not None:
         # The remote decision mirrors provision_remote_databases's owner gate
@@ -3768,22 +3982,19 @@ def _rollback(
 
 @app.command("converge")
 def _converge(
-    repo: Annotated[
-        Path, typer.Option("--repo", help="local clone of the manifest repo")
-    ] = CONVERGE_REPO,
-    signers: Annotated[
-        Path, typer.Option("--signers", help="allowed-signers file (the trust anchor)")
-    ] = ALLOWED_SIGNERS,
+    sources: Annotated[
+        Path, typer.Option("--sources", help="sources.yml: repos, deploy keys, what each applies")
+    ] = SOURCES_FILE,
+    signers_dir: Annotated[
+        Path, typer.Option("--signers-dir", help="allowed_signers.d: one trust file per source")
+    ] = SIGNERS_DIR,
     state_dir: Annotated[
-        Path, typer.Option("--state-dir", help="lock, last-applied record, status file")
+        Path, typer.Option("--state-dir", help="lock, per-source state, status file")
     ] = CONVERGE_STATE,
-    org_file: Annotated[
-        str, typer.Option("--org-file", help="org manifest filename inside the tree")
-    ] = DEFAULT_ORG_FILE,
 ) -> None:
-    """Converge this host to the newest verifying tag (spec §7)."""
+    """Converge this host from every source to its newest verifying tag (spec §7)."""
     raise typer.Exit(
-        cmd_converge(repo=repo, signers=signers, state_dir=state_dir, org_file=org_file)
+        cmd_converge(sources_file=sources, signers_dir=signers_dir, state_dir=state_dir)
     )
 
 

@@ -181,105 +181,11 @@ def test_record_applied_writes_tag_and_sha(tmp_path):
     assert state.read_text(encoding="utf-8") == f"v1.0.0 {'a' * 40}\n"
 
 
-# --- the loop: lock, fetch, verify, archive ------------------------------------
+# --- archive ---------------------------------------------------------------------
 
 
-ORG_FILE = "nuklaut.astrocloud.org.yml"
-
-
-@pytest.fixture
-def loop(repo, signer, tmp_path, monkeypatch):
-    """A signed repo plus a state dir, with apply/render/reap stubbed out.
-
-    The repo carries an org manifest at ORG_FILE because the edge refuses to
-    converge without one (Task 6). Its CONTENT is irrelevant here — the tests
-    that reach rendering stub `load_org` — but its PRESENCE is what the edge
-    checks, so it has to be in the archived tree.
-    """
-    pubkey, signers = signer
-    (repo / ORG_FILE).write_text("apiVersion: nukorg/v1\n", encoding="utf-8")
-    _run("git", "add", ORG_FILE, cwd=repo)
-    _run("git", "commit", "-qm", "org", cwd=repo)
-    _sign_tag(repo, pubkey, "v1.0.0")
-    # Set up a local origin remote so fetch doesn't fail
-    origin = tmp_path / "origin"
-    _run("git", "clone", "--bare", str(repo), str(origin))
-    _run("git", "remote", "add", "origin", str(origin), cwd=repo)
-    _run("git", "push", "origin", "main", "--tags", cwd=repo)
-    state = tmp_path / "state"
-    monkeypatch.setattr(nuk, "apply_tree", lambda tree, role: [])
-    monkeypatch.setattr(nuk, "reap_report", lambda tree: [])
-    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
-    return repo, signers, state
-
-
-def test_converge_refuses_without_a_trust_anchor(loop, tmp_path, capsys):
-    repo, _, state = loop
-    code = nuk.cmd_converge(
-        repo=repo, signers=tmp_path / "absent", state_dir=state, org_file=ORG_FILE
-    )
-    assert code == 1
-    assert "trust anchor" in capsys.readouterr().err
-
-
-def test_converge_refuses_when_no_tag_verifies(repo, signer, tmp_path, capsys, monkeypatch):
-    _, signers = signer
-    origin = tmp_path / "origin"
-    _run("git", "clone", "--bare", str(repo), str(origin))
-    _run("git", "remote", "add", "origin", str(origin), cwd=repo)
-    _plain_tag(repo, "v1.0.0")
-    monkeypatch.setattr(nuk, "apply_tree", lambda tree, role: pytest.fail("must not apply"))
-    code = nuk.cmd_converge(
-        repo=repo, signers=signers, state_dir=tmp_path / "state", org_file=ORG_FILE
-    )
-    assert code == 1
-    assert "no v* tag verifies" in capsys.readouterr().err
-
-
-def test_converge_refuses_a_downgrade(repo, signer, tmp_path, monkeypatch, capsys):
-    pubkey, signers = signer
-    origin = tmp_path / "origin"
-    _run("git", "clone", "--bare", str(repo), str(origin))
-    _run("git", "remote", "add", "origin", str(origin), cwd=repo)
-    _sign_tag(repo, pubkey, "v1.0.0")
-    newer = _commit(repo, "2")
-    _sign_tag(repo, pubkey, "v1.1.0")
-    _run("git", "push", "origin", "main", "--tags", cwd=repo)
-    state = tmp_path / "state"
-    state.mkdir()
-    nuk.record_applied("v1.1.0", newer, state / "last-applied-tag")
-    # Delete v1.1.0 from the origin (simulating the attack)
-    _run("git", "-C", str(origin), "tag", "-d", "v1.1.0")
-    _run("git", "tag", "-d", "v1.1.0", cwd=repo)
-    monkeypatch.setattr(nuk, "apply_tree", lambda tree, role: pytest.fail("must not apply"))
-    code = nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE)
-    assert code == 1
-    assert "not a descendant" in capsys.readouterr().err
-    # Spec §12, "loop — signature": prior state UNTOUCHED. A refusal that quietly
-    # rewrote last-applied-tag would let the very next cycle accept the downgrade.
-    assert (state / "last-applied-tag").read_text(encoding="utf-8").split()[0] == "v1.1.0"
-
-
-def test_converge_records_the_applied_tag(loop, capsys):
-    repo, signers, state = loop
-    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
-    recorded = (state / "last-applied-tag").read_text(encoding="utf-8").split()
-    assert recorded[0] == "v1.0.0"
-    assert recorded[1] == _run("git", "rev-parse", "v1.0.0^{commit}", cwd=repo).stdout.strip()
-
-
-def test_converge_exits_zero_and_applies_nothing_while_the_lock_is_held(loop, monkeypatch):
-    """Spec §7.5: a skipped cycle is harmless; the next poke or floor picks it up.
-
-    A blocking wait would instead pile up systemd jobs.
-    """
-    repo, signers, state = loop
-    monkeypatch.setattr(nuk, "apply_tree", lambda tree, role: pytest.fail("must not apply"))
-    with nuk.converge_lock(state) as acquired:
-        assert acquired is True
-        code = nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE)
-    assert code == 0
-    assert not (state / "last-applied-tag").exists()
+def _ctx(tree, role):
+    return nuk.TreeContext.build(tree, role, None, None, nuk.APPLY_ALL)
 
 
 def test_archive_tree_extracts_the_commit_not_the_worktree(repo, tmp_path):
@@ -291,87 +197,6 @@ def test_archive_tree_extracts_the_commit_not_the_worktree(repo, tmp_path):
     nuk.archive_tree(repo, commit, dest)
     assert (dest / "f").read_text(encoding="utf-8") == "1\n"
     assert not (dest / "untracked").exists()
-
-
-def test_converge_applies_a_new_tag_restoring_an_old_tree(loop, signer, monkeypatch):
-    """Spec §12, 'loop — monotonic (§7.3a)': fleet rollback applies cleanly.
-
-    The guard is ancestry-based (Task 3), so 'a new tag on an old tree' means a
-    NEW commit whose tree restores the old one — a revert commit. Tagging the
-    OLD commit directly is refused by design; this test pins down the intended
-    forward-only shape.
-    """
-    repo, signers, state = loop
-    pubkey, _ = signer
-    # v1.0.0 already exists (the loop fixture signed it); append a release on top.
-    _commit(repo, "2")
-    _sign_tag(repo, pubkey, "v1.1.0")  # file "2" — recorded as applied
-    nuk.record_applied(
-        "v1.1.0",
-        _run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip(),
-        state / "last-applied-tag",
-    )
-    _run("git", "revert", "--no-edit", "HEAD", cwd=repo)  # file "1" again
-    _sign_tag(repo, pubkey, "v1.2.0")  # the rollback tag
-    _run("git", "push", "origin", "main", "--tags", cwd=repo)
-    applied = []
-
-    def mock_apply_tree(tree, role):
-        applied.append((tree / "f").read_text())
-        return []
-
-    monkeypatch.setattr(nuk, "apply_tree", mock_apply_tree)
-    monkeypatch.setattr(nuk, "reap_report", lambda tree: [])
-    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
-    code = nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE)
-    assert code == 0
-    assert applied == ["1\n"]
-    assert (state / "last-applied-tag").read_text(encoding="utf-8").split()[0] == "v1.2.0"
-
-
-def test_converge_refuses_a_new_tag_on_the_old_commit_itself(loop, signer, monkeypatch, capsys):
-    """§7.3a strengthening: 'old commit, new tag' is the deletion attack's shape.
-
-    The attack deletes the applied tag, then tags the OLD commit with a NEW
-    signed tag — which verifies and is creatordate-newest, so the resolver picks
-    it. The ancestry guard is the only thing standing between that and a silent
-    walk backwards, and it must refuse with the prior state untouched.
-    """
-    repo, signers, state = loop
-    pubkey, _ = signer
-    origin = _run("git", "config", "remote.origin.url", cwd=repo).stdout.strip()
-    old_sha = _run("git", "rev-parse", "v1.0.0^{commit}", cwd=repo).stdout.strip()
-    _commit(repo, "2")
-    _sign_tag(repo, pubkey, "v1.1.0")
-    _run("git", "push", "origin", "main", "--tags", cwd=repo)
-    nuk.record_applied(
-        "v1.1.0",
-        _run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip(),
-        state / "last-applied-tag",
-    )
-    # Delete v1.1.0 from the origin (simulating the attack)
-    _run("git", "-C", origin, "tag", "-d", "v1.1.0")
-    _run("git", "tag", "-d", "v1.1.0", cwd=repo)
-    _run(
-        "git",
-        "-c",
-        "gpg.format=ssh",
-        "-c",
-        f"user.signingkey={pubkey}",
-        "tag",
-        "-s",
-        "v1.2.0",
-        "-m",
-        "v1.2.0",
-        old_sha,
-        cwd=repo,
-    )
-    _run("git", "push", "origin", "--tags", cwd=repo)
-    monkeypatch.setattr(nuk, "apply_tree", lambda tree, role: pytest.fail("must not apply"))
-    code = nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE)
-    assert code == 1
-    assert "not a descendant" in capsys.readouterr().err
-    assert (state / "last-applied-tag").read_text(encoding="utf-8").split()[0] == "v1.1.0"
 
 
 # --- apply order and isolation --------------------------------------------------
@@ -436,8 +261,8 @@ def test_apply_tree_applies_facilities_before_deployments(tmp_path, monkeypatch)
         deployments={"hello": DEPLOYMENT_YML},
     )
     order = []
-    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp: order.append(path.stem))
-    results = nuk.apply_tree(tree, "app")
+    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp, **_k: order.append(path.stem))
+    results = nuk.apply_tree(_ctx(tree, "app"))
     assert order == ["data-stack", "hello"]
     assert [r["result"] for r in results] == ["ok", "ok"]
     assert [r["kind"] for r in results] == ["Facility", "Deployment"]
@@ -449,8 +274,8 @@ def test_apply_tree_skips_manifests_placed_on_another_host(tmp_path, monkeypatch
         tmp_path, facilities={"data-stack": FACILITY_YML}, deployments={"hello": DEPLOYMENT_YML}
     )
     applied = []
-    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp: applied.append(path.stem))
-    results = nuk.apply_tree(tree, "app")
+    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp, **_k: applied.append(path.stem))
+    results = nuk.apply_tree(_ctx(tree, "app"))
     assert applied == ["hello"]
     assert len(results) == 1
 
@@ -460,28 +285,28 @@ def test_one_failing_deployment_does_not_stop_the_rest(tmp_path, monkeypatch):
     second = DEPLOYMENT_YML.replace("name: hello", "name: zulu")
     tree = _tree(tmp_path, deployments={"hello": DEPLOYMENT_YML, "zulu": second})
 
-    def flaky(path, _rp):
+    def flaky(path, _rp, **_k):
         if path.stem == "hello":
             msg = "hello: image pull failed"
             raise SystemExit(msg)
 
     monkeypatch.setattr(nuk, "cmd_apply", flaky)
-    results = nuk.apply_tree(tree, "app")
+    results = nuk.apply_tree(_ctx(tree, "app"))
     assert [(r["name"], r["result"]) for r in results] == [("hello", "failed"), ("zulu", "ok")]
     assert "image pull failed" in results[0]["error"]
 
 
 def test_a_malformed_manifest_is_recorded_not_raised(tmp_path, monkeypatch):
     tree = _tree(tmp_path, deployments={"hello": DEPLOYMENT_YML, "broken": "kind: Nonsense\n"})
-    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp: None)
-    results = nuk.apply_tree(tree, "app")
+    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp, **_k: None)
+    results = nuk.apply_tree(_ctx(tree, "app"))
     by_name = {r["name"]: r for r in results}
     assert by_name["broken.yml"]["result"] == "failed"
     assert by_name["hello"]["result"] == "ok"
 
 
 def test_apply_tree_tolerates_a_tree_with_neither_directory(tmp_path):
-    assert nuk.apply_tree(tmp_path / "empty", "app") == []
+    assert nuk.apply_tree(_ctx(tmp_path / "empty", "app")) == []
 
 
 def test_a_deployment_consuming_a_failed_facility_is_refused(tmp_path, monkeypatch):
@@ -496,14 +321,14 @@ def test_a_deployment_consuming_a_failed_facility_is_refused(tmp_path, monkeypat
         deployments={"hello": DB_APP_YML},
     )
 
-    def flaky(path, _rp):
+    def flaky(path, _rp, **_k):
         if path.stem == "data-stack":
             msg = "data-stack: container 'nuk-postgres' is not healthy"
             raise SystemExit(msg)
 
     monkeypatch.setattr(nuk, "cmd_apply", flaky)
     monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")  # db env files land here
-    results = nuk.apply_tree(tree, "app")
+    results = nuk.apply_tree(_ctx(tree, "app"))
     by_name = {r["name"]: r for r in results}
     assert by_name["data-stack"]["result"] == "failed"
     assert by_name["hello"]["result"] == "refused"
@@ -518,13 +343,13 @@ def test_a_deployment_consuming_nothing_applies_despite_a_failed_facility(tmp_pa
         deployments={"hello": DEPLOYMENT_YML},
     )
 
-    def flaky(path, _rp):
+    def flaky(path, _rp, **_k):
         if path.stem == "data-stack":
             msg = "data-stack: not healthy"
             raise SystemExit(msg)
 
     monkeypatch.setattr(nuk, "cmd_apply", flaky)
-    results = nuk.apply_tree(tree, "app")
+    results = nuk.apply_tree(_ctx(tree, "app"))
     by_name = {r["name"]: r for r in results}
     assert by_name["hello"]["result"] == "ok"
 
@@ -536,13 +361,13 @@ def test_a_facility_placed_on_another_host_does_not_poison(tmp_path, monkeypatch
         facilities={"data-stack": DATA_FACILITY_YML.replace("role: app", "role: data")},
         deployments={"hello": DB_APP_YML},
     )
-    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp: None)
-    results = nuk.apply_tree(tree, "app")
+    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp, **_k: None)
+    results = nuk.apply_tree(_ctx(tree, "app"))
     assert [r["name"] for r in results] == ["hello"]
     assert results[0]["result"] == "ok"
 
 
-# --- reap, render, status -------------------------------------------------------
+# --- reap -----------------------------------------------------------------------
 
 
 def test_reap_reports_orphans_and_deletes_nothing(tmp_path, monkeypatch):
@@ -574,164 +399,6 @@ def test_reap_counts_facilities_as_declared(tmp_path, monkeypatch):
 def test_reap_is_empty_when_nothing_is_deployed(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "absent")
     assert nuk.reap_report(tmp_path / "tree") == []
-
-
-def test_status_file_records_the_cycle(tmp_path):
-    path = tmp_path / "converge-status.json"
-    nuk.write_converge_status(
-        path,
-        tag="v1.2.0",
-        commit="a" * 40,
-        role="app",
-        results=[{"name": "hello", "kind": "Deployment", "result": "ok", "error": None}],
-        rendered=[],
-        warnings=["oauth"],
-    )
-    data = nuk.read_converge_status(path)
-    assert data["tag"] == "v1.2.0"
-    assert data["role"] == "app"
-    assert data["manifests"][0]["name"] == "hello"
-    assert data["reapWarnings"] == ["oauth"]
-    assert data["appliedAt"].endswith("Z")
-
-
-def test_read_status_is_none_when_absent(tmp_path):
-    assert nuk.read_converge_status(tmp_path / "absent.json") is None
-
-
-def test_converge_writes_a_status_file(loop, monkeypatch):
-    repo, signers, state = loop
-    monkeypatch.setattr(
-        nuk,
-        "apply_tree",
-        lambda tree, role: [{"name": "hello", "kind": "Deployment", "result": "ok", "error": None}],
-    )
-    monkeypatch.setattr(nuk, "reap_report", lambda tree: ["oauth"])
-    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
-    data = nuk.read_converge_status(state / "converge-status.json")
-    assert data["tag"] == "v1.0.0"
-    assert data["reapWarnings"] == ["oauth"]
-
-
-def test_converge_warns_about_orphans_on_stdout(loop, monkeypatch, capsys):
-    repo, signers, state = loop
-    monkeypatch.setattr(nuk, "reap_report", lambda tree: ["hello", "oauth"])
-    nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE)
-    out = capsys.readouterr().out
-    assert "WARN: 2 deployed app(s) not present at v1.0.0" in out
-    assert "nuk delete" in out
-
-
-def test_a_non_edge_host_renders_no_routers(loop, monkeypatch):
-    repo, signers, state = loop
-    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
-    monkeypatch.setattr(
-        nuk, "render_edge_routers", lambda tree, org: pytest.fail("only the edge renders")
-    )
-    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
-
-
-def test_the_edge_renders_every_router(loop, monkeypatch):
-    repo, signers, state = loop
-    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
-    monkeypatch.setattr(nuk, "load_org", lambda path: "ORG")
-    monkeypatch.setattr(nuk, "render_edge_routers", lambda tree, org: ["hello", "app-alpha"])
-    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
-    assert nuk.read_converge_status(state / "converge-status.json")["rendered"] == [
-        "hello",
-        "app-alpha",
-    ]
-
-
-def test_the_edge_refuses_when_the_org_manifest_is_missing(loop, monkeypatch, capsys):
-    """Rendering resolves every backend IP from it; guessing is not an option."""
-    repo, signers, state = loop
-    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
-    code = nuk.cmd_converge(
-        repo=repo, signers=signers, state_dir=state, org_file="nuklaut.absent.org.yml"
-    )
-    assert code == 1
-    assert "org manifest" in capsys.readouterr().err
-
-
-# --- the logging status line (spec §14.3, §15.7) --------------------------------
-
-
-def test_write_converge_status_records_an_optional_logging_line(tmp_path):
-    path = tmp_path / "converge-status.json"
-    nuk.write_converge_status(
-        path,
-        tag="v1.2.0",
-        commit="a" * 40,
-        role="edge",
-        results=[],
-        rendered=[],
-        warnings=[],
-        logging={"healthy": True, "detail": "ok"},
-    )
-    data = nuk.read_converge_status(path)
-    assert data["logging"] == {"healthy": True, "detail": "ok"}
-
-
-def test_write_converge_status_omits_logging_when_not_given(tmp_path):
-    """A pre-loop host, or a non-edge role, records no logging line at all."""
-    path = tmp_path / "converge-status.json"
-    nuk.write_converge_status(
-        path, tag="v1.2.0", commit="a" * 40, role="app", results=[], rendered=[], warnings=[]
-    )
-    data = nuk.read_converge_status(path)
-    assert "logging" not in data
-
-
-def test_the_edge_records_the_logging_facility_health(loop, monkeypatch):
-    """Spec §14.3: info-only — the line reflects the facility's health gate."""
-    repo, signers, state = loop
-    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
-    monkeypatch.setattr(nuk, "load_org", lambda path: "ORG")
-    monkeypatch.setattr(nuk, "render_edge_routers", lambda tree, org: [])
-    monkeypatch.setattr(
-        nuk,
-        "env_facility",
-        lambda facilities, capability: facilities[0] if capability == "logs" else None,
-    )
-    monkeypatch.setattr(
-        nuk,
-        "load_facilities",
-        lambda tree: [object()],  # any manifest — env_facility is stubbed
-    )
-    monkeypatch.setattr(nuk, "facility_health", lambda manifest: None)
-    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
-    data = nuk.read_converge_status(state / "converge-status.json")
-    assert data["logging"] == {"healthy": True, "detail": "ok"}
-
-
-def test_a_non_edge_host_records_no_logging_line(loop, monkeypatch):
-    """Loki lives on the edge; only the edge's cycle knows its health."""
-    repo, signers, state = loop
-    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
-    monkeypatch.setattr(
-        nuk,
-        "env_facility",
-        lambda *a, **k: pytest.fail("must not resolve logging off the edge"),
-    )
-    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
-    data = nuk.read_converge_status(state / "converge-status.json")
-    assert "logging" not in data
-
-
-def test_an_unhealthy_logging_facility_is_recorded_not_refused(loop, monkeypatch):
-    """§14.3's fail-open: a dead Loki never blocks or fails the cycle."""
-    repo, signers, state = loop
-    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
-    monkeypatch.setattr(nuk, "load_org", lambda path: "ORG")
-    monkeypatch.setattr(nuk, "render_edge_routers", lambda tree, org: [])
-    monkeypatch.setattr(nuk, "env_facility", lambda facilities, capability: object())
-    monkeypatch.setattr(nuk, "load_facilities", lambda tree: [object()])
-    monkeypatch.setattr(nuk, "facility_health", lambda manifest: "container 'loki' is not running")
-    assert nuk.cmd_converge(repo=repo, signers=signers, state_dir=state, org_file=ORG_FILE) == 0
-    data = nuk.read_converge_status(state / "converge-status.json")
-    assert data["logging"]["healthy"] is False
-    assert "loki" in data["logging"]["detail"]
 
 
 # --- sources.yml and per-source sync (contracts C3) ---------------------------------
