@@ -6,7 +6,7 @@
 apiVersion: nukorg/v1
 kind: Org
 metadata:
-  name: astrojones                  # the GitHub org; its config lives at astrojones/infra
+  name: astrojones                  # the GitHub org; its config lives at <org>/infra
 domains:                            # every managed domain; each gets a wildcard cert
   - astrojones.guru                 # the platform domain (auth., nuk., traefik.)
   - bitcoinalchemist.com            # an app domain

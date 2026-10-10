@@ -62,7 +62,7 @@ CONVERGE_STATE = Path("/var/lib/nuk")
 # anchor is delivered OUT OF BAND (see infra/tf-incus/ALLOWED_SIGNERS.md), never
 # from the repo it protects — a repo carrying its own trust anchor does not have one.
 ALLOWED_SIGNERS = Path("/etc/nuklaut/allowed_signers")
-# The manifest tree every host converges against: a clone of astrojones/infra.
+# The manifest tree every host converges against: a clone of bartixcloud/infra.
 CONVERGE_REPO = CONVERGE_STATE / "infra"
 # Only the CLI default: cmd_converge derives both files from its state_dir argument,
 # so the tests get a tmp_path and the host gets /var/lib/nuk.
@@ -1586,7 +1586,7 @@ def cmd_converge(  # noqa: PLR0911, C901  # each early return is a distinct fail
     """Converge this host to the newest verifying tag of the manifest repo.
 
     Args:
-        repo: Local clone of the manifest repo (astrojones/infra).
+        repo: Local clone of the manifest repo (bartixcloud/infra).
         signers: Allowed-signers file — the trust anchor.
         state_dir: Where the lock, the last-applied record, and the status file live.
         org_file: Org manifest filename inside the tree.
