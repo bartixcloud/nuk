@@ -150,8 +150,15 @@ def test_await_healthy_probes_the_configured_port(monkeypatch):
 # --- blue-green apply path (Task 7) --------------------------------------------------
 
 
-def _blue_green_yml(*, keep_previous: bool, port: int | None = None) -> str:
-    health = "{service: backend, path: /health"
+def _blue_green_yml(
+    *,
+    keep_previous: bool,
+    port: int | None = None,
+    health_service: str = "backend",
+    ingress_service: str = "frontend",
+    ingress_port: int = 80,
+) -> str:
+    health = f"{{service: {health_service}, path: /health"
     if port is not None:
         health += f", port: {port}"
     health += "}"
@@ -164,7 +171,7 @@ def _blue_green_yml(*, keep_previous: bool, port: int | None = None) -> str:
           placement: {{role: app}}
           source: {{repo: "git@github.com:kolbeapp-de/lernstanderfassung.git"}}
           ingress:
-            - {{host: kolbe.astrojones.de, service: frontend, port: 80}}
+            - {{host: kolbe.astrojones.de, service: {ingress_service}, port: {ingress_port}}}
           strategy:
             type: blue-green
             health: {health}
@@ -208,7 +215,7 @@ def test_blue_green_apply_rolls_out_idle_then_flips_then_drains(tmp_path, monkey
 
     assert ups == [("compose", "-p", "kolbe", "--profile", "green", "up", "-d")]
     assert len(execs) == 1
-    assert execs[0][:3] == ("docker", "exec", "kolbe-backend-green")
+    assert execs[0][:3] == ("docker", "exec", "kolbe-backend-green-1")
     assert downs == [
         ("compose", "-p", "kolbe", "--profile", "blue", "down", "backend-blue", "frontend-blue")
     ]
@@ -240,6 +247,61 @@ def test_blue_green_apply_probes_the_health_port(tmp_path, monkeypatch):
 
     execs = [c for c in lines if c[:2] == ("docker", "exec")]
     assert "localhost:9000/health" in execs[0][-1]
+
+
+def test_blue_green_probe_target_matches_the_router_backend(tmp_path, monkeypatch):
+    """The probe and the router URL name the SAME container.
+
+    Both must use docker compose's default `<name>-<service>-<colour>-1` form, so
+    when health and ingress name the same service the probe's `docker exec` target
+    has to equal the router URL host. The expected name is derived from
+    `_container_name` (not the code's literal) and then cross-asserted router-vs-
+    probe, so a stub that merely echoes a wrong probe can't pass.
+    """
+    import yaml
+
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    doc = _write(
+        tmp_path,
+        _blue_green_yml(
+            keep_previous=True,
+            health_service="backend",
+            ingress_service="backend",
+            ingress_port=8080,
+        ),
+    )
+    nuk.cmd_apply(doc, None)
+
+    execs = [c for c in lines if c[:2] == ("docker", "exec")]
+    probe_target = execs[0][2]
+    router = yaml.safe_load((tmp_path / "dynamic" / "kolbe.yml").read_text(encoding="utf-8"))
+    url = router["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
+    router_target = url.removeprefix("http://").rsplit(":", 1)[0]
+
+    assert probe_target == nuk._container_name("kolbe", "backend", "green")
+    assert probe_target == router_target
+
+
+def test_blue_green_drains_every_published_service(tmp_path, monkeypatch):
+    """Drain targets come from the manifest, not a hardcoded backend/frontend pair."""
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    doc = _write(
+        tmp_path,
+        _blue_green_yml(
+            keep_previous=False,
+            health_service="api",
+            ingress_service="web",
+            ingress_port=8080,
+        ),
+    )
+    nuk.cmd_apply(doc, None)
+
+    downs = [c for c in lines if "down" in c]
+    assert downs == [
+        ("compose", "-p", "kolbe", "--profile", "blue", "down", "api-blue", "web-blue")
+    ]
 
 
 NON_STRATEGY_INGRESS_YML = """\

@@ -1199,6 +1199,18 @@ def _rule(ing: dict) -> str:
 DEFAULT_ROUTE_VOCAB: dict[str, list[str]] = {"basic": ["auth@file"]}
 
 
+def _container_name(name: str, service: str, colour: str | None = None) -> str:
+    """The runtime container name docker compose gives an app's service.
+
+    No manifest sets `container_name`, so compose's DEFAULT naming applies:
+    `<project>-<service>-<n>`. The single replicas nuk deploys always land on
+    `-1`, and blue-green adds the colour profile between service and index. Both
+    the router backend (write_ingress) and the health probe (`_apply_blue_green`)
+    must name the same container, so both go through here.
+    """
+    return f"{name}-{service}{f'-{colour}' if colour else ''}-1"
+
+
 def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extraction would obscure the per-field ordering
     name: str,
     ingress: list[dict],
@@ -1287,7 +1299,7 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
         if ing.get("address"):
             backend = ing["address"]
         else:
-            backend = f"{name}-{ing['service']}{f'-{colour}' if colour else ''}-1:{ing['port']}"
+            backend = f"{_container_name(name, ing['service'], colour)}:{ing['port']}"
         services[rid] = {"loadBalancer": {"servers": [{"url": f"http://{backend}"}]}}
         if ing.get("www"):
             host = ing["host"]
@@ -3784,7 +3796,7 @@ def _apply_blue_green(
     # import), so the probe runs through the same runner this host is configured
     # to use — and tests can capture it.
     await_healthy(
-        f"{name}-{health.service}-{idle}",
+        _container_name(name, health.service, idle),
         health.path,
         timeout=health.timeout,
         interval=health.interval,
@@ -3794,13 +3806,19 @@ def _apply_blue_green(
     write_ingress(name, ingress, vocab, colour=idle)
     record_active_colour(name, idle)
     if not strategy.keep_previous:
+        # Drain every service the deployment publishes — the probe service plus
+        # each ingress backend — so a manifest that names them other than the
+        # conventional backend/frontend still tears the old colour fully down.
+        # dict.fromkeys dedups while preserving manifest order.
+        published = dict.fromkeys(
+            [health.service, *(i.get("service") for i in ingress if i.get("service"))]
+        )
         sh(
             *compose_args(name, raw),
             "--profile",
             active,
             "down",
-            f"backend-{active}",
-            f"frontend-{active}",
+            *(f"{service}-{active}" for service in published),
         )
 
 
