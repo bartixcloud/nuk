@@ -1267,9 +1267,8 @@ def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; cle
             "rule": _rule(ing),
             "entryPoints": [entry_point],
             "service": rid,
+            **({} if is_mesh else {"tls": {"certResolver": "letsencrypt"}}),
         }
-        if not is_mesh:
-            router["tls"] = {"certResolver": "letsencrypt"}
         mw = []
         # ⚠ The refusals below are load-bearing. The chain this replaced once had no
         #   `else`, and an unrecognised value fell through to a router with no auth
@@ -1333,9 +1332,8 @@ def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; cle
                 "entryPoints": [entry_point],
                 "service": rid,
                 "middlewares": [rdid],
+                **({} if is_mesh else {"tls": {"certResolver": "letsencrypt"}}),
             }
-            if not is_mesh:
-                routers[wid]["tls"] = {"certResolver": "letsencrypt"}
     http = {"routers": routers, "services": services}
     if middlewares:
         http["middlewares"] = middlewares
