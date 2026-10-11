@@ -1836,6 +1836,22 @@ def _exit_reason(e: SystemExit, default: str) -> str:
     return str(e.code) if e.code else default
 
 
+def _deployment_tree(ctx: TreeContext, manifest: Deployment, path: Path) -> Path:
+    """The tree one Deployment applies from (Task 11).
+
+    `spec.source.unsigned` opts a non-prod deployment into the branch head, so it
+    applies from `ctx.trees["branch"]`; every other deployment keeps the signed tag
+    tree (`ctx.tree`). A hand-run apply carries only a tag tree, so a missing branch
+    key falls back to `path` rather than raising.
+    """
+    if not manifest.spec.source.unsigned:
+        return path
+    branch = ctx.trees.get("branch")
+    if branch is None:
+        return path
+    return branch / path.relative_to(ctx.tree)
+
+
 def apply_tree(ctx: TreeContext) -> list[dict]:
     """Apply this host's Facilities, then its Deployments (spec §7 steps 6-7).
 
@@ -1880,6 +1896,7 @@ def apply_tree(ctx: TreeContext) -> list[dict]:
                 continue
             if manifest.kind != kind or not placement_matches(manifest, role):
                 continue
+            apply_path = path
             if isinstance(manifest, Deployment):
                 poisoned = consumes(manifest) & failed_caps
                 if poisoned:
@@ -1889,9 +1906,10 @@ def apply_tree(ctx: TreeContext) -> list[dict]:
                     )
                     results.append(_result(manifest.metadata.name, kind, "refused", reason))
                     continue
+                apply_path = _deployment_tree(ctx, manifest, path)
             entry = _result(manifest.metadata.name, kind)
             try:
-                cmd_apply(path, None, ctx=ctx)
+                cmd_apply(apply_path, None, ctx=ctx)
             except (SystemExit, ValueError, subprocess.CalledProcessError, OSError) as e:
                 entry["result"] = "failed"
                 entry["error"] = (

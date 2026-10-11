@@ -166,3 +166,53 @@ def test_prepare_source_archives_the_tag_tree_and_the_branch_tree(two_ref_origin
     assert (ctx.trees["tag"] / "f").read_text(encoding="utf-8") == "1\n"
     assert (ctx.trees["branch"] / "f").read_text(encoding="utf-8") == "2\n"
     assert ctx.commits == {"tag": tag_sha, "branch": branch_sha}
+
+
+def _ref_tree(root, marker: str) -> None:
+    """One deployment tree at `root`: a signed `prod` and an unsigned `test`.
+
+    The two trees differ only by `marker`, so reading an applied manifest's
+    `spec.compose.file` proves which tree it came from.
+    """
+    d = root / "deployments"
+    d.mkdir(parents=True)
+    (d / "prod.yml").write_text(
+        "apiVersion: nuk/v1\n"
+        "kind: Deployment\n"
+        "metadata: {name: prod}\n"
+        f"spec: {{source: {{repo: 'r'}}, compose: {marker}.yml}}\n",
+        encoding="utf-8",
+    )
+    (d / "test.yml").write_text(
+        "apiVersion: nuk/v1\n"
+        "kind: Deployment\n"
+        "metadata: {name: test}\n"
+        f"spec: {{source: {{repo: 'r', unsigned: true}}, compose: {marker}.yml}}\n",
+        encoding="utf-8",
+    )
+
+
+def test_apply_tree_selects_the_tree_per_deployment(tmp_path, monkeypatch):
+    """Task 11: `spec.source.unsigned` picks the branch tree, everything else the tag tree."""
+    tag, branch = tmp_path / "tag", tmp_path / "branch"
+    _ref_tree(tag, "tag")
+    _ref_tree(branch, "branch")
+    ctx = nuk.TreeContext.build(
+        tag,
+        "app",
+        None,
+        None,
+        nuk.APPLY_ALL,
+        trees={"tag": tag, "branch": branch},
+        commits={},
+    )
+    applied: dict[str, str] = {}
+
+    def fake(path, _rp, **_k):
+        applied[path.name] = path.read_text(encoding="utf-8")
+
+    monkeypatch.setattr(nuk, "cmd_apply", fake)
+    nuk.apply_tree(ctx)
+
+    assert "compose: branch.yml" in applied["test.yml"]  # unsigned -> branch tree
+    assert "compose: tag.yml" in applied["prod.yml"]  # signed -> tag tree, never branch
