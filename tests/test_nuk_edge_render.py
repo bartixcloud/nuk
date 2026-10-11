@@ -63,6 +63,14 @@ GATE_FACILITY = """
         route: {capability: basic, middlewares: [auth@file]}
 """
 
+ROUTER_FACILITY = """
+    apiVersion: nuk/v1
+    kind: Facility
+    metadata: {name: router}
+    spec:
+      placement: {role: app}
+"""
+
 
 def _tree(tmp_path: Path, deployments: dict[str, str], facilities: dict[str, str]) -> Path:
     for sub, docs in (("deployments", deployments), ("facilities", facilities)):
@@ -149,6 +157,22 @@ def test_edge_render_applies_the_gate_from_the_vocabulary(tmp_path, monkeypatch)
         "auth@file",
         "maintenance-errors@file",
     ]
+
+
+def test_edge_routes_apps_through_the_app_host_router(tmp_path, monkeypatch):
+    """An app-role deployment whose fleet runs the `router` facility points at it.
+
+    The router (a Traefik on the app host, plain HTTP :8443) fronts app containers,
+    so the edge sends traffic there instead of the container's published host port.
+    """
+    tree = _tree(tmp_path, {"hello": HELLO}, {"router": ROUTER_FACILITY})
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml"))
+    doc = yaml.safe_load((dynamic / "hello.yml").read_text())
+    server = doc["http"]["services"]["hello-0"]["loadBalancer"]["servers"][0]
+    assert server["url"] == "http://10.0.10.107:8443"
 
 
 def test_edge_render_skips_deployments_without_ingress(tmp_path, monkeypatch):

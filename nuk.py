@@ -2243,13 +2243,25 @@ class TreeContext:
         return cls.build(_tree_root(manifest_path), role, self_ip, None, APPLY_ALL)
 
 
-def backend_address(org: Org, manifest: Deployment, ing: dict) -> str:
+# The app host's router facility listens for plain-HTTP ingress from the edge on
+# this port (infra: the `router` facility, placement {role: app}). When present,
+# app deployments are fronted by it rather than dialled on their published port.
+ROUTER_PORT = 8443
+
+
+def backend_address(
+    org: Org, manifest: Deployment, ing: dict, *, router_present: bool = False
+) -> str:
     """Where the edge should send traffic for one ingress entry.
 
     An explicit `address` (a backend the org does not manage) passes through.
     Otherwise the backend is the private IP of the org's host for this
     deployment's `placement.role`, on the published port — the port
     build_override publishes, which is `hostPort` when set and `port` otherwise.
+
+    When the fleet runs the `router` facility, an app-role deployment is instead
+    fronted by that router on `ROUTER_PORT`: the app host's Traefik terminates the
+    route, so the edge dials the router, not the container's published port.
 
     Raises:
         ValueError: If the deployment has no placement (the edge cannot guess
@@ -2271,6 +2283,8 @@ def backend_address(org: Org, manifest: Deployment, ing: dict) -> str:
             f"manifest declares no host with role {placement.role!r}."
         )
         raise ValueError(msg)
+    if router_present and placement.role == "app":
+        return f"{host.private_ip}:{ROUTER_PORT}"
     return f"{host.private_ip}:{_published_port(ing)}"
 
 
@@ -2350,7 +2364,9 @@ def _render_routers(
     protected = {f"{m.metadata.name}.yml" for m in deployments}
     for stale in reap_legacy_worker_routers(protected):
         print(f"edge: reaped legacy router {stale} (cross-host delivery is retired)")
-    vocab = route_vocabulary(load_facilities(tree))
+    facilities = load_facilities(tree)
+    vocab = route_vocabulary(facilities)
+    router_present = any(f.metadata.name == "router" for f in facilities)
     rendered: list[str] = []
     refused: list[str] = []
     for manifest in deployments:
@@ -2379,7 +2395,7 @@ def _render_routers(
             ingress = allowed
         resolved = [
             {k: v for k, v in ing.items() if k not in {"service", "port", "hostPort"}}
-            | {"address": backend_address(org, manifest, ing)}
+            | {"address": backend_address(org, manifest, ing, router_present=router_present)}
             for ing in ingress
         ]
         name = manifest.metadata.name
