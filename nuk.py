@@ -1712,6 +1712,11 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
     if tag is None:
         msg = f"no v* tag verifies against {signers}"
         raise ValueError(msg)
+    # The downgrade guard is TAG-MODE ONLY: it compares the newest signed tag against
+    # the last applied one and never the branch head. The branch head is fetched and
+    # archived for unsigned deployments, but a branch head that is older than the
+    # newest tag is legitimate (the tag may have been cut on another branch), so it
+    # must not feed this guard nor trip it.
     assert_not_downgrade(repo, tag, sdir / "last-applied-tag")
     return (
         tag,

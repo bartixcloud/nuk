@@ -146,6 +146,90 @@ def test_sync_source_refuses_a_repo_with_no_signed_tag(two_ref_origin, tmp_path)
         nuk.sync_source(_src(origin), signers_dir, tmp_path / "state")
 
 
+def _signed_work(tmp_path, name="astrojones"):
+    """A work repo on `main` plus its signing key and `allowed_signers.d` entry.
+
+    Returns `(work, pubkey, signers_dir)`; callers commit, `_sign_tag`, then clone bare.
+    """
+    key = tmp_path / "signing"
+    _run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", name, "-f", str(key))
+    pubkey = key.with_suffix(".pub")
+    signers_dir = tmp_path / "allowed_signers.d"
+    signers_dir.mkdir()
+    (signers_dir / name).write_text(
+        f"{name} {pubkey.read_text(encoding='utf-8').strip()}\n", encoding="utf-8"
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    _run("git", "init", "-q", "-b", "main", cwd=work)
+    _run("git", "config", "user.email", "t@example.invalid", cwd=work)
+    _run("git", "config", "user.name", "T", cwd=work)
+    (work / "f").write_text("1\n", encoding="utf-8")
+    _run("git", "add", "f", cwd=work)
+    _run("git", "commit", "-qm", "one", cwd=work)
+    return work, pubkey, signers_dir
+
+
+def _rev(work, ref="HEAD"):
+    return _run("git", "rev-parse", ref, cwd=work).stdout.strip()
+
+
+def test_sync_source_still_refuses_a_signed_tag_downgrade(tmp_path):
+    """Task 12 regression: branch mode must not weaken the signed-tag downgrade guard.
+
+    Apply `v1.1.0`, then delete it upstream. The newest verifying tag falls back to
+    `v1.0.0`, an ancestor — the guard must refuse exactly as it did before Task 10.
+    """
+    work, pubkey, signers_dir = _signed_work(tmp_path)
+    _sign_tag(work, pubkey, "v1.0.0")
+    (work / "f").write_text("2\n", encoding="utf-8")
+    _run("git", "commit", "-qam", "two", cwd=work)
+    _sign_tag(work, pubkey, "v1.1.0")
+    origin = tmp_path / "origin.git"
+    _run("git", "clone", "--bare", "-q", str(work), str(origin))
+
+    state = tmp_path / "state"
+    tag, commit, _branch = nuk.sync_source(_src(origin), signers_dir, state)
+    assert tag == "v1.1.0"
+    nuk.record_applied(tag, commit, nuk.source_state_dir(state, "astrojones") / "last-applied-tag")
+    _run("git", "-C", str(origin), "tag", "-d", "v1.1.0")
+    with pytest.raises(ValueError, match="not a descendant"):
+        nuk.sync_source(_src(origin), signers_dir, state)
+
+
+def test_sync_source_exempts_an_older_unsigned_branch_head(tmp_path):
+    """Task 12: the branch head is not downgrade-guarded — an older head is legitimate.
+
+    `main` advances to the branch head. The newest signed tag `v2.0.0` is cut on a side
+    branch, so it is NOT an ancestor of the branch head. A prior cycle applied `v2.0.0`;
+    the guard must compare the tag only and never refuse over the branch head.
+    """
+    work, pubkey, signers_dir = _signed_work(tmp_path)
+    _sign_tag(work, pubkey, "v1.0.0")
+    c1 = _rev(work)
+    (work / "f").write_text("2\n", encoding="utf-8")
+    _run("git", "commit", "-qam", "two", cwd=work)
+    branch_sha = _rev(work)
+    _run("git", "checkout", "-qb", "release", c1, cwd=work)
+    (work / "f").write_text("3\n", encoding="utf-8")
+    _run("git", "commit", "-qam", "three", cwd=work)
+    _sign_tag(work, pubkey, "v2.0.0")
+    tag_sha = _rev(work)
+    _run("git", "checkout", "-q", "main", cwd=work)
+    origin = tmp_path / "origin.git"
+    _run("git", "clone", "--bare", "-q", str(work), str(origin))
+
+    state = tmp_path / "state"
+    sdir = nuk.source_state_dir(state, "astrojones")
+    sdir.mkdir(parents=True)
+    nuk.record_applied("v2.0.0", tag_sha, sdir / "last-applied-tag")
+
+    tag, got_tag_sha, got_branch_sha = nuk.sync_source(_src(origin), signers_dir, state)
+    assert tag == "v2.0.0"
+    assert got_tag_sha == tag_sha
+    assert got_branch_sha == branch_sha
+
+
 def test_prepare_source_archives_the_tag_tree_and_the_branch_tree(two_ref_origin, tmp_path):
     """Task 10: two trees are archived and both commits stored on the context."""
     origin, signers_dir, tag_sha, branch_sha = two_ref_origin
