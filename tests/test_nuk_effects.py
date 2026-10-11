@@ -299,6 +299,34 @@ def test_default_vocab_reproduces_the_legacy_chain_byte_for_byte():
         assert yaml.safe_dump(doc)  # renders without error
 
 
+# --- blue-green: the router points at the active colour's service -------------
+
+
+KOLBE_INGRESS = [{"host": "kolbe.astrojones.de", "service": "frontend", "port": 80}]
+
+
+def test_write_ingress_colour_urls_the_active_colour_service(tmp_path, monkeypatch):
+    """With a colour the backend is that colour's docker service container."""
+    import yaml
+
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
+    nuk.write_ingress("kolbe", KOLBE_INGRESS, {}, colour="green")
+    doc = yaml.safe_load((tmp_path / "kolbe.yml").read_text(encoding="utf-8"))
+    url = doc["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
+    assert url == "http://kolbe-frontend-green-1:80"
+
+
+def test_write_ingress_without_colour_is_unchanged(tmp_path, monkeypatch):
+    """No colour -> the current single-service URL, byte-for-byte as before."""
+    import yaml
+
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
+    nuk.write_ingress("kolbe", KOLBE_INGRESS, {})
+    doc = yaml.safe_load((tmp_path / "kolbe.yml").read_text(encoding="utf-8"))
+    url = doc["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
+    assert url == "http://kolbe-frontend-1:80"
+
+
 def test_shipped_facilities_reproduce_the_default_vocabulary():
     """The manifests in infra/facilities/ must agree with the built-in default.
 

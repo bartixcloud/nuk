@@ -1098,7 +1098,11 @@ DEFAULT_ROUTE_VOCAB: dict[str, list[str]] = {"basic": ["auth@file"]}
 
 
 def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extraction would obscure the per-field ordering
-    name: str, ingress: list[dict], vocab: dict[str, list[str]]
+    name: str,
+    ingress: list[dict],
+    vocab: dict[str, list[str]],
+    *,
+    colour: str | None = None,
 ) -> dict | None:
     """Render the Traefik file-provider doc, or None to remove the dynamic file.
 
@@ -1119,6 +1123,10 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
         vocab: Route capabilities declared by the facilities in the git tree,
             mapped to their middleware chains (see route_vocabulary). A router
             that asks for a capability absent from this mapping is refused.
+        colour: Optional blue-green colour. When set, each docker-named backend
+            points at that colour's service container
+            (`{name}-{service}-{colour}-1`) instead of the colourless
+            `{name}-{service}-1`. Remote `address` backends are unaffected.
 
     Returns:
         The Traefik dynamic doc, or None when there is no ingress.
@@ -1174,9 +1182,10 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
         # `address` (remote host:port) bypasses the local edge-network container
         # naming convention entirely — used for backends on another host (e.g. a
         # libvirt VM reached over the private vswitch/cloud-network).
-        backend = (
-            ing["address"] if ing.get("address") else f"{name}-{ing['service']}-1:{ing['port']}"
-        )
+        if ing.get("address"):
+            backend = ing["address"]
+        else:
+            backend = f"{name}-{ing['service']}{f'-{colour}' if colour else ''}-1:{ing['port']}"
         services[rid] = {"loadBalancer": {"servers": [{"url": f"http://{backend}"}]}}
         if ing.get("www"):
             host = ing["host"]
@@ -1201,10 +1210,19 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
     return {"http": http}
 
 
-def write_ingress(name: str, ingress: list[dict], vocab: dict[str, list[str]]) -> None:
-    """Render and write the Traefik dynamic file for an app (removes it if empty)."""
+def write_ingress(
+    name: str,
+    ingress: list[dict],
+    vocab: dict[str, list[str]],
+    *,
+    colour: str | None = None,
+) -> None:
+    """Render and write the Traefik dynamic file for an app (removes it if empty).
+
+    `colour` threads the blue-green colour into `build_ingress` (see there).
+    """
     target = _router_file(name)
-    doc = build_ingress(name, ingress, vocab)
+    doc = build_ingress(name, ingress, vocab, colour=colour)
     if doc is None:
         target.unlink(missing_ok=True)
         return
