@@ -2567,7 +2567,12 @@ class RouteResult:
 
 
 def _render_routers(
-    tree: Path, org: Org, *, tenant: str | None, domains: list[str] | None
+    tree: Path,
+    org: Org,
+    *,
+    tenant: str | None,
+    domains: list[str] | None,
+    platform_facilities: list[Facility] | None = None,
 ) -> RouteResult:
     """On the edge: render a router for EVERY Deployment with ingress (spec §6).
 
@@ -2586,6 +2591,12 @@ def _render_routers(
         domains: The tenant allowlist (spec §4 anti-hijack). When set, an ingress
             whose host is in no allowed domain is REFUSED — recorded, never written.
             None (the platform source) writes every host.
+        platform_facilities: The PLATFORM tree's facilities, when the caller has
+            them (a tenant source ships none). The fleet-wide `router` lives in
+            the platform source, so `router_present` must be read from here — not
+            from `tree`, which in the S1 topology holds only this source's
+            deployments. Falls back to `tree`'s own facilities when empty, so a
+            caller that does not plumb them keeps the old behaviour.
 
     Returns:
         The router names written and the refusal lines (one per foreign host).
@@ -2597,7 +2608,7 @@ def _render_routers(
         print(f"edge: reaped legacy router {stale} (cross-host delivery is retired)")
     facilities = load_facilities(tree)
     vocab = route_vocabulary(facilities)
-    router_present = any(f.metadata.name == "router" for f in facilities)
+    router_present = any(f.metadata.name == "router" for f in (platform_facilities or facilities))
     rendered: list[str] = []
     refused: list[str] = []
     for manifest in deployments:
@@ -2655,7 +2666,9 @@ def render_routes(ctx: TreeContext) -> RouteResult:
     if ctx.tenant is not None:
         row = ctx.tenants.get(ctx.tenant) if ctx.tenants is not None else None
         domains = row.domains if row is not None else []
-    return _render_routers(ctx.tree, ctx.org, tenant=ctx.tenant, domains=domains)
+    return _render_routers(
+        ctx.tree, ctx.org, tenant=ctx.tenant, domains=domains, platform_facilities=ctx.facilities
+    )
 
 
 def facility_health(manifest: Facility) -> str | None:
