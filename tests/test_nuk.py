@@ -114,36 +114,24 @@ def test_every_app_router_inherits_maintenance_errors():
     assert routers["kolbeapp-0-www"]["middlewares"] == ["kolbeapp-0-www-redirect"]
 
 
-def test_auth_oauth_prepends_forwardauth_chain():
-    """auth: oauth gates a router via the shared oauth2-proxy GitHub chain,
-    ordered errors-then-auth like the Traefik dashboard, ahead of the inherited
-    maintenance-errors reference. All three are cross-file (@file) references, so
-    no app-local middleware definitions are emitted.
+def test_auth_basic_prepends_the_gate_ahead_of_maintenance_errors():
+    """auth: basic resolves through the route capability `basic` (auth@file). The reference is
+    cross-file (@file), so no app-local middleware definitions are emitted.
     """
     doc = nuk.build_ingress(
         "nukview",
-        [
-            {
-                "host": "nuk.astrojones.de",
-                "service": "nukview",
-                "port": 3000,
-                "auth": "oauth",
-            }
-        ],
+        [{"host": "nuk.example.de", "service": "nukview", "port": 3000, "auth": "basic"}],
         nuk.DEFAULT_ROUTE_VOCAB,
     )
     assert doc["http"]["routers"]["nukview-0"]["middlewares"] == [
-        "oauth-errors@file",
-        "oauth-auth@file",
+        "auth@file",
         "maintenance-errors@file",
     ]
     assert "middlewares" not in doc["http"]
 
 
-def test_auth_oauth_with_pathprefix_orders_oauth_then_strip():
-    """When a path is stripped too, the oauth chain stays outermost, then strip,
-    then the maintenance reference.
-    """
+def test_auth_basic_with_pathprefix_orders_basic_then_strip():
+    """When a path is stripped too, the gate stays outermost, then strip, then maintenance."""
     doc = nuk.build_ingress(
         "api",
         [
@@ -153,53 +141,45 @@ def test_auth_oauth_with_pathprefix_orders_oauth_then_strip():
                 "stripPrefix": True,
                 "service": "s",
                 "port": 1,
-                "auth": "oauth",
+                "auth": "basic",
             }
         ],
         nuk.DEFAULT_ROUTE_VOCAB,
     )
     assert doc["http"]["routers"]["api-0"]["middlewares"] == [
-        "oauth-errors@file",
-        "oauth-auth@file",
+        "auth@file",
         "api-0-strip",
         "maintenance-errors@file",
     ]
 
 
-@pytest.mark.parametrize("bad", ["authentik", "oauth2-proxy", "Oauth", "sso", ""])
+def test_default_route_vocab_is_basic_only():
+    assert nuk.DEFAULT_ROUTE_VOCAB == {"basic": ["auth@file"]}
+
+
+@pytest.mark.parametrize("bad", ["authentik", "oauth2-proxy", "oauth", "Oauth", "sso"])
 def test_unknown_auth_value_refuses_to_render_instead_of_publishing(bad):
     """An unrecognised `auth` must ABORT, never render an ungated router.
 
-    Regression for a fail-open authentication control: `auth` was an unvalidated
-    `str` and the render matched it with if/elif and no else, so any value outside
-    {oauth, basic} produced a router with no auth middleware and no error — the
-    manifest claimed the route was protected while Traefik served it to the world.
-
-    `authentik` is the specific trap: it is legal one layer up (facilities.auth),
-    so it is the natural thing to write per-route, and it published the route.
+    Regression for a fail-open authentication control: `auth` was an unvalidated `str` and
+    the render matched it with if/elif and no else, so a typo produced a router with no auth
+    middleware and no error. build_ingress works on raw dicts (it does not see the Literal),
+    so it refuses on its own.
     """
-    if bad == "":
-        pytest.skip("empty string is falsy upstream; covered by the Literal at load time")
     with pytest.raises(ValueError, match="no facility in the tree provides"):
         nuk.build_ingress(
             "demo", [{"host": "h", "service": "s", "port": 1, "auth": bad}], nuk.DEFAULT_ROUTE_VOCAB
         )
 
 
-@pytest.mark.parametrize("impl", ["authentik", "oauth2-proxy"])
-def test_ingress_auth_rejects_implementation_names_at_load(impl):
-    """Naming an auth *implementation* per-route is rejected with a pointer to `oauth`.
-
-    facilities.auth picks the implementation; every global.<impl>.yml defines the
-    same middleware names, so the per-route value stays implementation-agnostic.
-    """
-    with pytest.raises(ValueError, match=r"belongs in the org's facilities\.auth"):
-        nuk.Ingress(host="h", service="s", port=1, auth=impl)
+@pytest.mark.parametrize("retired", ["oauth", "authentik", "oauth2-proxy"])
+def test_ingress_auth_rejects_the_retired_gates_at_load(retired):
+    """The retired gates are a load-time ValidationError (fail closed), not a silent no-op."""
+    with pytest.raises(ValueError):
+        nuk.Ingress(host="h", service="s", port=1, auth=retired)
 
 
-def test_ingress_auth_accepts_the_two_gates():
-    """The closed set still admits exactly the values the renderer implements."""
-    assert nuk.Ingress(host="h", service="s", port=1, auth="oauth").auth == "oauth"
+def test_ingress_auth_accepts_only_basic():
     assert nuk.Ingress(host="h", service="s", port=1, auth="basic").auth == "basic"
     assert nuk.Ingress(host="h", service="s", port=1).auth is None
 
