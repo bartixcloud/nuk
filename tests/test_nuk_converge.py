@@ -491,7 +491,7 @@ def _src(origin, name="astrojones"):
 
 def test_sync_source_returns_the_verified_tag_and_commit(tenant_origin, tmp_path):
     repo, origin, _, signers_dir = tenant_origin
-    tag, commit = nuk.sync_source(_src(origin), signers_dir, tmp_path / "state")
+    tag, commit, _branch = nuk.sync_source(_src(origin), signers_dir, tmp_path / "state")
     assert tag == "v1.0.0"
     tip = _run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip()
     assert commit == tip
@@ -517,7 +517,7 @@ def test_sync_source_refuses_a_downgrade(tenant_origin, tmp_path):
     _sign_tag(repo, keys["astrojones"], "v1.1.0")
     _run("git", "push", "-q", str(origin), "main", "--tags", cwd=repo)
     state = tmp_path / "state"
-    tag, commit = nuk.sync_source(_src(origin), signers_dir, state)
+    tag, commit, _branch = nuk.sync_source(_src(origin), signers_dir, state)
     assert tag == "v1.1.0"
     nuk.record_applied(tag, commit, nuk.source_state_dir(state, "astrojones") / "last-applied-tag")
     _run("git", "-C", str(origin), "tag", "-d", "v1.1.0")

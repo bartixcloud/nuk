@@ -23,11 +23,12 @@ import subprocess  # noqa: S404  # all calls use fixed argv, no shell (see per-c
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, cast
@@ -46,7 +47,7 @@ from pydantic import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 __version__ = "2.0.0"  # bumped on release by .github/workflows/release.yml
 
@@ -131,6 +132,10 @@ class Source(BaseModel):
 
     repo: str | None = None
     branch: str = "main"
+    # Opt into deploying the branch head without a signed `v*` tag — for
+    # non-prod/test deployments. Prod deployments leave this False and require
+    # a signed tag.
+    unsigned: bool = False
 
 
 class Compose(BaseModel):
@@ -282,6 +287,38 @@ class Provides(_NullTolerant):
     env: EnvProvide | None = None
 
 
+class StrategyHealth(_NullTolerant):
+    """`spec.strategy.health` — the blue-green readiness probe for one service.
+
+    Distinct from the facility `Health` (`spec.health.containers`): this one
+    names a compose service and the HTTP path that proves its idle colour is up.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    service: str
+    path: str
+    port: int | None = None
+    timeout: int = 120
+    interval: float = 2.0
+
+
+class Strategy(_NullTolerant):
+    """`spec.strategy` — how a Deployment rolls out its containers.
+
+    `blue-green` brings the idle colour up, gates on `health`, flips the
+    app-host router to it, then drains the previous colour — unless
+    `keepPrevious` keeps it running for an instant rollback.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: Literal["blue-green"]
+    health: StrategyHealth
+    drain: int = 30
+    keep_previous: bool = Field(default=True, alias="keepPrevious")
+
+
 class Spec(_NullTolerant):
     """The manifest `spec` block."""
 
@@ -293,6 +330,7 @@ class Spec(_NullTolerant):
     env_from: list[EnvFrom] = Field(default=[], alias="envFrom")
     databases: Databases = Databases()
     placement: Placement | None = None
+    strategy: Strategy | None = None
 
 
 class Metadata(BaseModel):
@@ -781,6 +819,101 @@ def project_dir(name: str) -> Path:
     return DEPLOYS / name
 
 
+def _active_colour_file(name: str) -> Path:
+    """The file recording an app's currently live colour."""
+    return project_dir(name) / "active-colour"
+
+
+def active_colour(name: str) -> str:
+    """Return an app's currently live colour, defaulting to `blue`."""
+    path = _active_colour_file(name)
+    try:
+        colour = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "blue"
+    return colour or "blue"
+
+
+def idle_colour(active: str) -> str:
+    """Return the colour opposite `active` (`blue` ↔ `green`)."""
+    return "green" if active == "blue" else "blue"
+
+
+def record_active_colour(name: str, colour: str) -> None:
+    """Persist `colour` as an app's currently live colour."""
+    path = _active_colour_file(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{colour}\n", encoding="utf-8")
+
+
+def _router_dialect_file(name: str) -> Path:
+    """The file recording an app's deployed router dialect."""
+    return project_dir(name) / "router-dialect"
+
+
+def router_dialect(name: str) -> str:
+    """Return an app's deployed router dialect, defaulting to `edge`.
+
+    Persisted by `_apply_blue_green` beside `active-colour`, so a rollback — which
+    has no facilities/ in its tree and so cannot detect router mode — replays the
+    dialect the apply actually wrote.
+    """
+    path = _router_dialect_file(name)
+    try:
+        dialect = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "edge"
+    return dialect or "edge"
+
+
+def record_router_dialect(name: str, dialect: str) -> None:
+    """Persist `dialect` as an app's deployed router dialect."""
+    path = _router_dialect_file(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{dialect}\n", encoding="utf-8")
+
+
+def await_healthy(  # noqa: PLR0913  # one keyword per probe input; all read, none derived
+    container: str,
+    path: str,
+    *,
+    timeout: int,
+    interval: float,
+    port: int = 8000,
+    exec_: Callable[..., None] = sh,
+) -> None:
+    """Block until an idle colour's container answers its health path.
+
+    Polls `docker exec <container> python -c "<urllib request>"` — Kolbe's own
+    readiness pattern — every `interval` seconds until it exits zero, or raises
+    once `timeout` seconds have elapsed. The blue-green rollout calls this
+    before flipping the router to the new colour.
+
+    Args:
+        container: The compose container name to probe.
+        path: The HTTP path that proves the colour is up.
+        timeout: Seconds to keep polling before giving up.
+        interval: Seconds between polls.
+        port: The in-container port the service listens on (spec.strategy.health.port).
+        exec_: The command runner (defaults to `sh`); injected for tests.
+
+    Raises:
+        ValueError: If the container never answered within `timeout` seconds.
+    """
+    probe = f"urllib.request.urlopen('http://localhost:{port}{path}')"
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            exec_("docker", "exec", container, "python", "-c", probe)
+        except (subprocess.SubprocessError, OSError):
+            if time.monotonic() >= deadline:
+                msg = f"container {container!r} did not answer {path!r} within {timeout}s"
+                raise ValueError(msg) from None
+            time.sleep(interval)
+        else:
+            return
+
+
 def _manifest_file(name: str) -> Path:
     """The persisted copy of an app's last applied manifest."""
     return project_dir(name) / "manifest.yml"
@@ -925,6 +1058,8 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
     db_services: list[str] | None = None,
     publish_ip: str | None = None,
     local_data: bool = True,
+    *,
+    colours: list[str] | None = None,
 ) -> dict | None:
     """Compose override wiring services to the shared edge/data networks + secrets.
 
@@ -962,6 +1097,13 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
             host. False omits it: a CROSS-HOST database (spec §3.1) is reached
             over TCP at the data host's private IP, and no local ``data``
             network exists to join.
+        colours: Blue-green colours to expand each service key across — e.g.
+            ``["blue", "green"]`` renders ``backend-blue`` and ``backend-green``.
+            Router mode (C3) passes this: the app-host router resolves each
+            backend by its compose DNS name ``<service>-<colour>`` over the shared
+            ``edge`` network, so the override must key on the profile-suffixed
+            services, not the phantom base names. None (the default) leaves the
+            service keys untouched.
 
     Returns:
         The override doc, or None when no service needs any wiring.
@@ -985,6 +1127,8 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
                 if mapping not in publish_ports[svc]:
                     publish_ports[svc].append(mapping)
     services: dict = {}
+    uses_edge = False
+    uses_data = False
     for svc_name in ordered:
         is_ingress = svc_name in ingress_services
         is_db = svc_name in db_set
@@ -992,19 +1136,25 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
         nets = (["edge"] if is_ingress and not publish_ip else []) + (
             ["data"] if is_db and local_data else []
         )
+        uses_edge = uses_edge or "edge" in nets
+        uses_data = uses_data or "data" in nets
         env_files = [*env_from, *([db_env] if is_db else [])]
-        svc: dict = {"networks": nets}
-        if publish_ip and svc_name in publish_ports:
-            svc["ports"] = publish_ports[svc_name]
-        if env_files:
-            svc["env_file"] = env_files
-        services[svc_name] = svc
+        # Router mode expands each base service onto its colour profile keys, so
+        # the same wiring (networks, creds, no published port) lands on the
+        # containers the router actually resolves.
+        for key in [f"{svc_name}-{c}" for c in colours] if colours else [svc_name]:
+            svc: dict = {"networks": list(nets)}
+            if publish_ip and svc_name in publish_ports:
+                svc["ports"] = list(publish_ports[svc_name])
+            if env_files:
+                svc["env_file"] = list(env_files)
+            services[key] = svc
     if not services:
         return None
     networks: dict = {}
-    if not publish_ip and any(s in ingress_services for s in services):
+    if uses_edge:
         networks["edge"] = {"external": True}
-    if any(s in db_set for s in services) and local_data:
+    if uses_data:
         networks["data"] = {"external": True}
     return {"services": services, "networks": networks}
 
@@ -1025,9 +1175,13 @@ def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override
     db_services: list[str] | None = None,
     publish_ip: str | None = None,
     local_data: bool = True,
+    *,
+    colours: list[str] | None = None,
 ) -> None:
     """Render and write `compose.override.yml` for an app (no-op when empty)."""
-    doc = build_override(name, ingress, db_env, env_from, db_services, publish_ip, local_data)
+    doc = build_override(
+        name, ingress, db_env, env_from, db_services, publish_ip, local_data, colours=colours
+    )
     if doc is None:
         return
     (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc))
@@ -1097,8 +1251,27 @@ def _rule(ing: dict) -> str:
 DEFAULT_ROUTE_VOCAB: dict[str, list[str]] = {"basic": ["auth@file"]}
 
 
-def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extraction would obscure the per-field ordering
-    name: str, ingress: list[dict], vocab: dict[str, list[str]]
+def _container_name(name: str, service: str, colour: str | None = None) -> str:
+    """The runtime container name docker compose gives an app's service.
+
+    ASSUMPTION: every app compose file sets NO `container_name`, so compose's
+    DEFAULT naming applies — `<name>-<service>-<colour>-1` (the project name is the
+    deployment name, the `-<colour>` segment is present only for blue-green, and the
+    single replicas nuk deploys always land on index `-1`). An app that pinned
+    `container_name` would break both callers at once. The router backend
+    (write_ingress) and the health probe (`_apply_blue_green`) must name the same
+    container, so both go through here.
+    """
+    return f"{name}-{service}{f'-{colour}' if colour else ''}-1"
+
+
+def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; clean extraction would obscure the per-field ordering
+    name: str,
+    ingress: list[dict],
+    vocab: dict[str, list[str]],
+    *,
+    colour: str | None = None,
+    dialect: str = "edge",
 ) -> dict | None:
     """Render the Traefik file-provider doc, or None to remove the dynamic file.
 
@@ -1119,20 +1292,34 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
         vocab: Route capabilities declared by the facilities in the git tree,
             mapped to their middleware chains (see route_vocabulary). A router
             that asks for a capability absent from this mapping is refused.
+        colour: Optional blue-green colour. When set, each docker-named backend
+            points at that colour's service container
+            (`{name}-{service}-{colour}-1`) instead of the colourless
+            `{name}-{service}-1`. Remote `address` backends are unaffected.
+        dialect: The entrypoint/TLS flavour. `"edge"` (default) is the internet-
+            facing edge: `websecure`, the letsencrypt cert resolver, and the
+            branded `maintenance-errors@file` page. `"mesh"` is the app-host
+            router, which reaches Traefik over the private mesh only: the `mesh`
+            entrypoint, no TLS (terminated at the edge), no edge `global.yml`
+            middleware. The app-host router serves the WATCHED FILE PROVIDER by URL
+            (its docker provider is off), so these are file-provider routers, never
+            docker-label routers. Backend URL logic is identical in both.
 
     Returns:
         The Traefik dynamic doc, or None when there is no ingress.
     """
     if not ingress:
         return None
+    is_mesh = dialect == "mesh"
+    entry_point = "mesh" if is_mesh else "websecure"
     routers, services, middlewares = {}, {}, {}
     for i, ing in enumerate(ingress):
         rid = f"{name}-{i}"
         router = {
             "rule": _rule(ing),
-            "entryPoints": ["websecure"],
+            "entryPoints": [entry_point],
             "service": rid,
-            "tls": {"certResolver": "letsencrypt"},
+            **({} if is_mesh else {"tls": {"certResolver": "letsencrypt"}}),
         }
         mw = []
         # ⚠ The refusals below are load-bearing. The chain this replaced once had no
@@ -1166,17 +1353,21 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
         # Every app router inherits the controller-wide branded maintenance page:
         # 502-504 from the backend → the maintenance service (see global.yml). The
         # middleware is provider-qualified (@file) since it lives in global.yml.
-        mw.append("maintenance-errors@file")
-        router["middlewares"] = mw
+        # Only the edge ships that file; the mesh dialect leaves it off.
+        if not is_mesh:
+            mw.append("maintenance-errors@file")
+        if mw:
+            router["middlewares"] = mw
         if "priority" in ing:
             router["priority"] = ing["priority"]
         routers[rid] = router
         # `address` (remote host:port) bypasses the local edge-network container
         # naming convention entirely — used for backends on another host (e.g. a
         # libvirt VM reached over the private vswitch/cloud-network).
-        backend = (
-            ing["address"] if ing.get("address") else f"{name}-{ing['service']}-1:{ing['port']}"
-        )
+        if ing.get("address"):
+            backend = ing["address"]
+        else:
+            backend = f"{_container_name(name, ing['service'], colour)}:{ing['port']}"
         services[rid] = {"loadBalancer": {"servers": [{"url": f"http://{backend}"}]}}
         if ing.get("www"):
             host = ing["host"]
@@ -1190,10 +1381,10 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
             }
             routers[wid] = {
                 "rule": f"Host(`www.{host}`)",
-                "entryPoints": ["websecure"],
+                "entryPoints": [entry_point],
                 "service": rid,
                 "middlewares": [rdid],
-                "tls": {"certResolver": "letsencrypt"},
+                **({} if is_mesh else {"tls": {"certResolver": "letsencrypt"}}),
             }
     http = {"routers": routers, "services": services}
     if middlewares:
@@ -1201,10 +1392,21 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
     return {"http": http}
 
 
-def write_ingress(name: str, ingress: list[dict], vocab: dict[str, list[str]]) -> None:
-    """Render and write the Traefik dynamic file for an app (removes it if empty)."""
+def write_ingress(
+    name: str,
+    ingress: list[dict],
+    vocab: dict[str, list[str]],
+    *,
+    colour: str | None = None,
+    dialect: str = "edge",
+) -> None:
+    """Render and write the Traefik dynamic file for an app (removes it if empty).
+
+    `colour` threads the blue-green colour into `build_ingress` (see there).
+    `dialect` selects the edge or mesh entrypoint/TLS flavour (see there).
+    """
     target = _router_file(name)
-    doc = build_ingress(name, ingress, vocab)
+    doc = build_ingress(name, ingress, vocab, colour=colour, dialect=dialect)
     if doc is None:
         target.unlink(missing_ok=True)
         return
@@ -1507,14 +1709,26 @@ def source_state_dir(state_dir: Path, name: str) -> Path:
     return state_dir / "sources" / name
 
 
-def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[str, str]:
+# The branch whose head the unsigned (branch-mode) tree is archived from. A
+# sources.yml entry carries only a repo, and a bare repo has no default fetch
+# refspec, so the branch must be named explicitly. `Source.branch` defaults to
+# this; every fleet repo's main line is `main`.
+SOURCE_BRANCH = "main"
+
+
+def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[str, str, str]:
     """Fetch one source, verify it against its own signers file, guard against downgrade.
 
     The repo is bare: the tree is only ever read through `git archive` of a verified
     commit, never from a worktree.
 
+    Both refs are fetched in one round trip: the signed `v*` tags (always verified
+    against the source's own signers) and the branch head (`SOURCE_BRANCH`). The
+    branch head is UNSIGNED — branch mode is a non-prod opt-in, so it is not
+    signature-checked here and the tag downgrade guard does not apply to it.
+
     Returns:
-        The verified tag and its commit SHA.
+        The verified tag, its commit SHA, and the branch head's SHA.
 
     Raises:
         ValueError: With the refusal reason; nothing but fetched objects changes.
@@ -1532,8 +1746,13 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
         _git(repo, "remote", "set-url", "origin", src.repo)
     except subprocess.CalledProcessError:
         _git(repo, "remote", "add", "origin", src.repo)
-    # --prune-tags so a tag deleted upstream is deleted locally too; without it the
-    # downgrade guard would compare against a tag that exists nowhere else.
+    # The tag refspec prunes a tag deleted upstream (the downgrade guard must not
+    # compare against a tag that exists nowhere else). It is spelled out rather
+    # than `--prune-tags` because an explicit branch refspec on the command line
+    # defeats `--prune-tags` (git does not prune tags then), which would silently
+    # disable the downgrade guard. The branch refspec lands in a durable ref (not
+    # FETCH_HEAD) so the head can be archived by SHA right after. One round trip.
+    branch_ref = f"refs/remotes/origin/{SOURCE_BRANCH}"
     proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
         [  # noqa: S607  # git on PATH
             "git",
@@ -1541,10 +1760,10 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
             str(repo),
             "fetch",
             "--prune",
-            "--prune-tags",
-            "--tags",
             "--force",
             "origin",
+            f"refs/heads/{SOURCE_BRANCH}:{branch_ref}",
+            "refs/tags/*:refs/tags/*",
         ],
         env={**os.environ, "GIT_SSH_COMMAND": git_ssh_command(src.deploy_key)},
         check=False,
@@ -1552,6 +1771,34 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
         text=True,
     )
     if proc.returncode != 0:
+        # `SOURCE_BRANCH` is hardcoded, and the branch refspec shares ONE fetch with the
+        # signed tags: a remote whose branch is not `main` fails the WHOLE fetch, so its
+        # valid signed tag can never deploy. Probe for the branch to name the actual
+        # reason instead of an opaque `git fetch failed` (per-source/per-deployment
+        # branches are a future follow-up — this only tells the operator why the source
+        # is refused). Only reached on failure, so a healthy source pays nothing.
+        probe = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            [  # noqa: S607  # git on PATH
+                "git",
+                "-C",
+                str(repo),
+                "ls-remote",
+                "--heads",
+                "origin",
+                f"refs/heads/{SOURCE_BRANCH}",
+            ],
+            env={**os.environ, "GIT_SSH_COMMAND": git_ssh_command(src.deploy_key)},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0 and not probe.stdout.strip():
+            msg = (
+                f"{src.name}: origin has no {SOURCE_BRANCH} branch — nuk fetches "
+                f"refs/heads/{SOURCE_BRANCH} for every source, so its signed tags cannot "
+                f"deploy (per-source branches are a future follow-up)"
+            )
+            raise ValueError(msg)
         detail = (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[-1]
         msg = f"git fetch failed ({detail}) — no network, no change"
         raise ValueError(msg)
@@ -1559,8 +1806,17 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
     if tag is None:
         msg = f"no v* tag verifies against {signers}"
         raise ValueError(msg)
+    # The downgrade guard is TAG-MODE ONLY: it compares the newest signed tag against
+    # the last applied one and never the branch head. The branch head is fetched and
+    # archived for unsigned deployments, but a branch head that is older than the
+    # newest tag is legitimate (the tag may have been cut on another branch), so it
+    # must not feed this guard nor trip it.
     assert_not_downgrade(repo, tag, sdir / "last-applied-tag")
-    return tag, _git(repo, "rev-parse", f"{tag}^{{commit}}")
+    return (
+        tag,
+        _git(repo, "rev-parse", f"{tag}^{{commit}}"),
+        _git(repo, "rev-parse", branch_ref),
+    )
 
 
 # --- the convergence loop ------------------------------------------------------
@@ -1679,6 +1935,22 @@ def _exit_reason(e: SystemExit, default: str) -> str:
     return str(e.code) if e.code else default
 
 
+def _deployment_tree(ctx: TreeContext, manifest: Deployment, path: Path) -> Path:
+    """The tree one Deployment applies from (Task 11).
+
+    `spec.source.unsigned` opts a non-prod deployment into the branch head, so it
+    applies from `ctx.trees["branch"]`; every other deployment keeps the signed tag
+    tree (`ctx.tree`). A hand-run apply carries only a tag tree, so a missing branch
+    key falls back to `path` rather than raising.
+    """
+    if not manifest.spec.source.unsigned:
+        return path
+    branch = ctx.trees.get("branch")
+    if branch is None:
+        return path
+    return branch / path.relative_to(ctx.tree)
+
+
 def apply_tree(ctx: TreeContext) -> list[dict]:
     """Apply this host's Facilities, then its Deployments (spec §7 steps 6-7).
 
@@ -1723,6 +1995,7 @@ def apply_tree(ctx: TreeContext) -> list[dict]:
                 continue
             if manifest.kind != kind or not placement_matches(manifest, role):
                 continue
+            apply_path = path
             if isinstance(manifest, Deployment):
                 poisoned = consumes(manifest) & failed_caps
                 if poisoned:
@@ -1732,9 +2005,21 @@ def apply_tree(ctx: TreeContext) -> list[dict]:
                     )
                     results.append(_result(manifest.metadata.name, kind, "refused", reason))
                     continue
+                apply_path = _deployment_tree(ctx, manifest, path)
+            # A signed (non-unsigned) deployment must BUILD the signed tag, not the
+            # branch head its clone would otherwise follow: pin the clone to the
+            # tag commit. An unsigned deployment stays on the branch head. A context
+            # without a recorded tag commit (hand-run `for_path`, or Task 10's
+            # `build()` asymmetry with `commits={}`) degrades to today's behaviour —
+            # no pin — rather than raising.
+            pin_commit = (
+                ctx.commits.get("tag")
+                if isinstance(manifest, Deployment) and not manifest.spec.source.unsigned
+                else None
+            )
             entry = _result(manifest.metadata.name, kind)
             try:
-                cmd_apply(path, None, ctx=ctx)
+                cmd_apply(apply_path, None, ctx=ctx, pin_commit=pin_commit)
             except (SystemExit, ValueError, subprocess.CalledProcessError, OSError) as e:
                 entry["result"] = "failed"
                 entry["error"] = (
@@ -1854,6 +2139,11 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
 ) -> TreeContext:
     """Sync, verify and archive one source and build its context; fill tag/commit in `block`.
 
+    Both refs are archived: the signed tag's tree under `tag` and the branch head's
+    under `branch`. `ctx.tree` remains the tag tree (what a signed deployment
+    applies); Task 11's per-deployment selection reads `ctx.trees`. Only the tag
+    path is downgrade-guarded (`sync_source`).
+
     Raises:
         ValueError: With the refusal reason (also CalledProcessError/OSError/SystemExit from
             the git and manifest layers — `_SOURCE_FAILURES`).
@@ -1863,13 +2153,25 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
             "the platform source did not verify this cycle — no facilities or org to apply against"
         )
         raise ValueError(msg)
-    tag, commit = sync_source(src, signers_dir, state_dir)
-    block.update(tag=tag, commit=commit)
-    print(f"target: {src.name} {tag} ({commit[:12]}) role={role}")
-    tree = scratch / src.name
-    archive_tree(source_state_dir(state_dir, src.name) / "repo", commit, tree)
+    tag, tag_sha, branch_sha = sync_source(src, signers_dir, state_dir)
+    block.update(tag=tag, commit=tag_sha)
+    print(f"target: {src.name} {tag} ({tag_sha[:12]}) role={role}")
+    repo = source_state_dir(state_dir, src.name) / "repo"
+    tag_tree = scratch / src.name / "tag"
+    branch_tree = scratch / src.name / "branch"
+    archive_tree(repo, tag_sha, tag_tree)
+    archive_tree(repo, branch_sha, branch_tree)
     tenant = None if src.is_platform else src.name
-    return TreeContext.build(tree, role, self_ip, tenant, frozenset(src.apply), platform=platform)
+    return TreeContext.build(
+        tag_tree,
+        role,
+        self_ip,
+        tenant,
+        frozenset(src.apply),
+        platform=platform,
+        trees={"tag": tag_tree, "branch": branch_tree},
+        commits={"tag": tag_sha, "branch": branch_sha},
+    )
 
 
 def _apply_source(src: SourceEntry, ctx: TreeContext, block: dict, state_dir: Path) -> None:
@@ -2209,6 +2511,11 @@ class TreeContext:
     facilities: list[Facility]
     org: Org | None
     tenants: TenantRegistry | None
+    # Both refs one source was archived at (Task 10): the signed tag's tree and
+    # the branch head's tree, keyed "tag"/"branch". `tree` stays the tag tree (a
+    # signed deployment's). Task 11 picks per deployment from `trees`/`commits`.
+    trees: dict[Literal["tag", "branch"], Path] = field(default_factory=dict)
+    commits: dict[Literal["tag", "branch"], str] = field(default_factory=dict)
 
     @classmethod
     def build(  # noqa: PLR0913  # one field per attribute; a wrapper object buys nothing
@@ -2220,6 +2527,8 @@ class TreeContext:
         apply: frozenset[str],
         *,
         platform: Path | None = None,
+        trees: dict[Literal["tag", "branch"], Path] | None = None,
+        commits: dict[Literal["tag", "branch"], str] | None = None,
     ) -> TreeContext:
         """Load the platform-wide inputs from `platform` (default: `tree` itself)."""
         base = platform or tree
@@ -2234,6 +2543,8 @@ class TreeContext:
             facilities=load_facilities(base, lenient=True),
             org=load_org(org_path) if org_path.is_file() else None,
             tenants=load_tenants(base) if tenants_path.is_file() else None,
+            trees=trees if trees is not None else {"tag": tree},
+            commits=commits if commits is not None else {},
         )
 
     @classmethod
@@ -2243,13 +2554,35 @@ class TreeContext:
         return cls.build(_tree_root(manifest_path), role, self_ip, None, APPLY_ALL)
 
 
-def backend_address(org: Org, manifest: Deployment, ing: dict) -> str:
+# The app host's router facility listens for plain-HTTP ingress from the edge on
+# this port (infra: the `router` facility, placement {role: app}). When present,
+# app deployments are fronted by it rather than dialled on their published port.
+ROUTER_PORT = 8443
+
+
+def _router_present(facilities: list[Facility]) -> bool:
+    """Whether the fleet runs the `router` facility.
+
+    The router lives in the PLATFORM source (contracts C3), so callers must pass
+    the platform facilities (`ctx.facilities`) — never the source tree's own,
+    which in the S1 topology ships deployments only (C4).
+    """
+    return any(f.metadata.name == "router" for f in facilities)
+
+
+def backend_address(
+    org: Org, manifest: Deployment, ing: dict, *, router_present: bool = False
+) -> str:
     """Where the edge should send traffic for one ingress entry.
 
     An explicit `address` (a backend the org does not manage) passes through.
     Otherwise the backend is the private IP of the org's host for this
     deployment's `placement.role`, on the published port — the port
     build_override publishes, which is `hostPort` when set and `port` otherwise.
+
+    When the fleet runs the `router` facility, an app-role deployment is instead
+    fronted by that router on `ROUTER_PORT`: the app host's Traefik terminates the
+    route, so the edge dials the router, not the container's published port.
 
     Raises:
         ValueError: If the deployment has no placement (the edge cannot guess
@@ -2271,6 +2604,8 @@ def backend_address(org: Org, manifest: Deployment, ing: dict) -> str:
             f"manifest declares no host with role {placement.role!r}."
         )
         raise ValueError(msg)
+    if router_present and placement.role == "app":
+        return f"{host.private_ip}:{ROUTER_PORT}"
     return f"{host.private_ip}:{_published_port(ing)}"
 
 
@@ -2322,7 +2657,12 @@ class RouteResult:
 
 
 def _render_routers(
-    tree: Path, org: Org, *, tenant: str | None, domains: list[str] | None
+    tree: Path,
+    org: Org,
+    *,
+    tenant: str | None,
+    domains: list[str] | None,
+    platform_facilities: list[Facility] | None = None,
 ) -> RouteResult:
     """On the edge: render a router for EVERY Deployment with ingress (spec §6).
 
@@ -2341,6 +2681,12 @@ def _render_routers(
         domains: The tenant allowlist (spec §4 anti-hijack). When set, an ingress
             whose host is in no allowed domain is REFUSED — recorded, never written.
             None (the platform source) writes every host.
+        platform_facilities: The PLATFORM tree's facilities, when the caller has
+            them (a tenant source ships none). The fleet-wide `router` lives in
+            the platform source, so `router_present` must be read from here — not
+            from `tree`, which in the S1 topology holds only this source's
+            deployments. Falls back to `tree`'s own facilities when empty, so a
+            caller that does not plumb them keeps the old behaviour.
 
     Returns:
         The router names written and the refusal lines (one per foreign host).
@@ -2350,7 +2696,9 @@ def _render_routers(
     protected = {f"{m.metadata.name}.yml" for m in deployments}
     for stale in reap_legacy_worker_routers(protected):
         print(f"edge: reaped legacy router {stale} (cross-host delivery is retired)")
-    vocab = route_vocabulary(load_facilities(tree))
+    facilities = load_facilities(tree)
+    vocab = route_vocabulary(facilities)
+    router_present = _router_present(platform_facilities or facilities)
     rendered: list[str] = []
     refused: list[str] = []
     for manifest in deployments:
@@ -2379,7 +2727,7 @@ def _render_routers(
             ingress = allowed
         resolved = [
             {k: v for k, v in ing.items() if k not in {"service", "port", "hostPort"}}
-            | {"address": backend_address(org, manifest, ing)}
+            | {"address": backend_address(org, manifest, ing, router_present=router_present)}
             for ing in ingress
         ]
         name = manifest.metadata.name
@@ -2408,7 +2756,9 @@ def render_routes(ctx: TreeContext) -> RouteResult:
     if ctx.tenant is not None:
         row = ctx.tenants.get(ctx.tenant) if ctx.tenants is not None else None
         domains = row.domains if row is not None else []
-    return _render_routers(ctx.tree, ctx.org, tenant=ctx.tenant, domains=domains)
+    return _render_routers(
+        ctx.tree, ctx.org, tenant=ctx.tenant, domains=domains, platform_facilities=ctx.facilities
+    )
 
 
 def facility_health(manifest: Facility) -> str | None:
@@ -3463,6 +3813,25 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         return
     facilities = ctx.facilities
     vocab = route_vocabulary(facilities) if facilities else DEFAULT_ROUTE_VOCAB
+    # Router mode (C1): the fleet runs the `router` facility, which is placed on an
+    # app host and terminates HTTP on the private `mesh` entrypoint — no TLS, no
+    # edge `global.yml`. This host therefore writes its app file router in the mesh
+    # dialect. The gate on `role == "app"` keeps an entry host (which sits alongside
+    # the edge Traefik and still renders edge-dialect routers) on the edge dialect.
+    #
+    # A facilities-less context — a hand-run apply, or the digest-path re-apply
+    # `cmd_rollback` drives through `cmd_apply(..., ctx=None)` — cannot see the
+    # platform `router` facility (the persisted manifest dir ships no facilities/).
+    # Fall back to the dialect the last apply recorded (Task 16) so a router-mode app
+    # keeps its app-host file router instead of unlinking it below; an unrecorded app
+    # reads `edge` and keeps the legacy behaviour.
+    router_present = _router_present(facilities)
+    if not facilities:
+        router_present = router_dialect(name) == "mesh"
+    router_mode = role == "app" and router_present
+    # Only the mesh write carries the dialect; the edge-dialect call stays
+    # byte-identical to what every existing caller and test double expects.
+    mesh_kwargs = {"dialect": "mesh"} if router_mode else {}
     DYNAMIC.mkdir(parents=True, exist_ok=True)
     DEPLOYS.mkdir(parents=True, exist_ok=True)
     source = manifest.spec.source
@@ -3568,26 +3937,53 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             f"{name}: host is non-edge (role={role}) but /etc/nuklaut/host.env has no "
             f"PRIVATE_IP — cannot publish ingress for the edge to reach"
         )
+    strategy = manifest.spec.strategy
+    # Router mode (C3): the app host's own router resolves each backend by its
+    # compose DNS name over the shared `edge` network, so the colour containers
+    # must JOIN `edge` — not publish a host port the router cannot dial. A
+    # blue-green deployment's services are profile-suffixed `<service>-<colour>`;
+    # wire BOTH colours so whichever the rollout flips to is reachable, including
+    # the colour a later rollback brings back up (rollback does not rewrite this
+    # file). A non-blue-green router-mode app keeps its base service keys.
+    router_colours = (
+        ["blue", "green"]
+        if router_mode and strategy is not None and strategy.type == "blue-green"
+        else None
+    )
     write_override(
         name,
         ingress,
         db_env,
         env_from,
         db_services,
-        publish_ip=self_ip if edge_term else None,
+        publish_ip=self_ip if (edge_term and not router_mode) else None,
         local_data=remote_ip is None,
+        colours=router_colours,
     )
-    if edge_term:
-        _router_file(name).unlink(missing_ok=True)  # inert here; the edge owns it
+    if strategy is not None and strategy.type == "blue-green":
+        # Blue-green replaces "ingress -> up -d" with a colour rollout: bring the
+        # idle colour up (its compose profile), gate on its health, flip the
+        # app-host file router to it, record it, then drain the old colour. The
+        # app host owns its own router here (the edge routes stably to it), so
+        # the colourless `edge_term` unlink below is deliberately bypassed.
+        persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
+        _apply_blue_green(name, raw, ingress, vocab, strategy, **mesh_kwargs)
     else:
-        write_ingress(name, ingress, vocab)
-    persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
-    # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
-    # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
-    # whose image id changed. A declaration-only Facility has no compose file at
-    # all — there is nothing to bring up.
-    if not declaration_only:
-        sh(*compose_args(name, raw), "up", "-d")
+        if edge_term and not router_mode:
+            _router_file(name).unlink(missing_ok=True)  # inert here; the edge owns it
+        else:
+            write_ingress(name, ingress, vocab, **mesh_kwargs)
+        # Record the dialect this apply decided (write OR unlink) so a later
+        # facilities-less re-apply — the digest-path rollback — re-decides router mode
+        # from the marker rather than guessing `edge` and unlinking the app-host router.
+        record_router_dialect(name, "mesh" if router_mode else "edge")
+        persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
+        # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
+        # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
+        # whose image id changed. A declaration-only Facility has no compose file at
+        # all — there is nothing to bring up.
+        if not declaration_only:
+            sh(*compose_args(name, raw), "up", "-d")
     # An unhealthy facility must not become "current": write_provenance is what
     # `nuk status`, `nuk rollback` and drift.sh read as the deployed state, so
     # appending here would both hide the breakage and put the last known-good
@@ -3607,6 +4003,96 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         )
     except OSError as e:
         print(f"{name}: provenance not recorded ({e})")
+
+
+def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/dialect, one per concern
+    name: str,
+    raw: dict,
+    ingress: list[dict],
+    vocab: dict[str, list[str]],
+    strategy: Strategy,
+    *,
+    dialect: str = "edge",
+) -> None:
+    """Roll a blue-green deployment onto the idle colour.
+
+    Brings the idle colour's compose profile up, gates on the strategy's health
+    probe, flips the app-host file router to that colour, records it as active,
+    and drains the previous colour — unless `keepPrevious` keeps it for an
+    instant rollback.
+
+    Args:
+        name: The deployment name.
+        raw: The raw manifest dict (for `compose_args`).
+        ingress: The raw `spec.ingress[]` entries.
+        vocab: Route capabilities resolved from the tree.
+        strategy: The parsed `spec.strategy` block.
+        dialect: The file-router dialect the flip writes; `"mesh"` on a router-mode
+            app host, `"edge"` otherwise (see `build_ingress`).
+    """
+    active = active_colour(name)
+    idle = idle_colour(active)
+    health = strategy.health
+    sh(*compose_args(name, raw), "--profile", idle, "up", "-d")
+    # Resolve `sh` at call time (await_healthy's default binds the original at
+    # import), so the probe runs through the same runner this host is configured
+    # to use — and tests can capture it.
+    await_healthy(
+        _container_name(name, health.service, idle),
+        health.path,
+        timeout=health.timeout,
+        interval=health.interval,
+        port=health.port or 8000,
+        exec_=sh,
+    )
+    write_ingress(name, ingress, vocab, colour=idle, dialect=dialect)
+    record_active_colour(name, idle)
+    record_router_dialect(name, dialect)
+    if not strategy.keep_previous:
+        # Drain every service the deployment publishes — the probe service plus
+        # each ingress backend — so a manifest that names them other than the
+        # conventional backend/frontend still tears the old colour fully down.
+        # dict.fromkeys dedups while preserving manifest order.
+        published = dict.fromkeys(
+            [health.service, *(i.get("service") for i in ingress if i.get("service"))]
+        )
+        sh(
+            *compose_args(name, raw),
+            "--profile",
+            active,
+            "down",
+            *(f"{service}-{active}" for service in published),
+        )
+
+
+def _rollback_blue_green(
+    name: str,
+    raw: dict,
+    ingress: list[dict],
+    vocab: dict[str, list[str]],
+    strategy: Strategy,
+) -> None:
+    """Flip a blue-green deployment's router back to its previous colour.
+
+    The inverse of `_apply_blue_green`: the previous colour is the idle one, so
+    bring its compose profile back up (a no-op when `keepPrevious` kept it, and
+    the restart when the last apply drained it), gate on the same health probe,
+    flip the app-host file router back to it, and record it as active. No image
+    change is needed — the previous colour's bits are still on the host.
+    """
+    previous = idle_colour(active_colour(name))
+    health = strategy.health
+    sh(*compose_args(name, raw), "--profile", previous, "up", "-d")
+    await_healthy(
+        _container_name(name, health.service, previous),
+        health.path,
+        timeout=health.timeout,
+        interval=health.interval,
+        port=health.port or 8000,
+        exec_=sh,
+    )
+    write_ingress(name, ingress, vocab, colour=previous, dialect=router_dialect(name))
+    record_active_colour(name, previous)
 
 
 def _compose_ps(name: str, fmt: str) -> list[str]:
@@ -3784,11 +4270,22 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
     provenance write records the release being re-applied with a fresh
     timestamp.
 
+    A blue-green Deployment rolls back differently. `nuk rollback <name>` with
+    no `to` performs a COLOUR FLIP, not a digest re-apply: the router flips back
+    to the previous (idle) colour — brought up and health-gated first — and that
+    colour is recorded active (the inverse of `_apply_blue_green`); there is
+    nothing to pull or pin because the previous colour's bits are already on the
+    host. `to` is NOT honoured on the flip — it only selects a release for the
+    digest path — so a blue-green rollback with an explicit index falls through
+    to the ordinary digest re-apply of release `to`. The flip refuses when no
+    colour has been recorded (there is no previous colour to flip to).
+
     Args:
         name: The deployment name.
         to: History index to restore; None means the entry before the current
-            one. Negative indices count from the end, so `-1` is the current
-            release (a re-apply) and `-2` is the previous one.
+            one (or, for a blue-green Deployment, the colour flip). Negative
+            indices count from the end, so `-1` is the current release (a
+            re-apply) and `-2` is the previous one.
         show: Print the history and apply nothing.
 
     Raises:
@@ -3808,6 +4305,48 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
             digest = (entry.get("imageDigest") or "-").split("@")[-1][:12]
             marker = "  (current)" if i == len(history) - 1 else ""
             print(f"{i:>3}  {commit}  {digest}  {entry.get('appliedAt', '?')}{marker}")
+        return
+    manifest = _manifest_file(name)
+    if not manifest.exists():
+        sys.exit(f"{name}: {manifest} is missing — nothing to re-apply")
+    try:
+        raw = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+        parsed = _MANIFEST_ADAPTER.validate_python(raw)
+    except ValidationError as e:
+        sys.exit(
+            f"{name}: the persisted manifest no longer validates under the current "
+            f"schema (a field was removed since; spec §8) — refusing to silently "
+            f"upgrade it into the new schema: {e}"
+        )
+    if parsed.kind != "Deployment":
+        sys.exit(
+            f"{name}: the persisted manifest is a {parsed.kind}, not a Deployment — "
+            f"facility rollback needs no mechanism, cut a new tag at the old tree (spec §8)"
+        )
+    strategy = parsed.spec.strategy if parsed.spec is not None else None
+    if to is None and strategy is not None and strategy.type == "blue-green":
+        # A blue-green rollback is a colour flip, not a digest re-apply: the
+        # previous colour's bits are already on the host (keepPrevious kept it),
+        # so there is nothing to pull or pin. The router flips back to it and it
+        # is recorded active — the inverse of `_apply_blue_green`. `to` is not
+        # honoured here: an explicit index selects a release to re-apply by
+        # digest (below), so it skips this flip and takes the ordinary path.
+        if not _active_colour_file(name).exists():
+            # `active_colour` would default to blue, flipping to a colour that
+            # never ran. Refuse instead, mirroring the digest path's wording.
+            sys.exit(f"{name}: no previous release recorded — nothing to roll back to")
+        # Resolve the vocabulary the same way `cmd_apply` does, from the
+        # manifest's tree, so rollback and apply cannot drift. The persisted
+        # manifest lives in the deploy state dir, which ships no facilities/, so
+        # this falls back to DEFAULT_ROUTE_VOCAB — the built-in chain that
+        # duplicates infra/facilities/basic.yml's `basic -> [auth@file]`, kept in
+        # step by test_shipped_facilities_reproduce_the_default_vocabulary. A
+        # deployment using a tree-only capability would re-render without it
+        # until the next converge cycle corrects it.
+        ctx = TreeContext.for_path(manifest)
+        vocab = route_vocabulary(ctx.facilities) if ctx.facilities else DEFAULT_ROUTE_VOCAB
+        ingress = (raw.get("spec") or {}).get("ingress", []) or []
+        _rollback_blue_green(name, raw, ingress, vocab, strategy)
         return
     if to is None and len(history) < 2:  # noqa: PLR2004  # need a current AND a previous
         sys.exit(f"{name}: no previous release recorded — nothing to roll back to")
@@ -3829,23 +4368,6 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
             f"{name}: the release at index {index} has no recorded commit "
             f"(a workflow deploy from a .git-less tree) — its compose tree is "
             f"unreproducible, cannot re-apply it"
-        )
-    manifest = _manifest_file(name)
-    if not manifest.exists():
-        sys.exit(f"{name}: {manifest} is missing — nothing to re-apply")
-    try:
-        raw = yaml.safe_load(manifest.read_text(encoding="utf-8"))
-        parsed = _MANIFEST_ADAPTER.validate_python(raw)
-    except ValidationError as e:
-        sys.exit(
-            f"{name}: the persisted manifest no longer validates under the current "
-            f"schema (a field was removed since; spec §8) — refusing to silently "
-            f"upgrade it into the new schema: {e}"
-        )
-    if parsed.kind != "Deployment":
-        sys.exit(
-            f"{name}: the persisted manifest is a {parsed.kind}, not a Deployment — "
-            f"facility rollback needs no mechanism, cut a new tag at the old tree (spec §8)"
         )
     print(f"{name}: rolling back to {digest} (applied {entry.get('appliedAt', '?')})")
     cmd_apply(manifest, None, pin_commit=commit, pin_digest=digest)
