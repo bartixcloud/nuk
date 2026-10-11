@@ -28,7 +28,6 @@ facilities:
   tls: dns01                        # dns01 | http01      (wildcard requires dns01)
   dnsProvider: hetzner              # required when tls: dns01
   secrets: sops                     # sops | generate | ci-inject
-  auth: authentik                   # basic | oauth2-proxy | authentik
   runners: ephemeral                # ephemeral | persistent
 mesh: tailscale                     # tailscale | none    (none only for a single host)
 overlays: [host-tooling-claude]     # host-specific add-on dirs sourced by bootstrap.sh

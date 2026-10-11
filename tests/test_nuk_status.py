@@ -388,7 +388,6 @@ ONE_HOST_ORG = {
         "tls": "dns01",
         "dnsProvider": "hetzner",
         "secrets": "sops",
-        "auth": "authentik",
         "runners": "ephemeral",
     },
     "mesh": "none",

@@ -42,7 +42,6 @@ from pydantic import (
     PrivateAttr,
     TypeAdapter,
     ValidationError,
-    field_validator,
     model_validator,
 )
 
@@ -169,35 +168,12 @@ class Ingress(BaseModel):
     # that bind (default = port), so two worker apps sharing a container port don't collide
     # on the host. Ignored on an edge/all-in-one host (no publish). Finding 6.
     host_port: int | None = Field(default=None, alias="hostPort")
-    # Which gate to put in front of this route — NOT which implementation provides it.
-    # `oauth` resolves to whatever `facilities.auth` selected for the org, because every
-    # global.<impl>.yml deliberately defines the same middleware names (oauth-auth,
-    # oauth-errors). So an org on Authentik still writes `auth: oauth` here.
-    #
-    # ⚠ This MUST stay a closed set. It was a bare `str | None`, and build_ingress matches
-    #   it with if/elif and no else — so any unrecognised value rendered a router with NO
-    #   auth middleware and NO error. `auth: authentik` is the tempting way to write it
-    #   (it IS legal one layer up, in facilities.auth) and it silently published the route.
-    #   An authentication control that fails OPEN on a typo is exactly the silent-failure
-    #   class the 2026-07-21 rebuild exists to make structurally impossible.
-    auth: Literal["basic", "oauth"] | None = None
-
-    @field_validator("auth", mode="before")
-    @classmethod
-    def _reject_impl_names(cls, v: object) -> object:
-        """Point the implementation names at the capability name they belong to.
-
-        Raises:
-            ValueError: If `auth` names an auth *implementation* rather than the gate.
-        """
-        if isinstance(v, str) and v in {"authentik", "oauth2-proxy"}:
-            msg = (
-                f"ingress.auth={v!r} names an auth IMPLEMENTATION, which belongs in the "
-                f"org's facilities.auth. Per-route, write `auth: oauth` — it resolves to "
-                f"whichever implementation this org runs."
-            )
-            raise ValueError(msg)
-        return v
+    # Which gate to put in front of this route. Since authentik and oauth2-proxy were retired
+    # `basic` is the only value, and it resolves through the route capability of the same name.
+    # This MUST stay a closed set: an unknown value used to render a router with NO auth
+    # middleware and NO error, an authentication control failing OPEN on a typo. A retired value
+    # (`oauth`, `authentik`) is now a load-time ValidationError.
+    auth: Literal["basic"] | None = None
 
     @model_validator(mode="after")
     def _check_backend(self) -> Ingress:
@@ -273,8 +249,8 @@ class Health(_NullTolerant):
 class RouteProvide(BaseModel):
     """`spec.provides.route` — a stateless decoration a router can opt into.
 
-    `capability` is what the facility HANDS OUT; a Deployment consumes it via
-    the §5.3 field→capability map (`ingress[].auth: oauth` → `auth`).
+    `capability` is what the facility HANDS OUT; a Deployment consumes it by
+    naming it in a field (`ingress[].auth: basic` → capability `basic`).
     `middlewares` are applied in declaration order, outer→inner.
     """
 
@@ -381,7 +357,7 @@ _MANIFEST_ADAPTER = TypeAdapter(AnyManifest)
 # One org's declarative facility choices, read by BOTH the core bootstrap (to
 # BUILD the platform) and the deploy plugin (to OPERATE it). Kept flat (not
 # spec-nested like nuk/v1) because it is human-edited and read key-by-key by
-# shell (`nuk org get facilities.auth`); dotted paths use the YAML alias names.
+# shell (`nuk org get facilities.dnsProvider`); dotted paths use the YAML alias names.
 
 
 class OrgData(BaseModel):
@@ -400,7 +376,6 @@ class Facilities(BaseModel):
     tls: Literal["dns01", "http01"]
     dns_provider: str | None = Field(default=None, alias="dnsProvider")
     secrets: Literal["sops", "generate", "ci-inject"]
-    auth: Literal["basic", "oauth2-proxy", "authentik"]
     runners: Literal["none", "ephemeral", "persistent"]
     data: OrgData = OrgData()
 
@@ -1118,16 +1093,8 @@ def _rule(ing: dict) -> str:
 # path — a single-host controller with no facilities dir — so its renders stay
 # byte-identical (spec §12). A tree that ships facilities/ overrides it entirely;
 # test_shipped_facilities_reproduce_the_default_vocabulary keeps the two in step.
-# Keys are CAPABILITY names (post-translation, see _ROUTE_CAPABILITY below).
-DEFAULT_ROUTE_VOCAB: dict[str, list[str]] = {
-    "auth": ["oauth-errors@file", "oauth-auth@file"],
-    "basic": ["auth@file"],
-}
-
-# The §5.3 field→capability map for route effects: `ingress[].auth: oauth`
-# consumes route capability `auth`. Field values absent here translate to
-# themselves (`basic` → `basic`). Adding a capability adds a row.
-_ROUTE_CAPABILITY: dict[str, str] = {"oauth": "auth"}
+# Keys are route CAPABILITY names; today `ingress[].auth: basic` names the capability `basic`.
+DEFAULT_ROUTE_VOCAB: dict[str, list[str]] = {"basic": ["auth@file"]}
 
 
 def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extraction would obscure the per-field ordering
@@ -1143,9 +1110,8 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
       stripPrefix strip `path` before proxying (needs path)
       priority    explicit router priority (Traefik else ranks by rule length)
       www         also answer www.<host> with a 301 to <host> (opt-in; apex only)
-      auth        "oauth"/"basic" -> the middleware chain of the route capability
-                  it maps to (_ROUTE_CAPABILITY), as declared by the facilities in
-                  `vocab` — e.g. the org's oauth2-proxy or Authentik forwardAuth
+      auth        "basic" -> HTTP Basic Auth (the route capability `basic`, middleware auth@file;
+                  refused unless a Facility in the tree provides it)
 
     Args:
         name: The deployment name, used to prefix router/service ids.
@@ -1176,9 +1142,7 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
         #   capability whose chain is empty, are BOTH refusals (spec §5.4).
         want = ing.get("auth")
         if want is not None:
-            # §5.3's field→capability map: the router asks for `oauth`, the
-            # facility provides `auth`. Identity for unmapped values (`basic`).
-            capability = _ROUTE_CAPABILITY.get(want, want)
+            capability = want
             if capability not in vocab:
                 msg = (
                     f"ingress.auth={want!r} maps to capability {capability!r}, which no "
@@ -2153,8 +2117,7 @@ def route_vocabulary(facilities: list[Facility]) -> dict[str, list[str]]:
     """Map each declared route capability to its middleware chain.
 
     Order within a chain is the facility's declaration order: outer→inner, the
-    same order the existing hardcoded chain uses (`[oauth-errors, oauth-auth]` —
-    errors outside catches the 401-403 auth returns and serves the sign-in page).
+    same order the hardcoded default chain uses.
 
     Raises:
         SystemExit: If two facilities declare the same capability. A closed
@@ -2479,7 +2442,6 @@ def consumes(manifest: Deployment) -> set[str]:
 
     | Deployment field        | Consumes                   |
     |--------------------------|----------------------------|
-    | `ingress[].auth: oauth` | route capability `auth`    |
     | `databases:`            | env capability `databases` |
 
     A Deployment consuming nothing still gets the default `tls` route from the
@@ -2494,8 +2456,6 @@ def consumes(manifest: Deployment) -> set[str]:
         The capability names consumed; empty for none.
     """
     caps: set[str] = set()
-    if any(ing.auth == "oauth" for ing in manifest.spec.ingress):
-        caps.add(_ROUTE_CAPABILITY["oauth"])
     db = manifest.spec.databases
     if db.postgres or db.redis:
         caps.add(_DATABASES_CAPABILITY)
@@ -3506,7 +3466,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     DYNAMIC.mkdir(parents=True, exist_ok=True)
     DEPLOYS.mkdir(parents=True, exist_ok=True)
     source = manifest.spec.source
-    # A declaration-only Facility (facilities/oauth.yml, facilities/basic.yml)
+    # A declaration-only Facility (e.g. facilities/basic.yml)
     # provides a route capability and nothing else: no source to clone, no
     # compose payload to mirror, no services to bring up. Applying it is pure
     # vocabulary registration, so demanding a facilities/<name>/ payload it has
@@ -3970,7 +3930,7 @@ Manifest (apiVersion: nuk/v1, kind: Deployment):
   spec.ingress[].{host,service,port}, spec.envFrom[].secretRef
   spec.ingress[] also takes optional: path (PathPrefix), stripPrefix,
     priority, www (301 www.<host> -> <host>; apex domains only),
-    auth ("oauth" -> the org's forwardAuth gate, "basic" -> HTTP Basic Auth)
+    auth ("basic" -> HTTP Basic Auth; refused unless a Facility provides the capability)
   spec.envFrom[].secretRef -> existing env files injected into each
     ingress service's container env via the compose override (and also
     passed to `docker compose --env-file` for ${VAR} interpolation).
@@ -4319,7 +4279,7 @@ def _org_validate(
 @org_app.command("get")
 def _org_get(
     path: Annotated[Path, typer.Argument(help="path to nuklaut.org.yml")],
-    key: Annotated[str, typer.Argument(help="dotted key, e.g. facilities.auth")],
+    key: Annotated[str, typer.Argument(help="dotted key, e.g. facilities.dnsProvider")],
 ) -> None:
     """Print one value from an Org manifest by dotted key (for bootstrap + plugin)."""
     print(_emit(org_get(load_org(path), key)))

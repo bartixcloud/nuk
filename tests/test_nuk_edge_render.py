@@ -38,7 +38,6 @@ ORG = """
       tls: dns01
       dnsProvider: hetzner
       secrets: sops
-      auth: authentik
       runners: persistent
     mesh: tailscale
 """
@@ -54,14 +53,14 @@ HELLO = """
         - {host: hello.example.com, service: web, port: 8080}
 """
 
-OAUTH_FACILITY = """
+GATE_FACILITY = """
     apiVersion: nuk/v1
     kind: Facility
-    metadata: {name: auth}
+    metadata: {name: basic-auth}
     spec:
       placement: {role: edge}
       provides:
-        route: {capability: auth, middlewares: [oauth-errors@file, oauth-auth@file]}
+        route: {capability: basic, middlewares: [auth@file]}
 """
 
 
@@ -78,7 +77,7 @@ def _tree(tmp_path: Path, deployments: dict[str, str], facilities: dict[str, str
 
 def test_backend_resolves_from_the_org_manifest(tmp_path):
     """Spec §6: backend private IP comes from the org manifest, per placement."""
-    tree = _tree(tmp_path, {"hello": HELLO}, {"auth": OAUTH_FACILITY})
+    tree = _tree(tmp_path, {"hello": HELLO}, {"basic": GATE_FACILITY})
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
     assert nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0]) == "10.0.10.107:8080"
@@ -125,7 +124,7 @@ def test_edge_renders_a_router_for_every_deployment(tmp_path, monkeypatch):
     tree = _tree(
         tmp_path,
         {"hello": HELLO, "other": HELLO.replace("hello", "other")},
-        {"auth": OAUTH_FACILITY},
+        {"basic": GATE_FACILITY},
     )
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
@@ -139,16 +138,15 @@ def test_edge_renders_a_router_for_every_deployment(tmp_path, monkeypatch):
 
 
 def test_edge_render_applies_the_gate_from_the_vocabulary(tmp_path, monkeypatch):
-    gated = HELLO.replace("port: 8080}", "port: 8080, auth: oauth}")
-    tree = _tree(tmp_path, {"hello": gated}, {"auth": OAUTH_FACILITY})
+    gated = HELLO.replace("port: 8080}", "port: 8080, auth: basic}")
+    tree = _tree(tmp_path, {"hello": gated}, {"basic": GATE_FACILITY})
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
     monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
     nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml"))
     doc = yaml.safe_load((dynamic / "hello.yml").read_text())
     assert doc["http"]["routers"]["hello-0"]["middlewares"] == [
-        "oauth-errors@file",
-        "oauth-auth@file",
+        "auth@file",
         "maintenance-errors@file",
     ]
 
@@ -172,7 +170,7 @@ def test_edge_render_skips_deployments_placed_on_an_entry_host(tmp_path, monkeyp
     file with a `privateIp:port` nothing is listening on.
     """
     local = HELLO.replace("role: app", f"role: {role}")
-    tree = _tree(tmp_path, {"hello": local}, {"auth": OAUTH_FACILITY})
+    tree = _tree(tmp_path, {"hello": local}, {"basic": GATE_FACILITY})
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
     (dynamic / "hello.yml").write_text("http: {local: true}\n", encoding="utf-8")
@@ -207,7 +205,7 @@ def test_render_edge_routers_reaps_first(tmp_path, monkeypatch):
     Traefik resolves that nondeterministically, so the stale one must be gone
     before the fresh one is published — not merely at some later point.
     """
-    tree = _tree(tmp_path, {"hello": HELLO}, {"auth": OAUTH_FACILITY})
+    tree = _tree(tmp_path, {"hello": HELLO}, {"basic": GATE_FACILITY})
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
     (dynamic / "worker-hello.yml").write_text("http: {}\n", encoding="utf-8")
