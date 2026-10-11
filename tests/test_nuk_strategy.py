@@ -377,3 +377,100 @@ def test_blue_green_rollback_refuses_without_a_persisted_manifest(tmp_path, monk
     monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
     with pytest.raises(SystemExit, match=r"manifest\.yml"):
         nuk.cmd_rollback("kolbe", to=None, show=False)
+
+
+def test_rollback_to_an_explicit_index_does_not_flip_a_blue_green_app(tmp_path, monkeypatch):
+    """`--to N` re-applies release N by digest; it must NOT colour-flip.
+
+    The flip is only for `to is None`; an explicit index is the digest path,
+    even on a blue-green deployment (a silent flip would be a surprising,
+    side-effecting regression).
+    """
+    import json
+
+    deployments = tmp_path / "deploys"
+    releases = tmp_path / "releases"
+    (deployments / "kolbe").mkdir(parents=True)
+    releases.mkdir()
+    (releases / "kolbe.jsonl").write_text(
+        json.dumps(
+            {"commit": "a" * 40, "imageDigest": "sha256:1", "appliedAt": "2026-01-01T00:00:00.000Z"}
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (deployments / "kolbe" / "manifest.yml").write_text(
+        _blue_green_yml(keep_previous=True), encoding="utf-8"
+    )
+    monkeypatch.setattr(nuk, "RELEASES", releases)
+    monkeypatch.setattr(nuk, "DEPLOYS", deployments)
+    monkeypatch.setattr(nuk, "project_dir", lambda name: deployments / name)
+    seen: dict[str, str | None] = {}
+    monkeypatch.setattr(
+        nuk,
+        "cmd_apply",
+        lambda path, repo_path, *, pin_commit=None, pin_digest=None: seen.update(
+            pin_digest=pin_digest, pin_commit=pin_commit
+        ),
+    )
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(nuk, "sh", lambda *cmd, **_k: calls.append(cmd))
+
+    nuk.cmd_rollback("kolbe", to=0, show=False)
+
+    assert seen["pin_digest"] == "sha256:1"
+    assert seen["pin_commit"] == "a" * 40
+    assert calls == []  # no flip: no compose up, no router write, no colour record
+
+
+def test_blue_green_rollback_refuses_without_a_recorded_colour(tmp_path, monkeypatch):
+    """No apply ever recorded a colour, so there is no previous colour to flip to.
+
+    `active_colour` defaults to blue; without this guard the flip would bring
+    up a colour that never ran and record it active.
+    """
+    deployments = tmp_path / "deploys"
+    (deployments / "kolbe").mkdir(parents=True)
+    (deployments / "kolbe" / "manifest.yml").write_text(
+        _blue_green_yml(keep_previous=True), encoding="utf-8"
+    )
+    monkeypatch.setattr(nuk, "RELEASES", tmp_path / "releases")
+    monkeypatch.setattr(nuk, "DEPLOYS", deployments)
+    monkeypatch.setattr(nuk, "project_dir", lambda name: deployments / name)
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(nuk, "sh", lambda *cmd, **_k: calls.append(cmd))
+
+    with pytest.raises(SystemExit, match=r"no previous release recorded"):
+        nuk.cmd_rollback("kolbe", to=None, show=False)
+
+    assert calls == []
+    assert nuk.active_colour("kolbe") == "blue"  # nothing was flipped or recorded
+
+
+def test_blue_green_rollback_flips_back_even_when_keep_previous_kept_it(tmp_path, monkeypatch):
+    """A kept previous colour is already up; rollback still flips to it."""
+    import yaml
+
+    deployments = tmp_path / "deploys"
+    (deployments / "kolbe").mkdir(parents=True)
+    (deployments / "kolbe" / "manifest.yml").write_text(
+        _blue_green_yml(keep_previous=True), encoding="utf-8"
+    )
+    monkeypatch.setattr(nuk, "RELEASES", tmp_path / "releases")
+    monkeypatch.setattr(nuk, "DEPLOYS", deployments)
+    (tmp_path / "dynamic").mkdir()
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "project_dir", lambda name: deployments / name)
+    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
+    monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["compose", "-p", "kolbe"])
+    nuk.record_active_colour("kolbe", "green")
+    rolled: list[tuple[str, ...]] = []
+    monkeypatch.setattr(nuk, "sh", lambda *cmd, **_k: rolled.append(cmd))
+
+    nuk.cmd_rollback("kolbe", to=None, show=False)
+
+    assert _profile_up(rolled) == [("compose", "-p", "kolbe", "--profile", "blue", "up", "-d")]
+    assert nuk.active_colour("kolbe") == "blue"
+    router = yaml.safe_load((tmp_path / "dynamic" / "kolbe.yml").read_text(encoding="utf-8"))
+    url = router["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
+    assert url == "http://kolbe-frontend-blue-1:80"

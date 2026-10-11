@@ -4027,11 +4027,22 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
     provenance write records the release being re-applied with a fresh
     timestamp.
 
+    A blue-green Deployment rolls back differently. `nuk rollback <name>` with
+    no `to` performs a COLOUR FLIP, not a digest re-apply: the router flips back
+    to the previous (idle) colour — brought up and health-gated first — and that
+    colour is recorded active (the inverse of `_apply_blue_green`); there is
+    nothing to pull or pin because the previous colour's bits are already on the
+    host. `to` is NOT honoured on the flip — it only selects a release for the
+    digest path — so a blue-green rollback with an explicit index falls through
+    to the ordinary digest re-apply of release `to`. The flip refuses when no
+    colour has been recorded (there is no previous colour to flip to).
+
     Args:
         name: The deployment name.
         to: History index to restore; None means the entry before the current
-            one. Negative indices count from the end, so `-1` is the current
-            release (a re-apply) and `-2` is the previous one.
+            one (or, for a blue-green Deployment, the colour flip). Negative
+            indices count from the end, so `-1` is the current release (a
+            re-apply) and `-2` is the previous one.
         show: Print the history and apply nothing.
 
     Raises:
@@ -4070,13 +4081,29 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
             f"facility rollback needs no mechanism, cut a new tag at the old tree (spec §8)"
         )
     strategy = parsed.spec.strategy if parsed.spec is not None else None
-    if strategy is not None and strategy.type == "blue-green":
+    if to is None and strategy is not None and strategy.type == "blue-green":
         # A blue-green rollback is a colour flip, not a digest re-apply: the
         # previous colour's bits are already on the host (keepPrevious kept it),
         # so there is nothing to pull or pin. The router flips back to it and it
-        # is recorded active — the inverse of `_apply_blue_green`.
+        # is recorded active — the inverse of `_apply_blue_green`. `to` is not
+        # honoured here: an explicit index selects a release to re-apply by
+        # digest (below), so it skips this flip and takes the ordinary path.
+        if not _active_colour_file(name).exists():
+            # `active_colour` would default to blue, flipping to a colour that
+            # never ran. Refuse instead, mirroring the digest path's wording.
+            sys.exit(f"{name}: no previous release recorded — nothing to roll back to")
+        # Resolve the vocabulary the same way `cmd_apply` does, from the
+        # manifest's tree, so rollback and apply cannot drift. The persisted
+        # manifest lives in the deploy state dir, which ships no facilities/, so
+        # this falls back to DEFAULT_ROUTE_VOCAB — the built-in chain that
+        # duplicates infra/facilities/basic.yml's `basic -> [auth@file]`, kept in
+        # step by test_shipped_facilities_reproduce_the_default_vocabulary. A
+        # deployment using a tree-only capability would re-render without it
+        # until the next converge cycle corrects it.
+        ctx = TreeContext.for_path(manifest)
+        vocab = route_vocabulary(ctx.facilities) if ctx.facilities else DEFAULT_ROUTE_VOCAB
         ingress = (raw.get("spec") or {}).get("ingress", []) or []
-        _rollback_blue_green(name, raw, ingress, DEFAULT_ROUTE_VOCAB, strategy)
+        _rollback_blue_green(name, raw, ingress, vocab, strategy)
         return
     if to is None and len(history) < 2:  # noqa: PLR2004  # need a current AND a previous
         sys.exit(f"{name}: no previous release recorded — nothing to roll back to")
