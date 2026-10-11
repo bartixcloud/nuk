@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, cast
@@ -1643,14 +1643,26 @@ def source_state_dir(state_dir: Path, name: str) -> Path:
     return state_dir / "sources" / name
 
 
-def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[str, str]:
+# The branch whose head the unsigned (branch-mode) tree is archived from. A
+# sources.yml entry carries only a repo, and a bare repo has no default fetch
+# refspec, so the branch must be named explicitly. `Source.branch` defaults to
+# this; every fleet repo's main line is `main`.
+SOURCE_BRANCH = "main"
+
+
+def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[str, str, str]:
     """Fetch one source, verify it against its own signers file, guard against downgrade.
 
     The repo is bare: the tree is only ever read through `git archive` of a verified
     commit, never from a worktree.
 
+    Both refs are fetched in one round trip: the signed `v*` tags (always verified
+    against the source's own signers) and the branch head (`SOURCE_BRANCH`). The
+    branch head is UNSIGNED — branch mode is a non-prod opt-in, so it is not
+    signature-checked here and the tag downgrade guard does not apply to it.
+
     Returns:
-        The verified tag and its commit SHA.
+        The verified tag, its commit SHA, and the branch head's SHA.
 
     Raises:
         ValueError: With the refusal reason; nothing but fetched objects changes.
@@ -1668,8 +1680,13 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
         _git(repo, "remote", "set-url", "origin", src.repo)
     except subprocess.CalledProcessError:
         _git(repo, "remote", "add", "origin", src.repo)
-    # --prune-tags so a tag deleted upstream is deleted locally too; without it the
-    # downgrade guard would compare against a tag that exists nowhere else.
+    # The tag refspec prunes a tag deleted upstream (the downgrade guard must not
+    # compare against a tag that exists nowhere else). It is spelled out rather
+    # than `--prune-tags` because an explicit branch refspec on the command line
+    # defeats `--prune-tags` (git does not prune tags then), which would silently
+    # disable the downgrade guard. The branch refspec lands in a durable ref (not
+    # FETCH_HEAD) so the head can be archived by SHA right after. One round trip.
+    branch_ref = f"refs/remotes/origin/{SOURCE_BRANCH}"
     proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
         [  # noqa: S607  # git on PATH
             "git",
@@ -1677,10 +1694,10 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
             str(repo),
             "fetch",
             "--prune",
-            "--prune-tags",
-            "--tags",
             "--force",
             "origin",
+            f"refs/heads/{SOURCE_BRANCH}:{branch_ref}",
+            "refs/tags/*:refs/tags/*",
         ],
         env={**os.environ, "GIT_SSH_COMMAND": git_ssh_command(src.deploy_key)},
         check=False,
@@ -1696,7 +1713,11 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
         msg = f"no v* tag verifies against {signers}"
         raise ValueError(msg)
     assert_not_downgrade(repo, tag, sdir / "last-applied-tag")
-    return tag, _git(repo, "rev-parse", f"{tag}^{{commit}}")
+    return (
+        tag,
+        _git(repo, "rev-parse", f"{tag}^{{commit}}"),
+        _git(repo, "rev-parse", branch_ref),
+    )
 
 
 # --- the convergence loop ------------------------------------------------------
@@ -1990,6 +2011,11 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
 ) -> TreeContext:
     """Sync, verify and archive one source and build its context; fill tag/commit in `block`.
 
+    Both refs are archived: the signed tag's tree under `tag` and the branch head's
+    under `branch`. `ctx.tree` remains the tag tree (what a signed deployment
+    applies); Task 11's per-deployment selection reads `ctx.trees`. Only the tag
+    path is downgrade-guarded (`sync_source`).
+
     Raises:
         ValueError: With the refusal reason (also CalledProcessError/OSError/SystemExit from
             the git and manifest layers — `_SOURCE_FAILURES`).
@@ -1999,13 +2025,25 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
             "the platform source did not verify this cycle — no facilities or org to apply against"
         )
         raise ValueError(msg)
-    tag, commit = sync_source(src, signers_dir, state_dir)
-    block.update(tag=tag, commit=commit)
-    print(f"target: {src.name} {tag} ({commit[:12]}) role={role}")
-    tree = scratch / src.name
-    archive_tree(source_state_dir(state_dir, src.name) / "repo", commit, tree)
+    tag, tag_sha, branch_sha = sync_source(src, signers_dir, state_dir)
+    block.update(tag=tag, commit=tag_sha)
+    print(f"target: {src.name} {tag} ({tag_sha[:12]}) role={role}")
+    repo = source_state_dir(state_dir, src.name) / "repo"
+    tag_tree = scratch / src.name / "tag"
+    branch_tree = scratch / src.name / "branch"
+    archive_tree(repo, tag_sha, tag_tree)
+    archive_tree(repo, branch_sha, branch_tree)
     tenant = None if src.is_platform else src.name
-    return TreeContext.build(tree, role, self_ip, tenant, frozenset(src.apply), platform=platform)
+    return TreeContext.build(
+        tag_tree,
+        role,
+        self_ip,
+        tenant,
+        frozenset(src.apply),
+        platform=platform,
+        trees={"tag": tag_tree, "branch": branch_tree},
+        commits={"tag": tag_sha, "branch": branch_sha},
+    )
 
 
 def _apply_source(src: SourceEntry, ctx: TreeContext, block: dict, state_dir: Path) -> None:
@@ -2345,6 +2383,11 @@ class TreeContext:
     facilities: list[Facility]
     org: Org | None
     tenants: TenantRegistry | None
+    # Both refs one source was archived at (Task 10): the signed tag's tree and
+    # the branch head's tree, keyed "tag"/"branch". `tree` stays the tag tree (a
+    # signed deployment's). Task 11 picks per deployment from `trees`/`commits`.
+    trees: dict[Literal["tag", "branch"], Path] = field(default_factory=dict)
+    commits: dict[Literal["tag", "branch"], str] = field(default_factory=dict)
 
     @classmethod
     def build(  # noqa: PLR0913  # one field per attribute; a wrapper object buys nothing
@@ -2356,6 +2399,8 @@ class TreeContext:
         apply: frozenset[str],
         *,
         platform: Path | None = None,
+        trees: dict[Literal["tag", "branch"], Path] | None = None,
+        commits: dict[Literal["tag", "branch"], str] | None = None,
     ) -> TreeContext:
         """Load the platform-wide inputs from `platform` (default: `tree` itself)."""
         base = platform or tree
@@ -2370,6 +2415,8 @@ class TreeContext:
             facilities=load_facilities(base, lenient=True),
             org=load_org(org_path) if org_path.is_file() else None,
             tenants=load_tenants(base) if tenants_path.is_file() else None,
+            trees=trees if trees is not None else {"tag": tree},
+            commits=commits if commits is not None else {},
         )
 
     @classmethod
