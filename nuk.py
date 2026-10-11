@@ -846,6 +846,33 @@ def record_active_colour(name: str, colour: str) -> None:
     path.write_text(f"{colour}\n", encoding="utf-8")
 
 
+def _router_dialect_file(name: str) -> Path:
+    """The file recording an app's deployed router dialect."""
+    return project_dir(name) / "router-dialect"
+
+
+def router_dialect(name: str) -> str:
+    """Return an app's deployed router dialect, defaulting to `edge`.
+
+    Persisted by `_apply_blue_green` beside `active-colour`, so a rollback — which
+    has no facilities/ in its tree and so cannot detect router mode — replays the
+    dialect the apply actually wrote.
+    """
+    path = _router_dialect_file(name)
+    try:
+        dialect = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "edge"
+    return dialect or "edge"
+
+
+def record_router_dialect(name: str, dialect: str) -> None:
+    """Persist `dialect` as an app's deployed router dialect."""
+    path = _router_dialect_file(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{dialect}\n", encoding="utf-8")
+
+
 def await_healthy(  # noqa: PLR0913  # one keyword per probe input; all read, none derived
     container: str,
     path: str,
@@ -3940,6 +3967,7 @@ def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/diale
     )
     write_ingress(name, ingress, vocab, colour=idle, dialect=dialect)
     record_active_colour(name, idle)
+    record_router_dialect(name, dialect)
     if not strategy.keep_previous:
         # Drain every service the deployment publishes — the probe service plus
         # each ingress backend — so a manifest that names them other than the
@@ -3983,7 +4011,7 @@ def _rollback_blue_green(
         port=health.port or 8000,
         exec_=sh,
     )
-    write_ingress(name, ingress, vocab, colour=previous)
+    write_ingress(name, ingress, vocab, colour=previous, dialect=router_dialect(name))
     record_active_colour(name, previous)
 
 

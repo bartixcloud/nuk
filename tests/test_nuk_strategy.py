@@ -85,6 +85,12 @@ def test_record_active_colour_persists(tmp_path, monkeypatch):
     assert nuk.idle_colour("green") == "blue"
 
 
+def test_router_dialect_defaults_to_edge_when_unset(tmp_path, monkeypatch):
+    """An app with no persisted dialect marker is an edge deployment."""
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    assert nuk.router_dialect("kolbe") == "edge"
+
+
 def test_await_healthy_returns_once_the_container_answers(monkeypatch):
     """The gate polls the idle colour and returns on the first zero exit."""
     calls: list[tuple[str, ...]] = []
@@ -433,6 +439,39 @@ def test_blue_green_rollback_flips_the_router_back_and_brings_the_colour_up(
     assert rolled.index(ups[0]) < rolled.index(execs[0])  # up precedes the health probe
     assert nuk.active_colour("kolbe") == "blue"
     router = yaml.safe_load((tmp_path / "dynamic" / "kolbe.yml").read_text(encoding="utf-8"))
+    url = router["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
+    assert url == "http://kolbe-frontend-blue-1:80"
+    entry = router["http"]["routers"]["kolbe-0"]
+    assert entry["entryPoints"] == ["websecure"]  # non-router mode: the edge dialect
+    assert entry["tls"] == {"certResolver": "letsencrypt"}
+
+
+def test_router_mode_blue_green_rollback_writes_a_mesh_router(tmp_path, monkeypatch):
+    """The rollback flip replays the dialect the apply persisted, not a guessed one.
+
+    Rollback builds its context from the persisted manifest, whose tree ships no
+    `facilities/`, so router mode is undetectable at rollback time. The apply
+    records the dialect beside `active-colour`, and the flip reads it back — so a
+    router-mode app keeps its mesh-dialect router instead of dropping an edge file
+    the app host's Traefik (the `router` facility) cannot serve (C1).
+    """
+    import yaml
+
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    _with_router_facility(tmp_path)
+    doc = _write(tmp_path, _blue_green_yml(keep_previous=True))
+    nuk.cmd_apply(doc, None)
+    assert nuk.router_dialect("kolbe") == "mesh"  # the apply persisted it
+    _persist_blue_green(keep_previous=True)
+
+    monkeypatch.setattr(nuk, "sh", lambda *cmd, **_k: None)
+    nuk.cmd_rollback("kolbe", to=None, show=False)
+
+    router = yaml.safe_load((tmp_path / "dynamic" / "kolbe.yml").read_text(encoding="utf-8"))
+    entry = router["http"]["routers"]["kolbe-0"]
+    assert entry["entryPoints"] == ["mesh"]
+    assert "tls" not in entry
     url = router["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
     assert url == "http://kolbe-frontend-blue-1:80"
 
