@@ -192,27 +192,57 @@ def _ref_tree(root, marker: str) -> None:
     )
 
 
-def test_apply_tree_selects_the_tree_per_deployment(tmp_path, monkeypatch):
-    """Task 11: `spec.source.unsigned` picks the branch tree, everything else the tag tree."""
+TAG_SHA = "a" * 40
+BRANCH_SHA = "b" * 40
+
+
+def _tree_and_branch(tmp_path, commits: dict) -> nuk.TreeContext:
     tag, branch = tmp_path / "tag", tmp_path / "branch"
     _ref_tree(tag, "tag")
     _ref_tree(branch, "branch")
-    ctx = nuk.TreeContext.build(
+    return nuk.TreeContext.build(
         tag,
         "app",
         None,
         None,
         nuk.APPLY_ALL,
         trees={"tag": tag, "branch": branch},
-        commits={},
+        commits=commits,
     )
-    applied: dict[str, str] = {}
 
-    def fake(path, _rp, **_k):
-        applied[path.name] = path.read_text(encoding="utf-8")
+
+def test_apply_tree_selects_the_tree_per_deployment(tmp_path, monkeypatch):
+    """Task 11: `spec.source.unsigned` picks the branch tree, everything else the tag tree."""
+    ctx = _tree_and_branch(tmp_path, {"tag": TAG_SHA, "branch": BRANCH_SHA})
+    calls: dict[str, dict] = {}
+
+    def fake(path, _rp, **k):
+        calls[path.name] = {
+            "text": path.read_text(encoding="utf-8"),
+            "pin_commit": k.get("pin_commit"),
+        }
 
     monkeypatch.setattr(nuk, "cmd_apply", fake)
     nuk.apply_tree(ctx)
 
-    assert "compose: branch.yml" in applied["test.yml"]  # unsigned -> branch tree
-    assert "compose: tag.yml" in applied["prod.yml"]  # signed -> tag tree, never branch
+    assert "compose: branch.yml" in calls["test.yml"]["text"]  # unsigned -> branch tree
+    assert "compose: tag.yml" in calls["prod.yml"]["text"]  # signed -> tag tree, never branch
+    # The tree choice must reach the BUILD, not just the manifest read: a signed
+    # deployment pins the clone to the tag commit; an unsigned one follows the head.
+    assert calls["prod.yml"]["pin_commit"] == TAG_SHA
+    assert calls["test.yml"]["pin_commit"] is None
+
+
+def test_apply_tree_without_recorded_commits_does_not_pin(tmp_path, monkeypatch):
+    """A hand-run/Task-10 context carries no `commits`: degrade to today's behaviour (no pin)."""
+    ctx = _tree_and_branch(tmp_path, {})
+    seen: dict[str, dict] = {}
+
+    def fake(path, _rp, **k):
+        seen[path.name] = {"pin_commit": k.get("pin_commit")}
+
+    monkeypatch.setattr(nuk, "cmd_apply", fake)
+    nuk.apply_tree(ctx)  # must not raise on the missing "tag" key
+
+    assert seen["prod.yml"]["pin_commit"] is None
+    assert seen["test.yml"]["pin_commit"] is None

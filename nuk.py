@@ -1907,9 +1907,20 @@ def apply_tree(ctx: TreeContext) -> list[dict]:
                     results.append(_result(manifest.metadata.name, kind, "refused", reason))
                     continue
                 apply_path = _deployment_tree(ctx, manifest, path)
+            # A signed (non-unsigned) deployment must BUILD the signed tag, not the
+            # branch head its clone would otherwise follow: pin the clone to the
+            # tag commit. An unsigned deployment stays on the branch head. A context
+            # without a recorded tag commit (hand-run `for_path`, or Task 10's
+            # `build()` asymmetry with `commits={}`) degrades to today's behaviour —
+            # no pin — rather than raising.
+            pin_commit = (
+                ctx.commits.get("tag")
+                if isinstance(manifest, Deployment) and not manifest.spec.source.unsigned
+                else None
+            )
             entry = _result(manifest.metadata.name, kind)
             try:
-                cmd_apply(apply_path, None, ctx=ctx)
+                cmd_apply(apply_path, None, ctx=ctx, pin_commit=pin_commit)
             except (SystemExit, ValueError, subprocess.CalledProcessError, OSError) as e:
                 entry["result"] = "failed"
                 entry["error"] = (
