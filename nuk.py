@@ -2480,6 +2480,16 @@ class TreeContext:
 ROUTER_PORT = 8443
 
 
+def _router_present(facilities: list[Facility]) -> bool:
+    """Whether the fleet runs the `router` facility.
+
+    The router lives in the PLATFORM source (contracts C3), so callers must pass
+    the platform facilities (`ctx.facilities`) — never the source tree's own,
+    which in the S1 topology ships deployments only (C4).
+    """
+    return any(f.metadata.name == "router" for f in facilities)
+
+
 def backend_address(
     org: Org, manifest: Deployment, ing: dict, *, router_present: bool = False
 ) -> str:
@@ -2608,7 +2618,7 @@ def _render_routers(
         print(f"edge: reaped legacy router {stale} (cross-host delivery is retired)")
     facilities = load_facilities(tree)
     vocab = route_vocabulary(facilities)
-    router_present = any(f.metadata.name == "router" for f in (platform_facilities or facilities))
+    router_present = _router_present(platform_facilities or facilities)
     rendered: list[str] = []
     refused: list[str] = []
     for manifest in deployments:
@@ -3723,6 +3733,15 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         return
     facilities = ctx.facilities
     vocab = route_vocabulary(facilities) if facilities else DEFAULT_ROUTE_VOCAB
+    # Router mode (C1): the fleet runs the `router` facility, which is placed on an
+    # app host and terminates HTTP on the private `mesh` entrypoint — no TLS, no
+    # edge `global.yml`. This host therefore writes its app file router in the mesh
+    # dialect. The gate on `role == "app"` keeps an entry host (which sits alongside
+    # the edge Traefik and still renders edge-dialect routers) on the edge dialect.
+    router_mode = role == "app" and _router_present(facilities)
+    # Only the mesh write carries the dialect; the edge-dialect call stays
+    # byte-identical to what every existing caller and test double expects.
+    mesh_kwargs = {"dialect": "mesh"} if router_mode else {}
     DYNAMIC.mkdir(parents=True, exist_ok=True)
     DEPLOYS.mkdir(parents=True, exist_ok=True)
     source = manifest.spec.source
@@ -3845,12 +3864,12 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         # app host owns its own router here (the edge routes stably to it), so
         # the colourless `edge_term` unlink below is deliberately bypassed.
         persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
-        _apply_blue_green(name, raw, ingress, vocab, strategy)
+        _apply_blue_green(name, raw, ingress, vocab, strategy, **mesh_kwargs)
     else:
-        if edge_term:
+        if edge_term and not router_mode:
             _router_file(name).unlink(missing_ok=True)  # inert here; the edge owns it
         else:
-            write_ingress(name, ingress, vocab)
+            write_ingress(name, ingress, vocab, **mesh_kwargs)
         persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
         # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
         # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
@@ -3879,12 +3898,14 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         print(f"{name}: provenance not recorded ({e})")
 
 
-def _apply_blue_green(
+def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/dialect, one per concern
     name: str,
     raw: dict,
     ingress: list[dict],
     vocab: dict[str, list[str]],
     strategy: Strategy,
+    *,
+    dialect: str = "edge",
 ) -> None:
     """Roll a blue-green deployment onto the idle colour.
 
@@ -3899,6 +3920,8 @@ def _apply_blue_green(
         ingress: The raw `spec.ingress[]` entries.
         vocab: Route capabilities resolved from the tree.
         strategy: The parsed `spec.strategy` block.
+        dialect: The file-router dialect the flip writes; `"mesh"` on a router-mode
+            app host, `"edge"` otherwise (see `build_ingress`).
     """
     active = active_colour(name)
     idle = idle_colour(active)
@@ -3915,7 +3938,7 @@ def _apply_blue_green(
         port=health.port or 8000,
         exec_=sh,
     )
-    write_ingress(name, ingress, vocab, colour=idle)
+    write_ingress(name, ingress, vocab, colour=idle, dialect=dialect)
     record_active_colour(name, idle)
     if not strategy.keep_previous:
         # Drain every service the deployment publishes — the probe service plus

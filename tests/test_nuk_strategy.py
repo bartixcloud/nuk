@@ -316,6 +316,71 @@ NON_STRATEGY_INGRESS_YML = """\
 """
 
 
+ROUTER_FACILITY_YML = """\
+    apiVersion: nuk/v1
+    kind: Facility
+    metadata: {name: router}
+    spec:
+      placement: {role: app}
+"""
+
+
+def _with_router_facility(tmp_path: Path) -> None:
+    """Put the fleet-wide `router` facility in the tree, switching router mode on."""
+    facilities = tmp_path / "facilities"
+    facilities.mkdir(parents=True, exist_ok=True)
+    (facilities / "router.yml").write_text(
+        textwrap.dedent(ROUTER_FACILITY_YML).lstrip(), encoding="utf-8"
+    )
+
+
+def test_router_mode_blue_green_apply_writes_a_mesh_router(tmp_path, monkeypatch):
+    """In router mode the colour flip writes the app-host file router in the mesh dialect.
+
+    The app host's Traefik (the `router` facility) listens on the private `mesh`
+    entrypoint with no TLS and no edge `global.yml`, so an edge-dialect file it
+    cannot serve is dropped (C1). The flip must name the idle colour container.
+    """
+    import yaml
+
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    _with_router_facility(tmp_path)
+    doc = _write(tmp_path, _blue_green_yml(keep_previous=True))
+    nuk.cmd_apply(doc, None)
+
+    router = yaml.safe_load((tmp_path / "dynamic" / "kolbe.yml").read_text(encoding="utf-8"))
+    entry = router["http"]["routers"]["kolbe-0"]
+    assert entry["entryPoints"] == ["mesh"]
+    assert "tls" not in entry
+    assert not any("maintenance-errors" in m for m in entry.get("middlewares", []))
+    url = router["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
+    assert url == "http://kolbe-frontend-green-1:80"
+
+
+def test_router_mode_plain_apply_writes_a_mesh_router(tmp_path, monkeypatch):
+    """A non-blue-green app on a router-mode host authors its own mesh router.
+
+    Without router mode an app host UNLINKS the file (the edge renders it, spec
+    §6); in router mode the app host IS the router, so it must write it itself —
+    in the mesh dialect it can actually serve.
+    """
+    import yaml
+
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    _with_router_facility(tmp_path)
+    doc = _write(tmp_path, NON_STRATEGY_INGRESS_YML)
+    nuk.cmd_apply(doc, None)
+
+    router = yaml.safe_load((tmp_path / "dynamic" / "kolbe.yml").read_text(encoding="utf-8"))
+    entry = router["http"]["routers"]["kolbe-0"]
+    assert entry["entryPoints"] == ["mesh"]
+    assert "tls" not in entry
+    url = router["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
+    assert url == "http://kolbe-frontend-1:80"
+
+
 def test_apply_without_strategy_keeps_the_plain_up(tmp_path, monkeypatch):
     """A non-strategy deployment still does a single `up -d`, no profile, no flip."""
     lines: list[tuple[str, ...]] = []
