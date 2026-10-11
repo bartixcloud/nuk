@@ -519,6 +519,53 @@ def test_router_mode_blue_green_rollback_writes_a_mesh_router(tmp_path, monkeypa
     assert url == "http://kolbe-frontend-blue-1:80"
 
 
+def test_router_mode_digest_rollback_keeps_the_mesh_router(tmp_path, monkeypatch):
+    """A digest-path rollback re-applies with a facilities-less context.
+
+    `cmd_rollback` drives the ordinary digest path through
+    `cmd_apply(..., ctx=None)`, which rebuilds its context from the persisted
+    manifest dir — that ships no `facilities/`, so router mode is undetectable from
+    the tree. Without a fallback the app host takes `edge_term and not router_mode`
+    and UNLINKS its own router, silently removing the app-host router. The persisted
+    `router-dialect` marker (Task 16) must keep the decision in router mode so the
+    mesh file survives the re-apply.
+    """
+    import json
+
+    import yaml
+
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    monkeypatch.setattr(nuk, "_pin_image", lambda *_a, **_k: None)
+    _with_router_facility(tmp_path)
+    doc = _write(tmp_path, NON_STRATEGY_INGRESS_YML)
+    nuk.cmd_apply(doc, None)  # router mode: writes the mesh router AND records the dialect
+    assert nuk.router_dialect("kolbe") == "mesh"
+
+    # The persisted manifest the rollback reads, and a two-entry history to roll between.
+    pdir = nuk.project_dir("kolbe")
+    pdir.mkdir(parents=True, exist_ok=True)
+    (pdir / "manifest.yml").write_text(NON_STRATEGY_INGRESS_YML, encoding="utf-8")
+    releases = tmp_path / "releases"
+    releases.mkdir()
+    (releases / "kolbe.jsonl").write_text(
+        json.dumps({"commit": "a" * 40, "imageDigest": "sha256:1", "appliedAt": "t1"})
+        + "\n"
+        + json.dumps({"commit": "b" * 40, "imageDigest": "sha256:2", "appliedAt": "t2"})
+        + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(nuk, "RELEASES", releases)
+
+    nuk.cmd_rollback("kolbe", to=None, show=False)
+
+    # The facilities-less re-apply must NOT unlink the app-host router; it stays mesh.
+    router = yaml.safe_load((tmp_path / "dynamic" / "kolbe.yml").read_text(encoding="utf-8"))
+    entry = router["http"]["routers"]["kolbe-0"]
+    assert entry["entryPoints"] == ["mesh"]
+    assert "tls" not in entry
+
+
 def test_blue_green_rollback_refuses_without_a_persisted_manifest(tmp_path, monkeypatch):
     """The colour flip needs the manifest to name the services; fail closed if gone."""
     monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)

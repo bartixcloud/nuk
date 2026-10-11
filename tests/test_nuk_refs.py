@@ -230,6 +230,24 @@ def test_sync_source_exempts_an_older_unsigned_branch_head(tmp_path):
     assert got_branch_sha == branch_sha
 
 
+def test_sync_source_refuses_a_source_whose_remote_has_no_main_branch(tmp_path):
+    """I1: a remote whose default branch is not `main` fails the WHOLE fetch.
+
+    `SOURCE_BRANCH` is hardcoded to `main` and shares ONE fetch with the signed
+    tags, so its valid signed tag can never deploy. Refuse with the actual reason
+    instead of a bare `git fetch failed`. (Per-source/per-deployment branches are
+    a future follow-up; this only names the cause.)
+    """
+    work, pubkey, signers_dir = _signed_work(tmp_path)
+    _run("git", "branch", "-m", "master", cwd=work)  # rename the only branch
+    _sign_tag(work, pubkey, "v1.0.0")
+    origin = tmp_path / "origin.git"
+    _run("git", "clone", "--bare", "-q", str(work), str(origin))
+
+    with pytest.raises(ValueError, match="no main branch"):
+        nuk.sync_source(_src(origin), signers_dir, tmp_path / "state")
+
+
 def test_prepare_source_archives_the_tag_tree_and_the_branch_tree(two_ref_origin, tmp_path):
     """Task 10: two trees are archived and both commits stored on the context."""
     origin, signers_dir, tag_sha, branch_sha = two_ref_origin

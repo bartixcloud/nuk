@@ -1254,11 +1254,13 @@ DEFAULT_ROUTE_VOCAB: dict[str, list[str]] = {"basic": ["auth@file"]}
 def _container_name(name: str, service: str, colour: str | None = None) -> str:
     """The runtime container name docker compose gives an app's service.
 
-    No manifest sets `container_name`, so compose's DEFAULT naming applies:
-    `<project>-<service>-<n>`. The single replicas nuk deploys always land on
-    `-1`, and blue-green adds the colour profile between service and index. Both
-    the router backend (write_ingress) and the health probe (`_apply_blue_green`)
-    must name the same container, so both go through here.
+    ASSUMPTION: every app compose file sets NO `container_name`, so compose's
+    DEFAULT naming applies — `<name>-<service>-<colour>-1` (the project name is the
+    deployment name, the `-<colour>` segment is present only for blue-green, and the
+    single replicas nuk deploys always land on index `-1`). An app that pinned
+    `container_name` would break both callers at once. The router backend
+    (write_ingress) and the health probe (`_apply_blue_green`) must name the same
+    container, so both go through here.
     """
     return f"{name}-{service}{f'-{colour}' if colour else ''}-1"
 
@@ -1299,7 +1301,9 @@ def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; cle
             branded `maintenance-errors@file` page. `"mesh"` is the app-host
             router, which reaches Traefik over the private mesh only: the `mesh`
             entrypoint, no TLS (terminated at the edge), no edge `global.yml`
-            middleware. Backend URL logic is identical in both.
+            middleware. The app-host router serves the WATCHED FILE PROVIDER by URL
+            (its docker provider is off), so these are file-provider routers, never
+            docker-label routers. Backend URL logic is identical in both.
 
     Returns:
         The Traefik dynamic doc, or None when there is no ingress.
@@ -1767,6 +1771,34 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
         text=True,
     )
     if proc.returncode != 0:
+        # `SOURCE_BRANCH` is hardcoded, and the branch refspec shares ONE fetch with the
+        # signed tags: a remote whose branch is not `main` fails the WHOLE fetch, so its
+        # valid signed tag can never deploy. Probe for the branch to name the actual
+        # reason instead of an opaque `git fetch failed` (per-source/per-deployment
+        # branches are a future follow-up — this only tells the operator why the source
+        # is refused). Only reached on failure, so a healthy source pays nothing.
+        probe = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            [  # noqa: S607  # git on PATH
+                "git",
+                "-C",
+                str(repo),
+                "ls-remote",
+                "--heads",
+                "origin",
+                f"refs/heads/{SOURCE_BRANCH}",
+            ],
+            env={**os.environ, "GIT_SSH_COMMAND": git_ssh_command(src.deploy_key)},
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if probe.returncode == 0 and not probe.stdout.strip():
+            msg = (
+                f"{src.name}: origin has no {SOURCE_BRANCH} branch — nuk fetches "
+                f"refs/heads/{SOURCE_BRANCH} for every source, so its signed tags cannot "
+                f"deploy (per-source branches are a future follow-up)"
+            )
+            raise ValueError(msg)
         detail = (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[-1]
         msg = f"git fetch failed ({detail}) — no network, no change"
         raise ValueError(msg)
@@ -3786,7 +3818,17 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     # edge `global.yml`. This host therefore writes its app file router in the mesh
     # dialect. The gate on `role == "app"` keeps an entry host (which sits alongside
     # the edge Traefik and still renders edge-dialect routers) on the edge dialect.
-    router_mode = role == "app" and _router_present(facilities)
+    #
+    # A facilities-less context — a hand-run apply, or the digest-path re-apply
+    # `cmd_rollback` drives through `cmd_apply(..., ctx=None)` — cannot see the
+    # platform `router` facility (the persisted manifest dir ships no facilities/).
+    # Fall back to the dialect the last apply recorded (Task 16) so a router-mode app
+    # keeps its app-host file router instead of unlinking it below; an unrecorded app
+    # reads `edge` and keeps the legacy behaviour.
+    router_present = _router_present(facilities)
+    if not facilities:
+        router_present = router_dialect(name) == "mesh"
+    router_mode = role == "app" and router_present
     # Only the mesh write carries the dialect; the edge-dialect call stays
     # byte-identical to what every existing caller and test double expects.
     mesh_kwargs = {"dialect": "mesh"} if router_mode else {}
@@ -3931,6 +3973,10 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             _router_file(name).unlink(missing_ok=True)  # inert here; the edge owns it
         else:
             write_ingress(name, ingress, vocab, **mesh_kwargs)
+        # Record the dialect this apply decided (write OR unlink) so a later
+        # facilities-less re-apply — the digest-path rollback — re-decides router mode
+        # from the marker rather than guessing `edge` and unlinking the app-host router.
+        record_router_dialect(name, "mesh" if router_mode else "edge")
         persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
         # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
         # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
