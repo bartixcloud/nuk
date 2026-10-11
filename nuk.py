@@ -132,6 +132,10 @@ class Source(BaseModel):
 
     repo: str | None = None
     branch: str = "main"
+    # Opt into deploying the branch head without a signed `v*` tag — for
+    # non-prod/test deployments. Prod deployments leave this False and require
+    # a signed tag.
+    unsigned: bool = False
 
 
 class Compose(BaseModel):
