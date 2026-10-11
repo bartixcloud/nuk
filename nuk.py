@@ -23,6 +23,7 @@ import subprocess  # noqa: S404  # all calls use fixed argv, no shell (see per-c
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -46,7 +47,7 @@ from pydantic import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Callable, Iterator
 
 __version__ = "2.0.0"  # bumped on release by .github/workflows/release.yml
 
@@ -839,6 +840,45 @@ def record_active_colour(name: str, colour: str) -> None:
     path = _active_colour_file(name)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(f"{colour}\n", encoding="utf-8")
+
+
+def await_healthy(
+    container: str,
+    path: str,
+    *,
+    timeout: int,
+    interval: float,
+    exec_: Callable[..., None] = sh,
+) -> None:
+    """Block until an idle colour's container answers its health path.
+
+    Polls `docker exec <container> python -c "<urllib request>"` — Kolbe's own
+    readiness pattern — every `interval` seconds until it exits zero, or raises
+    once `timeout` seconds have elapsed. The blue-green rollout calls this
+    before flipping the router to the new colour.
+
+    Args:
+        container: The compose container name to probe.
+        path: The HTTP path that proves the colour is up.
+        timeout: Seconds to keep polling before giving up.
+        interval: Seconds between polls.
+        exec_: The command runner (defaults to `sh`); injected for tests.
+
+    Raises:
+        ValueError: If the container never answered within `timeout` seconds.
+    """
+    probe = f"urllib.request.urlopen('http://localhost:8000{path}')"
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            exec_("docker", "exec", container, "python", "-c", probe)
+        except (subprocess.SubprocessError, OSError):
+            if time.monotonic() >= deadline:
+                msg = f"container {container!r} did not answer {path!r} within {timeout}s"
+                raise ValueError(msg) from None
+            time.sleep(interval)
+        else:
+            return
 
 
 def _manifest_file(name: str) -> Path:

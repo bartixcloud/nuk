@@ -5,6 +5,7 @@ Spec: docs/superpowers/plans/2026-10-11-nuk-deploy-strategies.md (Task 4).
 
 from __future__ import annotations
 
+import subprocess
 import textwrap
 from typing import TYPE_CHECKING
 
@@ -82,3 +83,48 @@ def test_record_active_colour_persists(tmp_path, monkeypatch):
     nuk.record_active_colour("kolbe", "green")
     assert nuk.active_colour("kolbe") == "green"
     assert nuk.idle_colour("green") == "blue"
+
+
+def test_await_healthy_returns_once_the_container_answers(monkeypatch):
+    """The gate polls the idle colour and returns on the first zero exit."""
+    calls: list[tuple[str, ...]] = []
+
+    def exec_(*cmd: str) -> None:
+        calls.append(cmd)
+        if len(calls) < 3:
+            raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(nuk.time, "sleep", lambda _s: None)
+
+    nuk.await_healthy(
+        "kolbe-backend-green", "/health", timeout=120, interval=2.0, exec_=exec_
+    )
+
+    assert len(calls) == 3
+    assert calls[0][:3] == ("docker", "exec", "kolbe-backend-green")
+    probe = calls[0][-1]
+    assert "/health" in probe
+    assert "8000" in probe
+
+
+def test_await_healthy_raises_when_the_container_never_answers(monkeypatch):
+    """A never-zero probe raises ValueError once the fake clock passes `timeout`."""
+    clock = {"now": 0.0}
+
+    def fake_monotonic() -> float:
+        return clock["now"]
+
+    def fake_sleep(seconds: float) -> None:
+        clock["now"] += seconds
+
+    def exec_(*cmd: str) -> None:
+        raise subprocess.CalledProcessError(1, cmd)
+
+    monkeypatch.setattr(nuk.time, "monotonic", fake_monotonic)
+    monkeypatch.setattr(nuk.time, "sleep", fake_sleep)
+
+    with pytest.raises(ValueError, match="did not answer"):
+        nuk.await_healthy(
+            "kolbe-backend-green", "/health", timeout=5, interval=2.0, exec_=exec_
+        )
+    assert clock["now"] >= 5
