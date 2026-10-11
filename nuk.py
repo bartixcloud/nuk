@@ -842,12 +842,13 @@ def record_active_colour(name: str, colour: str) -> None:
     path.write_text(f"{colour}\n", encoding="utf-8")
 
 
-def await_healthy(
+def await_healthy(  # noqa: PLR0913  # one keyword per probe input; all read, none derived
     container: str,
     path: str,
     *,
     timeout: int,
     interval: float,
+    port: int = 8000,
     exec_: Callable[..., None] = sh,
 ) -> None:
     """Block until an idle colour's container answers its health path.
@@ -862,12 +863,13 @@ def await_healthy(
         path: The HTTP path that proves the colour is up.
         timeout: Seconds to keep polling before giving up.
         interval: Seconds between polls.
+        port: The in-container port the service listens on (spec.strategy.health.port).
         exec_: The command runner (defaults to `sh`); injected for tests.
 
     Raises:
         ValueError: If the container never answered within `timeout` seconds.
     """
-    probe = f"urllib.request.urlopen('http://localhost:8000{path}')"
+    probe = f"urllib.request.urlopen('http://localhost:{port}{path}')"
     deadline = time.monotonic() + timeout
     while True:
         try:
@@ -3711,17 +3713,27 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         publish_ip=self_ip if edge_term else None,
         local_data=remote_ip is None,
     )
-    if edge_term:
-        _router_file(name).unlink(missing_ok=True)  # inert here; the edge owns it
+    strategy = manifest.spec.strategy
+    if strategy is not None and strategy.type == "blue-green":
+        # Blue-green replaces "ingress -> up -d" with a colour rollout: bring the
+        # idle colour up (its compose profile), gate on its health, flip the
+        # app-host file router to it, record it, then drain the old colour. The
+        # app host owns its own router here (the edge routes stably to it), so
+        # the colourless `edge_term` unlink below is deliberately bypassed.
+        persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
+        _apply_blue_green(name, raw, ingress, vocab, strategy)
     else:
-        write_ingress(name, ingress, vocab)
-    persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
-    # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
-    # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
-    # whose image id changed. A declaration-only Facility has no compose file at
-    # all — there is nothing to bring up.
-    if not declaration_only:
-        sh(*compose_args(name, raw), "up", "-d")
+        if edge_term:
+            _router_file(name).unlink(missing_ok=True)  # inert here; the edge owns it
+        else:
+            write_ingress(name, ingress, vocab)
+        persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
+        # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
+        # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
+        # whose image id changed. A declaration-only Facility has no compose file at
+        # all — there is nothing to bring up.
+        if not declaration_only:
+            sh(*compose_args(name, raw), "up", "-d")
     # An unhealthy facility must not become "current": write_provenance is what
     # `nuk status`, `nuk rollback` and drift.sh read as the deployed state, so
     # appending here would both hide the breakage and put the last known-good
@@ -3741,6 +3753,55 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         )
     except OSError as e:
         print(f"{name}: provenance not recorded ({e})")
+
+
+def _apply_blue_green(
+    name: str,
+    raw: dict,
+    ingress: list[dict],
+    vocab: dict[str, list[str]],
+    strategy: Strategy,
+) -> None:
+    """Roll a blue-green deployment onto the idle colour.
+
+    Brings the idle colour's compose profile up, gates on the strategy's health
+    probe, flips the app-host file router to that colour, records it as active,
+    and drains the previous colour — unless `keepPrevious` keeps it for an
+    instant rollback.
+
+    Args:
+        name: The deployment name.
+        raw: The raw manifest dict (for `compose_args`).
+        ingress: The raw `spec.ingress[]` entries.
+        vocab: Route capabilities resolved from the tree.
+        strategy: The parsed `spec.strategy` block.
+    """
+    active = active_colour(name)
+    idle = idle_colour(active)
+    health = strategy.health
+    sh(*compose_args(name, raw), "--profile", idle, "up", "-d")
+    # Resolve `sh` at call time (await_healthy's default binds the original at
+    # import), so the probe runs through the same runner this host is configured
+    # to use — and tests can capture it.
+    await_healthy(
+        f"{name}-{health.service}-{idle}",
+        health.path,
+        timeout=health.timeout,
+        interval=health.interval,
+        port=health.port or 8000,
+        exec_=sh,
+    )
+    write_ingress(name, ingress, vocab, colour=idle)
+    record_active_colour(name, idle)
+    if not strategy.keep_previous:
+        sh(
+            *compose_args(name, raw),
+            "--profile",
+            active,
+            "down",
+            f"backend-{active}",
+            f"frontend-{active}",
+        )
 
 
 def _compose_ps(name: str, fmt: str) -> list[str]:

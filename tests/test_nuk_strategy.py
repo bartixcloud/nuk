@@ -128,3 +128,141 @@ def test_await_healthy_raises_when_the_container_never_answers(monkeypatch):
             "kolbe-backend-green", "/health", timeout=5, interval=2.0, exec_=exec_
         )
     assert clock["now"] >= 5
+
+
+def test_await_healthy_probes_the_configured_port(monkeypatch):
+    """A non-default `port` is threaded into the probe URL, not hardcoded 8000."""
+    calls: list[tuple[str, ...]] = []
+    monkeypatch.setattr(nuk.time, "sleep", lambda _s: None)
+
+    nuk.await_healthy(
+        "kolbe-backend-green",
+        "/health",
+        timeout=5,
+        interval=1.0,
+        port=9000,
+        exec_=lambda *cmd: calls.append(cmd),
+    )
+
+    assert "localhost:9000/health" in calls[0][-1]
+
+
+# --- blue-green apply path (Task 7) --------------------------------------------------
+
+
+def _blue_green_yml(*, keep_previous: bool, port: int | None = None) -> str:
+    health = "{service: backend, path: /health"
+    if port is not None:
+        health += f", port: {port}"
+    health += "}"
+    keep = "true" if keep_previous else "false"
+    return textwrap.dedent(f"""\
+        apiVersion: nuk/v1
+        kind: Deployment
+        metadata: {{name: kolbe}}
+        spec:
+          placement: {{role: app}}
+          source: {{repo: "git@github.com:kolbeapp-de/lernstanderfassung.git"}}
+          ingress:
+            - {{host: kolbe.astrojones.de, service: frontend, port: 80}}
+          strategy:
+            type: blue-green
+            health: {health}
+            keepPrevious: {keep}
+    """).lstrip()
+
+
+def _stub_apply(tmp_path: Path, monkeypatch, lines: list[tuple[str, ...]]) -> None:
+    """Stub everything cmd_apply touches outside the tree; record `sh` calls."""
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
+    monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
+    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
+    monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
+    monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
+    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
+    monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
+    monkeypatch.setattr(nuk, "persist_manifest", lambda *_a: None)
+    monkeypatch.setattr(nuk, "write_provenance", lambda *_a, **_k: None)
+    monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["compose", "-p", "kolbe"])
+    monkeypatch.setattr(nuk, "sh", lambda *cmd, **_k: lines.append(cmd))
+
+
+def _profile_up(lines: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
+    return [c for c in lines if "--profile" in c and "up" in c]
+
+
+def test_blue_green_apply_rolls_out_idle_then_flips_then_drains(tmp_path, monkeypatch):
+    """Idle up -> health -> flip -> record -> drain, in that order."""
+    import yaml
+
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    doc = _write(tmp_path, _blue_green_yml(keep_previous=False))
+    nuk.cmd_apply(doc, None)
+
+    ups = _profile_up(lines)
+    execs = [c for c in lines if c[:2] == ("docker", "exec")]
+    downs = [c for c in lines if "down" in c]
+
+    assert ups == [("compose", "-p", "kolbe", "--profile", "green", "up", "-d")]
+    assert len(execs) == 1
+    assert execs[0][:3] == ("docker", "exec", "kolbe-backend-green")
+    assert downs == [
+        ("compose", "-p", "kolbe", "--profile", "blue", "down", "backend-blue", "frontend-blue")
+    ]
+    assert lines.index(ups[0]) < lines.index(execs[0]) < lines.index(downs[0])
+    assert nuk.active_colour("kolbe") == "green"
+    router = yaml.safe_load((tmp_path / "dynamic" / "kolbe.yml").read_text(encoding="utf-8"))
+    url = router["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
+    assert url == "http://kolbe-frontend-green-1:80"
+
+
+def test_blue_green_apply_keeps_the_previous_colour_when_asked(tmp_path, monkeypatch):
+    """`keepPrevious: true` skips the drain but still rolls out and flips."""
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    doc = _write(tmp_path, _blue_green_yml(keep_previous=True))
+    nuk.cmd_apply(doc, None)
+
+    assert _profile_up(lines) == [("compose", "-p", "kolbe", "--profile", "green", "up", "-d")]
+    assert not any("down" in c for c in lines)
+    assert nuk.active_colour("kolbe") == "green"
+
+
+def test_blue_green_apply_probes_the_health_port(tmp_path, monkeypatch):
+    """`health.port` reaches the probe URL (`await_healthy` is not left on 8000)."""
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    doc = _write(tmp_path, _blue_green_yml(keep_previous=True, port=9000))
+    nuk.cmd_apply(doc, None)
+
+    execs = [c for c in lines if c[:2] == ("docker", "exec")]
+    assert "localhost:9000/health" in execs[0][-1]
+
+
+NON_STRATEGY_INGRESS_YML = """\
+    apiVersion: nuk/v1
+    kind: Deployment
+    metadata: {name: kolbe}
+    spec:
+      placement: {role: app}
+      source: {repo: "git@github.com:kolbeapp-de/lernstanderfassung.git"}
+      ingress:
+        - {host: kolbe.astrojones.de, service: frontend, port: 80}
+"""
+
+
+def test_apply_without_strategy_keeps_the_plain_up(tmp_path, monkeypatch):
+    """A non-strategy deployment still does a single `up -d`, no profile, no flip."""
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    doc = _write(tmp_path, NON_STRATEGY_INGRESS_YML)
+    nuk.cmd_apply(doc, None)
+
+    ups = [c for c in lines if c[-2:] == ("up", "-d")]
+    assert ups == [("compose", "-p", "kolbe", "up", "-d")]
+    assert not any("--profile" in c for c in lines)
+    assert not any(c[:2] == ("docker", "exec") for c in lines)
+    assert nuk.active_colour("kolbe") == "blue"  # never recorded
