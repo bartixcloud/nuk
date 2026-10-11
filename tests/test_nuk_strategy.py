@@ -185,7 +185,13 @@ def _blue_green_yml(
     """).lstrip()
 
 
-def _stub_apply(tmp_path: Path, monkeypatch, lines: list[tuple[str, ...]]) -> None:
+def _stub_apply(
+    tmp_path: Path,
+    monkeypatch,
+    lines: list[tuple[str, ...]],
+    *,
+    real_override: bool = False,
+) -> None:
     """Stub everything cmd_apply touches outside the tree; record `sh` calls."""
     monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
     monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
@@ -195,7 +201,8 @@ def _stub_apply(tmp_path: Path, monkeypatch, lines: list[tuple[str, ...]]) -> No
     monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
     monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
-    monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
+    if not real_override:
+        monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "persist_manifest", lambda *_a: None)
     monkeypatch.setattr(nuk, "write_provenance", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["compose", "-p", "kolbe"])
@@ -385,6 +392,42 @@ def test_router_mode_plain_apply_writes_a_mesh_router(tmp_path, monkeypatch):
     assert "tls" not in entry
     url = router["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
     assert url == "http://kolbe-frontend-1:80"
+
+
+def test_router_mode_override_targets_colour_services_on_the_edge_network(tmp_path, monkeypatch):
+    """In router mode the override must name the COLOUR services on the shared `edge`.
+
+    The app-host router resolves each backend by its compose DNS name
+    (`<name>-<service>-<colour>-1`) over the shared `edge` network, so the override
+    must (a) key on the colour services (not the phantom base names), (b) join the
+    EXTERNAL `edge` network, (c) publish NO port (the router dials the container, not
+    a host port), and (d) still inject the DB creds. Non-router output is unchanged.
+    """
+    import yaml
+
+    db_env = "/opt/nuklaut/secrets/kolbe-db.env"
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines, real_override=True)
+    monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: db_env)
+    monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: ["backend"])
+    _with_router_facility(tmp_path)
+    doc = _write(
+        tmp_path,
+        _blue_green_yml(keep_previous=True, ingress_service="backend", ingress_port=8000),
+    )
+    nuk.cmd_apply(doc, None)
+
+    ov = yaml.safe_load(
+        (tmp_path / "proj" / "kolbe" / "compose.override.yml").read_text(encoding="utf-8")
+    )
+    assert "backend-blue" in ov["services"]
+    assert "backend-green" in ov["services"]
+    assert "backend" not in ov["services"]
+    svc = ov["services"]["backend-blue"]
+    assert "edge" in svc["networks"]  # joins the router's shared network
+    assert "ports" not in svc  # no published port: the router dials the container
+    assert svc["env_file"] == [db_env]  # the DB creds still reach the colour service
+    assert ov["networks"]["edge"] == {"external": True}
 
 
 def test_apply_without_strategy_keeps_the_plain_up(tmp_path, monkeypatch):

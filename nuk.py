@@ -1058,6 +1058,8 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
     db_services: list[str] | None = None,
     publish_ip: str | None = None,
     local_data: bool = True,
+    *,
+    colours: list[str] | None = None,
 ) -> dict | None:
     """Compose override wiring services to the shared edge/data networks + secrets.
 
@@ -1095,6 +1097,13 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
             host. False omits it: a CROSS-HOST database (spec §3.1) is reached
             over TCP at the data host's private IP, and no local ``data``
             network exists to join.
+        colours: Blue-green colours to expand each service key across — e.g.
+            ``["blue", "green"]`` renders ``backend-blue`` and ``backend-green``.
+            Router mode (C3) passes this: the app-host router resolves each
+            backend by its compose DNS name ``<service>-<colour>`` over the shared
+            ``edge`` network, so the override must key on the profile-suffixed
+            services, not the phantom base names. None (the default) leaves the
+            service keys untouched.
 
     Returns:
         The override doc, or None when no service needs any wiring.
@@ -1118,6 +1127,8 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
                 if mapping not in publish_ports[svc]:
                     publish_ports[svc].append(mapping)
     services: dict = {}
+    uses_edge = False
+    uses_data = False
     for svc_name in ordered:
         is_ingress = svc_name in ingress_services
         is_db = svc_name in db_set
@@ -1125,19 +1136,25 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
         nets = (["edge"] if is_ingress and not publish_ip else []) + (
             ["data"] if is_db and local_data else []
         )
+        uses_edge = uses_edge or "edge" in nets
+        uses_data = uses_data or "data" in nets
         env_files = [*env_from, *([db_env] if is_db else [])]
-        svc: dict = {"networks": nets}
-        if publish_ip and svc_name in publish_ports:
-            svc["ports"] = publish_ports[svc_name]
-        if env_files:
-            svc["env_file"] = env_files
-        services[svc_name] = svc
+        # Router mode expands each base service onto its colour profile keys, so
+        # the same wiring (networks, creds, no published port) lands on the
+        # containers the router actually resolves.
+        for key in [f"{svc_name}-{c}" for c in colours] if colours else [svc_name]:
+            svc: dict = {"networks": list(nets)}
+            if publish_ip and svc_name in publish_ports:
+                svc["ports"] = list(publish_ports[svc_name])
+            if env_files:
+                svc["env_file"] = list(env_files)
+            services[key] = svc
     if not services:
         return None
     networks: dict = {}
-    if not publish_ip and any(s in ingress_services for s in services):
+    if uses_edge:
         networks["edge"] = {"external": True}
-    if any(s in db_set for s in services) and local_data:
+    if uses_data:
         networks["data"] = {"external": True}
     return {"services": services, "networks": networks}
 
@@ -1158,9 +1175,13 @@ def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override
     db_services: list[str] | None = None,
     publish_ip: str | None = None,
     local_data: bool = True,
+    *,
+    colours: list[str] | None = None,
 ) -> None:
     """Render and write `compose.override.yml` for an app (no-op when empty)."""
-    doc = build_override(name, ingress, db_env, env_from, db_services, publish_ip, local_data)
+    doc = build_override(
+        name, ingress, db_env, env_from, db_services, publish_ip, local_data, colours=colours
+    )
     if doc is None:
         return
     (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc))
@@ -3874,16 +3895,29 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             f"{name}: host is non-edge (role={role}) but /etc/nuklaut/host.env has no "
             f"PRIVATE_IP — cannot publish ingress for the edge to reach"
         )
+    strategy = manifest.spec.strategy
+    # Router mode (C3): the app host's own router resolves each backend by its
+    # compose DNS name over the shared `edge` network, so the colour containers
+    # must JOIN `edge` — not publish a host port the router cannot dial. A
+    # blue-green deployment's services are profile-suffixed `<service>-<colour>`;
+    # wire BOTH colours so whichever the rollout flips to is reachable, including
+    # the colour a later rollback brings back up (rollback does not rewrite this
+    # file). A non-blue-green router-mode app keeps its base service keys.
+    router_colours = (
+        ["blue", "green"]
+        if router_mode and strategy is not None and strategy.type == "blue-green"
+        else None
+    )
     write_override(
         name,
         ingress,
         db_env,
         env_from,
         db_services,
-        publish_ip=self_ip if edge_term else None,
+        publish_ip=self_ip if (edge_term and not router_mode) else None,
         local_data=remote_ip is None,
+        colours=router_colours,
     )
-    strategy = manifest.spec.strategy
     if strategy is not None and strategy.type == "blue-green":
         # Blue-green replaces "ingress -> up -d" with a colour rollout: bring the
         # idle colour up (its compose profile), gate on its health, flip the
