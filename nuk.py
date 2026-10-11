@@ -282,6 +282,38 @@ class Provides(_NullTolerant):
     env: EnvProvide | None = None
 
 
+class StrategyHealth(_NullTolerant):
+    """`spec.strategy.health` — the blue-green readiness probe for one service.
+
+    Distinct from the facility `Health` (`spec.health.containers`): this one
+    names a compose service and the HTTP path that proves its idle colour is up.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    service: str
+    path: str
+    port: int | None = None
+    timeout: int = 120
+    interval: float = 2.0
+
+
+class Strategy(_NullTolerant):
+    """`spec.strategy` — how a Deployment rolls out its containers.
+
+    `blue-green` brings the idle colour up, gates on `health`, flips the
+    app-host router to it, then drains the previous colour — unless
+    `keepPrevious` keeps it running for an instant rollback.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    type: Literal["blue-green"]
+    health: StrategyHealth
+    drain: int = 30
+    keep_previous: bool = Field(default=True, alias="keepPrevious")
+
+
 class Spec(_NullTolerant):
     """The manifest `spec` block."""
 
@@ -293,6 +325,7 @@ class Spec(_NullTolerant):
     env_from: list[EnvFrom] = Field(default=[], alias="envFrom")
     databases: Databases = Databases()
     placement: Placement | None = None
+    strategy: Strategy | None = None
 
 
 class Metadata(BaseModel):
