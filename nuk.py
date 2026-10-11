@@ -3822,6 +3822,36 @@ def _apply_blue_green(
         )
 
 
+def _rollback_blue_green(
+    name: str,
+    raw: dict,
+    ingress: list[dict],
+    vocab: dict[str, list[str]],
+    strategy: Strategy,
+) -> None:
+    """Flip a blue-green deployment's router back to its previous colour.
+
+    The inverse of `_apply_blue_green`: the previous colour is the idle one, so
+    bring its compose profile back up (a no-op when `keepPrevious` kept it, and
+    the restart when the last apply drained it), gate on the same health probe,
+    flip the app-host file router back to it, and record it as active. No image
+    change is needed — the previous colour's bits are still on the host.
+    """
+    previous = idle_colour(active_colour(name))
+    health = strategy.health
+    sh(*compose_args(name, raw), "--profile", previous, "up", "-d")
+    await_healthy(
+        _container_name(name, health.service, previous),
+        health.path,
+        timeout=health.timeout,
+        interval=health.interval,
+        port=health.port or 8000,
+        exec_=sh,
+    )
+    write_ingress(name, ingress, vocab, colour=previous)
+    record_active_colour(name, previous)
+
+
 def _compose_ps(name: str, fmt: str) -> list[str]:
     """`docker compose ps` lines for an app's project, one per container."""
     return (
@@ -4022,6 +4052,32 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
             marker = "  (current)" if i == len(history) - 1 else ""
             print(f"{i:>3}  {commit}  {digest}  {entry.get('appliedAt', '?')}{marker}")
         return
+    manifest = _manifest_file(name)
+    if not manifest.exists():
+        sys.exit(f"{name}: {manifest} is missing — nothing to re-apply")
+    try:
+        raw = yaml.safe_load(manifest.read_text(encoding="utf-8"))
+        parsed = _MANIFEST_ADAPTER.validate_python(raw)
+    except ValidationError as e:
+        sys.exit(
+            f"{name}: the persisted manifest no longer validates under the current "
+            f"schema (a field was removed since; spec §8) — refusing to silently "
+            f"upgrade it into the new schema: {e}"
+        )
+    if parsed.kind != "Deployment":
+        sys.exit(
+            f"{name}: the persisted manifest is a {parsed.kind}, not a Deployment — "
+            f"facility rollback needs no mechanism, cut a new tag at the old tree (spec §8)"
+        )
+    strategy = parsed.spec.strategy if parsed.spec is not None else None
+    if strategy is not None and strategy.type == "blue-green":
+        # A blue-green rollback is a colour flip, not a digest re-apply: the
+        # previous colour's bits are already on the host (keepPrevious kept it),
+        # so there is nothing to pull or pin. The router flips back to it and it
+        # is recorded active — the inverse of `_apply_blue_green`.
+        ingress = (raw.get("spec") or {}).get("ingress", []) or []
+        _rollback_blue_green(name, raw, ingress, DEFAULT_ROUTE_VOCAB, strategy)
+        return
     if to is None and len(history) < 2:  # noqa: PLR2004  # need a current AND a previous
         sys.exit(f"{name}: no previous release recorded — nothing to roll back to")
     index = -2 if to is None else to
@@ -4042,23 +4098,6 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
             f"{name}: the release at index {index} has no recorded commit "
             f"(a workflow deploy from a .git-less tree) — its compose tree is "
             f"unreproducible, cannot re-apply it"
-        )
-    manifest = _manifest_file(name)
-    if not manifest.exists():
-        sys.exit(f"{name}: {manifest} is missing — nothing to re-apply")
-    try:
-        raw = yaml.safe_load(manifest.read_text(encoding="utf-8"))
-        parsed = _MANIFEST_ADAPTER.validate_python(raw)
-    except ValidationError as e:
-        sys.exit(
-            f"{name}: the persisted manifest no longer validates under the current "
-            f"schema (a field was removed since; spec §8) — refusing to silently "
-            f"upgrade it into the new schema: {e}"
-        )
-    if parsed.kind != "Deployment":
-        sys.exit(
-            f"{name}: the persisted manifest is a {parsed.kind}, not a Deployment — "
-            f"facility rollback needs no mechanism, cut a new tag at the old tree (spec §8)"
         )
     print(f"{name}: rolling back to {digest} (applied {entry.get('appliedAt', '?')})")
     cmd_apply(manifest, None, pin_commit=commit, pin_digest=digest)

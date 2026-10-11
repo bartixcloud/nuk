@@ -328,3 +328,52 @@ def test_apply_without_strategy_keeps_the_plain_up(tmp_path, monkeypatch):
     assert not any("--profile" in c for c in lines)
     assert not any(c[:2] == ("docker", "exec") for c in lines)
     assert nuk.active_colour("kolbe") == "blue"  # never recorded
+
+
+# --- blue-green rollback (Task 8) ----------------------------------------------------
+
+
+def _persist_blue_green(*, keep_previous: bool) -> None:
+    """Write the manifest `cmd_rollback` reads back (cmd_apply's persist is stubbed)."""
+    path = nuk._manifest_file("kolbe")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(_blue_green_yml(keep_previous=keep_previous), encoding="utf-8")
+
+
+def test_blue_green_rollback_flips_the_router_back_and_brings_the_colour_up(
+    tmp_path, monkeypatch
+):
+    """Rollback after an apply flips active→previous, bringing it back up first.
+
+    The apply drained blue (keepPrevious=false), so rollback must bring blue's
+    idle profile back up, health-gate it, flip the router to blue, and record it.
+    """
+    import yaml
+
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    doc = _write(tmp_path, _blue_green_yml(keep_previous=False))
+    nuk.cmd_apply(doc, None)
+    assert nuk.active_colour("kolbe") == "green"
+    _persist_blue_green(keep_previous=False)
+
+    rolled: list[tuple[str, ...]] = []
+    monkeypatch.setattr(nuk, "sh", lambda *cmd, **_k: rolled.append(cmd))
+    nuk.cmd_rollback("kolbe", to=None, show=False)
+
+    ups = _profile_up(rolled)
+    execs = [c for c in rolled if c[:2] == ("docker", "exec")]
+    assert ups == [("compose", "-p", "kolbe", "--profile", "blue", "up", "-d")]
+    assert execs[0][:3] == ("docker", "exec", "kolbe-backend-blue-1")
+    assert rolled.index(ups[0]) < rolled.index(execs[0])  # up precedes the health probe
+    assert nuk.active_colour("kolbe") == "blue"
+    router = yaml.safe_load((tmp_path / "dynamic" / "kolbe.yml").read_text(encoding="utf-8"))
+    url = router["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
+    assert url == "http://kolbe-frontend-blue-1:80"
+
+
+def test_blue_green_rollback_refuses_without_a_persisted_manifest(tmp_path, monkeypatch):
+    """The colour flip needs the manifest to name the services; fail closed if gone."""
+    monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
+    with pytest.raises(SystemExit, match=r"manifest\.yml"):
+        nuk.cmd_rollback("kolbe", to=None, show=False)
