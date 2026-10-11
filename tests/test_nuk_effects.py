@@ -327,6 +327,28 @@ def test_write_ingress_without_colour_is_unchanged(tmp_path, monkeypatch):
     assert url == "http://kolbe-frontend-1:80"
 
 
+def test_mesh_dialect_has_no_tls_or_edge_middleware(tmp_path, monkeypatch):
+    """The app-host file router dials the mesh entrypoint: no TLS, no edge middleware.
+
+    C1: the app host has only a `mesh` entrypoint on :8443 and no TLS resolver /
+    edge `global.yml`, so the edge dialect's `websecure` + letsencrypt + branded
+    maintenance page cannot render there. The backend URL logic is unchanged.
+    """
+    import yaml
+
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
+    nuk.write_ingress("kolbe", KOLBE_INGRESS, {}, colour="green", dialect="mesh")
+    doc = yaml.safe_load((tmp_path / "kolbe.yml").read_text(encoding="utf-8"))
+    router = doc["http"]["routers"][next(iter(doc["http"]["routers"]))]
+    assert router["entryPoints"] == ["mesh"]
+    assert "tls" not in router
+    assert all("maintenance-errors" not in m for m in router.get("middlewares", []))
+    url = doc["http"]["services"][next(iter(doc["http"]["services"]))]["loadBalancer"][
+        "servers"
+    ][0]["url"]
+    assert url == "http://kolbe-frontend-green-1:80"
+
+
 def test_shipped_facilities_reproduce_the_default_vocabulary():
     """The manifests in infra/facilities/ must agree with the built-in default.
 

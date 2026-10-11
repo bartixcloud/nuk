@@ -1215,12 +1215,13 @@ def _container_name(name: str, service: str, colour: str | None = None) -> str:
     return f"{name}-{service}{f'-{colour}' if colour else ''}-1"
 
 
-def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extraction would obscure the per-field ordering
+def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; clean extraction would obscure the per-field ordering
     name: str,
     ingress: list[dict],
     vocab: dict[str, list[str]],
     *,
     colour: str | None = None,
+    dialect: str = "edge",
 ) -> dict | None:
     """Render the Traefik file-provider doc, or None to remove the dynamic file.
 
@@ -1245,21 +1246,30 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
             points at that colour's service container
             (`{name}-{service}-{colour}-1`) instead of the colourless
             `{name}-{service}-1`. Remote `address` backends are unaffected.
+        dialect: The entrypoint/TLS flavour. `"edge"` (default) is the internet-
+            facing edge: `websecure`, the letsencrypt cert resolver, and the
+            branded `maintenance-errors@file` page. `"mesh"` is the app-host
+            router, which reaches Traefik over the private mesh only: the `mesh`
+            entrypoint, no TLS (terminated at the edge), no edge `global.yml`
+            middleware. Backend URL logic is identical in both.
 
     Returns:
         The Traefik dynamic doc, or None when there is no ingress.
     """
     if not ingress:
         return None
+    is_mesh = dialect == "mesh"
+    entry_point = "mesh" if is_mesh else "websecure"
     routers, services, middlewares = {}, {}, {}
     for i, ing in enumerate(ingress):
         rid = f"{name}-{i}"
         router = {
             "rule": _rule(ing),
-            "entryPoints": ["websecure"],
+            "entryPoints": [entry_point],
             "service": rid,
-            "tls": {"certResolver": "letsencrypt"},
         }
+        if not is_mesh:
+            router["tls"] = {"certResolver": "letsencrypt"}
         mw = []
         # ⚠ The refusals below are load-bearing. The chain this replaced once had no
         #   `else`, and an unrecognised value fell through to a router with no auth
@@ -1292,8 +1302,11 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
         # Every app router inherits the controller-wide branded maintenance page:
         # 502-504 from the backend → the maintenance service (see global.yml). The
         # middleware is provider-qualified (@file) since it lives in global.yml.
-        mw.append("maintenance-errors@file")
-        router["middlewares"] = mw
+        # Only the edge ships that file; the mesh dialect leaves it off.
+        if not is_mesh:
+            mw.append("maintenance-errors@file")
+        if mw:
+            router["middlewares"] = mw
         if "priority" in ing:
             router["priority"] = ing["priority"]
         routers[rid] = router
@@ -1317,11 +1330,12 @@ def build_ingress(  # noqa: C901, PLR0912  # one router-build loop; clean extrac
             }
             routers[wid] = {
                 "rule": f"Host(`www.{host}`)",
-                "entryPoints": ["websecure"],
+                "entryPoints": [entry_point],
                 "service": rid,
                 "middlewares": [rdid],
-                "tls": {"certResolver": "letsencrypt"},
             }
+            if not is_mesh:
+                routers[wid]["tls"] = {"certResolver": "letsencrypt"}
     http = {"routers": routers, "services": services}
     if middlewares:
         http["middlewares"] = middlewares
@@ -1334,13 +1348,15 @@ def write_ingress(
     vocab: dict[str, list[str]],
     *,
     colour: str | None = None,
+    dialect: str = "edge",
 ) -> None:
     """Render and write the Traefik dynamic file for an app (removes it if empty).
 
     `colour` threads the blue-green colour into `build_ingress` (see there).
+    `dialect` selects the edge or mesh entrypoint/TLS flavour (see there).
     """
     target = _router_file(name)
-    doc = build_ingress(name, ingress, vocab, colour=colour)
+    doc = build_ingress(name, ingress, vocab, colour=colour, dialect=dialect)
     if doc is None:
         target.unlink(missing_ok=True)
         return
