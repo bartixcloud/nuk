@@ -69,3 +69,16 @@ def test_load_without_strategy_is_none(tmp_path):
 def test_strategy_rejects_unknown_type(tmp_path):
     with pytest.raises(SystemExit):
         nuk.load(_write(tmp_path, STRATEGY_YML.replace("blue-green", "canary")))
+
+
+def test_active_colour_defaults_to_blue(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    assert nuk.active_colour("kolbe") == "blue"
+    assert nuk.idle_colour("blue") == "green"
+
+
+def test_record_active_colour_persists(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    nuk.record_active_colour("kolbe", "green")
+    assert nuk.active_colour("kolbe") == "green"
+    assert nuk.idle_colour("green") == "blue"

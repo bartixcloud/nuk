@@ -814,6 +814,33 @@ def project_dir(name: str) -> Path:
     return DEPLOYS / name
 
 
+def _active_colour_file(name: str) -> Path:
+    """The file recording an app's currently live colour."""
+    return project_dir(name) / "active-colour"
+
+
+def active_colour(name: str) -> str:
+    """Return an app's currently live colour, defaulting to `blue`."""
+    path = _active_colour_file(name)
+    try:
+        colour = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return "blue"
+    return colour or "blue"
+
+
+def idle_colour(active: str) -> str:
+    """Return the colour opposite `active` (`blue` ↔ `green`)."""
+    return "green" if active == "blue" else "blue"
+
+
+def record_active_colour(name: str, colour: str) -> None:
+    """Persist `colour` as an app's currently live colour."""
+    path = _active_colour_file(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{colour}\n", encoding="utf-8")
+
+
 def _manifest_file(name: str) -> Path:
     """The persisted copy of an app's last applied manifest."""
     return project_dir(name) / "manifest.yml"
