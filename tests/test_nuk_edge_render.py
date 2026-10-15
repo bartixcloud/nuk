@@ -189,6 +189,25 @@ def test_backend_refuses_a_pinned_host_the_org_does_not_declare(tmp_path):
         nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0])
 
 
+def test_backend_refuses_an_ambiguous_unpinned_app(tmp_path):
+    """Two app hosts and no default ⇒ the edge cannot pick one. Refuse (§13)."""
+    tree = _tree(tmp_path, {"hello": HELLO}, {"router": ROUTER_FACILITY}, org_body=ORG_TWO_APP)
+    org = nuk.load_org(tree / "org.yml")
+    hello = nuk.load_deployments(tree)[0]
+    with pytest.raises(ValueError, match="ambiguous"):
+        nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0], router_present=True)
+
+
+def test_backend_refuses_a_pin_to_a_host_of_another_role(tmp_path):
+    """A pin to a host whose role ≠ placement.role matches no host on converge."""
+    pinned = HELLO.replace("placement: {role: app}", "placement: {role: app, host: ingress}")
+    tree = _tree(tmp_path, {"hello": pinned}, {}, org_body=ORG_TWO_APP)
+    org = nuk.load_org(tree / "org.yml")
+    hello = nuk.load_deployments(tree)[0]
+    with pytest.raises(ValueError, match="role"):
+        nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0])
+
+
 def test_edge_renders_a_router_for_every_deployment(tmp_path, monkeypatch):
     tree = _tree(
         tmp_path,

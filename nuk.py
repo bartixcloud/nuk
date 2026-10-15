@@ -2721,6 +2721,15 @@ def backend_address(
                 f"org manifest declares no host with that name."
             )
             raise ValueError(msg)
+        if host.role != placement.role:
+            # placement_matches gates the pin behind `placement.role == self role`,
+            # so a pin to another role's host matches NO host on converge. The edge
+            # must refuse it too, not emit a route nothing serves.
+            msg = (
+                f"{manifest.metadata.name}: placement.host={placement.host!r} has role "
+                f"{host.role!r}, not {placement.role!r} — no host runs this placement."
+            )
+            raise ValueError(msg)
     else:
         # No `or host_for` fallback: several hosts and no default is AMBIGUOUS, and
         # picking the first would disagree with placement_matches (which raises).
