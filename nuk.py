@@ -2721,13 +2721,14 @@ def backend_address(
             )
             raise ValueError(msg)
     else:
-        host = org.host_for(placement.role)
-        if host is None:
-            msg = (
-                f"{manifest.metadata.name}: placement.role={placement.role!r} but the org "
-                f"manifest declares no host with role {placement.role!r}."
-            )
-            raise ValueError(msg)
+        host = org.default_host(placement.role) or org.host_for(placement.role)
+    if host is None:
+        msg = (
+            f"{manifest.metadata.name}: placement.role={placement.role!r} is unresolvable — the "
+            f"org declares no host with role {placement.role!r}, or several such hosts and none "
+            f"is marked default."
+        )
+        raise ValueError(msg)
     if router_present and placement.role == "app":
         return f"{host.private_ip}:{ROUTER_PORT}"
     return f"{host.private_ip}:{_published_port(ing)}"

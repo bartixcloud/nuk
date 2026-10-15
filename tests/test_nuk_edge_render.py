@@ -77,6 +77,15 @@ ORG_TWO_APP = ORG.replace(
     "      - {name: kolbe-app, provider: incus, role: app, privateIp: 10.0.10.190, metal: metal}\n",
 )
 
+# `deploy` (10.0.10.107) is the marked default; `kolbe-app` (10.0.10.190) is declared
+# FIRST, so a plain first-match lookup would wrongly pick it.
+ORG_TWO_APP_WITH_DEFAULT = ORG.replace(
+    "      - {name: deploy,  provider: incus, role: app,  privateIp: 10.0.10.107, metal: metal}\n",
+    "      - {name: kolbe-app, provider: incus, role: app, privateIp: 10.0.10.190, metal: metal}\n"
+    "      - {name: deploy, provider: incus, role: app, "
+    "privateIp: 10.0.10.107, metal: metal, default: true}\n",
+)
+
 PINNED_HELLO = HELLO.replace("placement: {role: app}", "placement: {role: app, host: kolbe-app}")
 
 
@@ -103,6 +112,20 @@ def test_backend_resolves_from_the_org_manifest(tmp_path):
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
     assert nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0]) == "10.0.10.107:8080"
+
+
+def test_backend_unpinned_app_uses_the_default_host(tmp_path):
+    """An unpinned app Deployment resolves to the org's default app host (§13)."""
+    tree = _tree(
+        tmp_path,
+        {"hello": HELLO},
+        {"router": ROUTER_FACILITY},
+        org_body=ORG_TWO_APP_WITH_DEFAULT,
+    )
+    org = nuk.load_org(tree / "org.yml")
+    hello = nuk.load_deployments(tree)[0]
+    addr = nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0], router_present=True)
+    assert addr == "10.0.10.107:8443"  # the default `deploy`, not the first `kolbe-app`
 
 
 def test_backend_honours_an_explicit_address(tmp_path):
