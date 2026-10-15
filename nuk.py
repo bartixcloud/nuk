@@ -2659,7 +2659,8 @@ def backend_address(
 
     Raises:
         ValueError: If the deployment has no placement (the edge cannot guess
-            which host runs it), or the org declares no host with that role.
+            which host runs it), the org declares no host with that role, or the
+            placement names a `host` the org does not declare.
     """
     if ing.get("address"):
         return ing["address"]
@@ -2670,13 +2671,22 @@ def backend_address(
             f"cannot resolve a backend without knowing which host runs it."
         )
         raise ValueError(msg)
-    host = org.host_for(placement.role)
-    if host is None:
-        msg = (
-            f"{manifest.metadata.name}: placement.role={placement.role!r} but the org "
-            f"manifest declares no host with role {placement.role!r}."
-        )
-        raise ValueError(msg)
+    if placement.host is not None:
+        host = org.host_named(placement.host)
+        if host is None:
+            msg = (
+                f"{manifest.metadata.name}: placement.host={placement.host!r} but the "
+                f"org manifest declares no host with that name."
+            )
+            raise ValueError(msg)
+    else:
+        host = org.host_for(placement.role)
+        if host is None:
+            msg = (
+                f"{manifest.metadata.name}: placement.role={placement.role!r} but the org "
+                f"manifest declares no host with role {placement.role!r}."
+            )
+            raise ValueError(msg)
     if router_present and placement.role == "app":
         return f"{host.private_ip}:{ROUTER_PORT}"
     return f"{host.private_ip}:{_published_port(ing)}"

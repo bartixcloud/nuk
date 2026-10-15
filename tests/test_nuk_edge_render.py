@@ -71,15 +71,31 @@ ROUTER_FACILITY = """
       placement: {role: app}
 """
 
+ORG_TWO_APP = ORG.replace(
+    "      - {name: deploy,  provider: incus, role: app,  privateIp: 10.0.10.107, metal: metal}\n",
+    "      - {name: deploy,    provider: incus, role: app, privateIp: 10.0.10.107, metal: metal}\n"
+    "      - {name: kolbe-app, provider: incus, role: app, privateIp: 10.0.10.190, metal: metal}\n",
+)
 
-def _tree(tmp_path: Path, deployments: dict[str, str], facilities: dict[str, str]) -> Path:
+PINNED_HELLO = HELLO.replace(
+    "placement: {role: app}", "placement: {role: app, host: kolbe-app}"
+)
+
+
+def _tree(
+    tmp_path: Path,
+    deployments: dict[str, str],
+    facilities: dict[str, str],
+    *,
+    org_body: str = ORG,
+) -> Path:
     for sub, docs in (("deployments", deployments), ("facilities", facilities)):
         d = tmp_path / sub
         d.mkdir(parents=True, exist_ok=True)
         for name, body in docs.items():
             (d / f"{name}.yml").write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
     org = tmp_path / "org.yml"
-    org.write_text(textwrap.dedent(ORG).lstrip(), encoding="utf-8")
+    org.write_text(textwrap.dedent(org_body).lstrip(), encoding="utf-8")
     return tmp_path
 
 
@@ -125,6 +141,34 @@ def test_backend_refuses_a_role_the_org_does_not_declare(tmp_path):
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
     with pytest.raises(ValueError, match="no host with role"):
+        nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0])
+
+
+def test_backend_address_uses_pinned_app_host(tmp_path):
+    """A `placement.host` pin routes to THAT host, not the first app host (§13)."""
+    tree = _tree(
+        tmp_path,
+        {"hello": PINNED_HELLO},
+        {"router": ROUTER_FACILITY},
+        org_body=ORG_TWO_APP,
+    )
+    org = nuk.load_org(tree / "org.yml")
+    pinned = nuk.load_deployments(tree)[0]
+    addr = nuk.backend_address(
+        org, pinned, pinned.raw["spec"]["ingress"][0], router_present=True
+    )
+    assert addr == "10.0.10.190:8443"  # kolbe-app, not deploy (10.0.10.107)
+
+
+def test_backend_refuses_a_pinned_host_the_org_does_not_declare(tmp_path):
+    """A `placement.host` naming no host is a manifest the org cannot serve."""
+    pinned = HELLO.replace(
+        "placement: {role: app}", "placement: {role: app, host: ghost}"
+    )
+    tree = _tree(tmp_path, {"hello": pinned}, {}, org_body=ORG_TWO_APP)
+    org = nuk.load_org(tree / "org.yml")
+    hello = nuk.load_deployments(tree)[0]
+    with pytest.raises(ValueError, match="no host with that name"):
         nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0])
 
 
