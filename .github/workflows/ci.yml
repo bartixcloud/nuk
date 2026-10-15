@@ -16,6 +16,9 @@ permissions:
 
 jobs:
   ci:
+    # nuk is a PUBLIC repo on self-hosted runners: never hand a fork PR (untrusted
+    # code) a broker build VM. Same-repo PRs and push-to-main only.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, build]
     steps:
       - uses: actions/checkout@v7
