@@ -395,14 +395,37 @@ def test_org_accepts_app_role():
 # --- singleton roles (spec §3.1) -------------------------------------------------
 
 
-def test_org_rejects_two_app_hosts():
+def test_org_allows_two_app_hosts():
+    """Spec §13: a second app host (the dedicated Kolbe VM) is legal."""
     hosts = [
         {"name": "edge", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
-        {"name": "a", "provider": "hcloud", "role": "app", "privateIp": "10.10.1.3"},
-        {"name": "b", "provider": "hcloud", "role": "app", "privateIp": "10.10.1.4"},
+        {
+            "name": "m",
+            "provider": "manual",
+            "ip": "1.2.3.4",
+            "role": "hypervisor",
+            "privateIp": "10.10.2.2",
+        },
+        {
+            "name": "deploy",
+            "provider": "incus",
+            "metal": "m",
+            "role": "app",
+            "privateIp": "10.10.1.3",
+        },
+        {
+            "name": "kolbe-app",
+            "provider": "incus",
+            "metal": "m",
+            "role": "app",
+            "privateIp": "10.10.1.4",
+        },
     ]
-    with pytest.raises(nuk.ValidationError, match="at most one host may have role 'app'"):
-        nuk.Org.model_validate(_hosts(hosts))
+    # incus hosts are VMs: they must sit in the vswitchSubnet (mirrors
+    # test_org_accepts_incus_provider), so widen it to cover their IPs.
+    doc = _hosts(hosts, network={**ORG_DOC["network"], "vswitchSubnet": "10.10.1.0/24"})
+    org = nuk.Org.model_validate(doc)
+    assert [h.name for h in org.hosts if h.role == "app"] == ["deploy", "kolbe-app"]
 
 
 def test_org_rejects_two_data_hosts():

@@ -524,7 +524,7 @@ def _check_entry_and_mesh(hosts: list[Host], mesh: str) -> None:
             raise ValueError(msg)
 
 
-_SINGLETON_ROLES = frozenset({"app", "data"})
+_SINGLETON_ROLES = frozenset({"data"})
 
 
 def _check_singleton_roles(hosts: list[Host]) -> None:
@@ -532,8 +532,10 @@ def _check_singleton_roles(hosts: list[Host]) -> None:
 
     `edge`/`all-in-one` are already exactly-one via `_check_entry_and_mesh`;
     `hypervisor` is exempt — placement never targets it, and the broker needs
-    multi-metal to be legal. Multi-host roles are future work; the seam is a
-    `selector:` on placement, not a redesign (§13).
+    multi-metal to be legal. `app` is multi-host as of the selector work (§13):
+    an org may declare a second app host (e.g. a dedicated Kolbe VM), selected
+    via the placement `host` field; only `data` stays singleton. Multi-host
+    `data` remains future work; the seam is a `selector:` on placement.
     """
     for role in sorted(_SINGLETON_ROLES):
         named = [h.name for h in hosts if h.role == role]
