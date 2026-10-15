@@ -77,9 +77,7 @@ ORG_TWO_APP = ORG.replace(
     "      - {name: kolbe-app, provider: incus, role: app, privateIp: 10.0.10.190, metal: metal}\n",
 )
 
-PINNED_HELLO = HELLO.replace(
-    "placement: {role: app}", "placement: {role: app, host: kolbe-app}"
-)
+PINNED_HELLO = HELLO.replace("placement: {role: app}", "placement: {role: app, host: kolbe-app}")
 
 
 def _tree(
@@ -154,17 +152,13 @@ def test_backend_address_uses_pinned_app_host(tmp_path):
     )
     org = nuk.load_org(tree / "org.yml")
     pinned = nuk.load_deployments(tree)[0]
-    addr = nuk.backend_address(
-        org, pinned, pinned.raw["spec"]["ingress"][0], router_present=True
-    )
+    addr = nuk.backend_address(org, pinned, pinned.raw["spec"]["ingress"][0], router_present=True)
     assert addr == "10.0.10.190:8443"  # kolbe-app, not deploy (10.0.10.107)
 
 
 def test_backend_refuses_a_pinned_host_the_org_does_not_declare(tmp_path):
     """A `placement.host` naming no host is a manifest the org cannot serve."""
-    pinned = HELLO.replace(
-        "placement: {role: app}", "placement: {role: app, host: ghost}"
-    )
+    pinned = HELLO.replace("placement: {role: app}", "placement: {role: app, host: ghost}")
     tree = _tree(tmp_path, {"hello": pinned}, {}, org_body=ORG_TWO_APP)
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
