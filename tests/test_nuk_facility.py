@@ -114,8 +114,7 @@ TWO_APP_HOSTS_ORG = {
 TWO_APP_HOSTS_ORG_WITH_DEFAULT = {
     **TWO_APP_HOSTS_ORG,
     "hosts": [
-        {**h, "default": True} if h["name"] == "deploy" else h
-        for h in TWO_APP_HOSTS_ORG["hosts"]
+        {**h, "default": True} if h["name"] == "deploy" else h for h in TWO_APP_HOSTS_ORG["hosts"]
     ],
 }
 
