@@ -81,7 +81,7 @@ raises-extend-require-match-for = [
 convention = "google"
 
 [tool.ty.environment]
-python-version = "3.11"
+python-version = "3.13"
 
 # Type-check the product module, not the tests: the frozen wire-contract tests
 # deliberately pass None / subscript dict|None returns (patterns we may not edit,

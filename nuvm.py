@@ -177,8 +177,11 @@ def _is_placeholder_user_data(text: str) -> bool:
 def _write_seed(host: nuk.Host, org: nuk.Org) -> None:
     d = instance_dir(host.name)
     d.mkdir(parents=True, exist_ok=True)
-    gateway = org.network.vswitch_subnet.rsplit(".", 1)[0] + ".1"
-    prefixlen = int(org.network.vswitch_subnet.split("/")[1])
+    network = org.network
+    if network is None:
+        nuk.die(f"{host.name}: the org declares no `network` block, so no gateway can be derived")
+    gateway = network.vswitch_subnet.rsplit(".", 1)[0] + ".1"
+    prefixlen = int(network.vswitch_subnet.split("/")[1])
     (d / "network-config").write_text(render_network_config(host, gateway, prefixlen))
     (d / "meta-data").write_text(render_meta_data(host))
     # P1: minimal cloud-config; Ops O3 supplies the real template.
