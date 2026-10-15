@@ -113,6 +113,25 @@ def test_org_parses_full_manifest():
     assert org.mesh == "tailscale"
 
 
+def test_org_parses_default_host_marker():
+    org = nuk.Org.model_validate(
+        _hosts(
+            [
+                {"name": "edge", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
+                {
+                    "name": "deploy",
+                    "provider": "hcloud",
+                    "role": "app",
+                    "privateIp": "10.10.1.3",
+                    "default": True,
+                },
+            ]
+        )
+    )
+    assert org.host_named("deploy").default is True
+    assert org.host_named("edge").default is False
+
+
 def test_org_one_host_all_in_one_no_network():
     org = nuk.Org.model_validate(ONE_HOST_DOC)
     assert org.network is None

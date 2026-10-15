@@ -474,6 +474,9 @@ class Host(BaseModel):
     metal: str | None = None  # libvirt: the hypervisor host it runs on
     vcpu: int | None = None
     memory: str | None = None
+    # The default host for its role: where an UNPINNED deployment of that role runs
+    # when the role has more than one host (spec §13 selector follow-up).
+    default: bool = False
 
 
 def _ip_in_cidr(ip: str, cidr: str) -> bool:
