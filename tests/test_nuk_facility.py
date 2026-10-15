@@ -143,6 +143,28 @@ def test_placement_does_not_match_other_role(tmp_path):
     assert nuk.placement_matches(m, "edge") is False
 
 
+def test_placement_parses_optional_host(tmp_path):
+    m = nuk.load(
+        _write(
+            tmp_path,
+            """
+            apiVersion: nuk/v1
+            kind: Deployment
+            metadata: {name: pinned}
+            spec:
+              source: {repo: https://github.com/bartixcloud/x.git}
+              placement: {role: app, host: kolbe-app}
+            """,
+        )
+    )
+    assert m.spec.placement.host == "kolbe-app"
+
+
+def test_placement_host_defaults_to_none(tmp_path):
+    m = nuk.load(_write(tmp_path, DEPLOYMENT_HELLO))
+    assert m.spec.placement.host is None
+
+
 def test_unplaced_manifest_matches_every_role(tmp_path):
     """No placement = legacy manifest. It applies wherever it is run, as before."""
     m = nuk.load(

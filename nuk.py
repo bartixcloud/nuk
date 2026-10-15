@@ -233,12 +233,17 @@ Role = Literal["edge", "data", "app", "hypervisor", "all-in-one"]
 class Placement(BaseModel):
     """`spec.placement` — the role whose hosts run this manifest's containers.
 
+    `host` optionally pins a manifest to ONE named host of that role, for a role
+    that has several hosts (spec §13's `selector:` seam). Absent it, the role must
+    resolve to a single host.
+
     Shared by both kinds (spec §4.2). Replaces the two implicit placement
     mechanisms it supersedes: "whichever host someone ran `nuk apply` on", and
     converge.sh's retired APPS environment variable.
     """
 
     role: Role
+    host: str | None = None
 
 
 class Health(_NullTolerant):
