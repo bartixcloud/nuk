@@ -2431,10 +2431,11 @@ def placement_matches(
         so it owns every placement.
 
     `placement.host` pins a manifest to one named host: it matches only where that
-    host's `privateIp == self_ip`. A Deployment placed `app` with no `host` is
-    ambiguous once the org has more than one app host — a loud error, never a
-    silent double-deploy. A Facility is shared substrate and matches every host of
-    its role (each app host runs its own `router`).
+    host's `privateIp == self_ip`, and a pin naming a host the org does not declare
+    is a loud error. A Deployment placed `app` with no `host` resolves to the org's
+    default app host once the org has more than one app host; without a default it
+    is a loud error, never a silent double-deploy. A Facility is shared substrate
+    and matches every host of its role (each app host runs its own `router`).
     """
     placement = manifest.spec.placement
     if placement is None or role == "all-in-one":
@@ -2442,33 +2443,49 @@ def placement_matches(
     if placement.role != role:
         return False
     if placement.host is not None:
-        host = org.host_named(placement.host) if org is not None else None
-        return host is not None and host.private_ip == self_ip
-    if (
-        isinstance(manifest, Deployment)
-        and role == "app"
-        and org is not None
-        and org.app_host_count() > 1
-    ):
+        if org is None:
+            return False
+        host = org.host_named(placement.host)
+        if host is None:
+            msg = (
+                f"{manifest.metadata.name}: placement.host={placement.host!r} — the org "
+                f"manifest declares no host of that name."
+            )
+            raise ValidationError.from_exception_data(
+                manifest.metadata.name,
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("spec", "placement", "host"),
+                        "input": placement.host,
+                        "ctx": {"error": ValueError(msg)},
+                    }
+                ],
+            )
+        return host.private_ip == self_ip
+    if isinstance(manifest, Deployment) and role == "app" and org is not None:
         count = org.app_host_count()
-        msg = (
-            f"{manifest.metadata.name}: placement.role='app' is ambiguous — the org has "
-            f"{count} app hosts; set spec.placement.host to pin one."
-        )
-        # `ValidationError` is pydantic's (a ValueError, so `apply_tree`'s failure
-        # guard catches it); in v2 it cannot be raised with a bare message, so build
-        # one carrying `msg` through the supported constructor.
-        raise ValidationError.from_exception_data(
-            manifest.metadata.name,
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("spec", "placement", "host"),
-                    "input": None,
-                    "ctx": {"error": ValueError(msg)},
-                }
-            ],
-        )
+        if count > 1 and org.default_host("app") is None:
+            msg = (
+                f"{manifest.metadata.name}: placement.role='app' is ambiguous — the org has "
+                f"{count} app hosts and none is the default; set spec.placement.host to pin one."
+            )
+            # `ValidationError` is pydantic's (a ValueError, so `apply_tree`'s failure
+            # guard catches it); in v2 it cannot be raised with a bare message, so
+            # build one carrying `msg` through the supported constructor.
+            raise ValidationError.from_exception_data(
+                manifest.metadata.name,
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("spec", "placement", "host"),
+                        "input": None,
+                        "ctx": {"error": ValueError(msg)},
+                    }
+                ],
+            )
+        default = org.default_host("app")
+        return default is None or default.private_ip == self_ip
     return True
 
 

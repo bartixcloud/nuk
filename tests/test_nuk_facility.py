@@ -111,6 +111,16 @@ TWO_APP_HOSTS_ORG = {
     },
 }
 
+TWO_APP_HOSTS_ORG_WITH_DEFAULT = {
+    **TWO_APP_HOSTS_ORG,
+    "hosts": [
+        {**h, "default": True} if h["name"] == "deploy" else h
+        for h in TWO_APP_HOSTS_ORG["hosts"]
+    ],
+}
+
+PINNED_TO_UNKNOWN_HOST = PINNED_DEPLOYMENT.replace("host: kolbe-app", "host: nope")
+
 
 def test_load_returns_facility_for_kind_facility(tmp_path):
     m = nuk.load(_write(tmp_path, FACILITY_AUTH))
@@ -266,6 +276,27 @@ def test_unpinned_app_deployment_is_ambiguous_with_two_app_hosts(tmp_path):
     m = nuk.load(_write(tmp_path, DEPLOYMENT_HELLO))
     org = nuk.Org.model_validate(TWO_APP_HOSTS_ORG)
     with pytest.raises(nuk.ValidationError, match="ambiguous"):
+        nuk.placement_matches(m, "app", self_ip="10.0.10.107", org=org)
+
+
+def test_unpinned_app_deployment_matches_the_default_host(tmp_path):
+    m = nuk.load(_write(tmp_path, DEPLOYMENT_HELLO))  # placement: {role: app}
+    org = nuk.Org.model_validate(TWO_APP_HOSTS_ORG_WITH_DEFAULT)  # deploy default, kolbe-app not
+    assert nuk.placement_matches(m, "app", self_ip="10.0.10.107", org=org) is True
+    assert nuk.placement_matches(m, "app", self_ip="10.0.10.190", org=org) is False
+
+
+def test_unpinned_app_deployment_is_ambiguous_only_without_a_default(tmp_path):
+    m = nuk.load(_write(tmp_path, DEPLOYMENT_HELLO))
+    org = nuk.Org.model_validate(TWO_APP_HOSTS_ORG)  # two app hosts, none default
+    with pytest.raises(nuk.ValidationError, match="ambiguous"):
+        nuk.placement_matches(m, "app", self_ip="10.0.10.107", org=org)
+
+
+def test_unknown_pinned_host_is_loud_on_converge(tmp_path):
+    m = nuk.load(_write(tmp_path, PINNED_TO_UNKNOWN_HOST))  # placement.host: nope
+    org = nuk.Org.model_validate(TWO_APP_HOSTS_ORG)
+    with pytest.raises(nuk.ValidationError, match="no host"):
         nuk.placement_matches(m, "app", self_ip="10.0.10.107", org=org)
 
 
