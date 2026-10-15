@@ -27,6 +27,9 @@ permissions:
 
 jobs:
   integration:
+    # A fork PR must never reach a broker build VM (arbitrary code on the fleet's
+    # network): same-repo PRs and push-to-main only.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # ⚠ MUST NOT be a self-hosted runner that shares a host with the live data stack:
     #   with the unfiltered `on: pull_request` above and the fixture's
     #   `docker compose down -v`, any pull request would bring up the fixed-name
