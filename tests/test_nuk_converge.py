@@ -240,6 +240,23 @@ spec:
   databases: {postgres: true}
 """
 
+# Two `app` hosts: a Deployment placed `{role: app}` with no `host` names neither,
+# so placement_matches cannot decide and must surface a loud failure (§13).
+TWO_APP_HOSTS_ORG_YML = """\
+apiVersion: nukorg/v1
+kind: Org
+metadata: {name: astrojones}
+domains: [jonaheidsick.de]
+platformDomain: jonaheidsick.de
+acmeEmail: admin@jonaheidsick.de
+hosts:
+  - {name: ingress, provider: incus, metal: metal, role: edge, privateIp: 10.0.10.241}
+  - {name: metal, provider: manual, ip: 1.2.3.4, role: hypervisor, privateIp: 10.0.2.2}
+  - {name: deploy, provider: incus, metal: metal, role: app, privateIp: 10.0.10.107}
+  - {name: kolbe-app, provider: incus, metal: metal, role: app, privateIp: 10.0.10.190}
+facilities: {dns: wildcard, tls: dns01, dnsProvider: hetzner, secrets: sops, runners: ephemeral}
+"""
+
 
 def _tree(tmp_path, **files):
     """Build a manifest tree under `tmp_path` from facilities=/deployments= YAML bodies."""
@@ -278,6 +295,18 @@ def test_apply_tree_skips_manifests_placed_on_another_host(tmp_path, monkeypatch
     results = nuk.apply_tree(_ctx(tree, "app"))
     assert applied == ["hello"]
     assert len(results) == 1
+
+
+def test_ambiguous_app_deployment_fails_not_silently_skips(tmp_path, monkeypatch):
+    # An org with two app hosts and a deployment pinned to neither must surface a
+    # FAILED result for that deployment, never an "ok" on both hosts.
+    tree = _tree(tmp_path, deployments={"hello": DEPLOYMENT_YML})
+    (tree / nuk.DEFAULT_ORG_FILE).write_text(TWO_APP_HOSTS_ORG_YML, encoding="utf-8")
+    monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp, **_k: None)
+    results = nuk.apply_tree(_ctx(tree, "app"))
+    entry = next(r for r in results if r["name"] == "hello")
+    assert entry["result"] == "failed"
+    assert "ambiguous" in entry["error"]
 
 
 def test_one_failing_deployment_does_not_stop_the_rest(tmp_path, monkeypatch):

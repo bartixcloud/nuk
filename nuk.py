@@ -1895,7 +1895,14 @@ def _provided_capabilities(manifest: Facility) -> set[str]:
     return {p.capability for p in (provides.route, provides.env) if p is not None}
 
 
-def provision_remote_databases(tree: Path, role: str, facilities: list[Facility]) -> list[dict]:
+def provision_remote_databases(
+    tree: Path,
+    role: str,
+    facilities: list[Facility],
+    *,
+    self_ip: str | None = None,
+    org: Org | None = None,
+) -> list[dict]:
     """Provision every deployment's databases on this host IF it owns the capability.
 
     The placement-gate exception (spec §3.1): a deployment placed `app` is a
@@ -1907,7 +1914,7 @@ def provision_remote_databases(tree: Path, role: str, facilities: list[Facility]
     same password, so re-running converges to a no-op rather than rotating.
     """
     provider = env_facility(facilities, _DATABASES_CAPABILITY)
-    if provider is None or not placement_matches(provider, role):
+    if provider is None or not placement_matches(provider, role, self_ip=self_ip, org=org):
         return []
     out: list[dict] = []
     for path in sorted((tree / DEPLOYMENT_DIR).glob("*.yml")):
@@ -1966,7 +1973,7 @@ def _deployment_tree(ctx: TreeContext, manifest: Deployment, path: Path) -> Path
     return branch / path.relative_to(ctx.tree)
 
 
-def apply_tree(ctx: TreeContext) -> list[dict]:
+def apply_tree(ctx: TreeContext) -> list[dict]:  # noqa: C901  # placement ambiguity is recorded per manifest, not raised out of the loop
     """Apply this host's Facilities, then its Deployments (spec §7 steps 6-7).
 
     Facilities first within a cycle (§7.1): effect VOCABULARY is git-derived and
@@ -2008,7 +2015,14 @@ def apply_tree(ctx: TreeContext) -> list[dict]:
             except SystemExit as e:
                 results.append(_result(path.name, kind, "failed", _exit_reason(e, "load failed")))
                 continue
-            if manifest.kind != kind or not placement_matches(manifest, role):
+            if manifest.kind != kind:
+                continue
+            try:
+                matches = placement_matches(manifest, role, self_ip=ctx.self_ip, org=ctx.org)
+            except ValueError as e:
+                results.append(_result(manifest.metadata.name, kind, "failed", str(e)))
+                continue
+            if not matches:
                 continue
             apply_path = path
             if isinstance(manifest, Deployment):
@@ -2051,7 +2065,9 @@ def apply_tree(ctx: TreeContext) -> list[dict]:
     handled = {r["name"] for r in results if r["kind"] == "Deployment"}
     results.extend(
         r
-        for r in provision_remote_databases(tree, role, ctx.facilities)
+        for r in provision_remote_databases(
+            tree, role, ctx.facilities, self_ip=ctx.self_ip, org=ctx.org
+        )
         if r["name"] not in handled
     )
     return results
@@ -3859,7 +3875,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         sys.exit(1)
     ctx = ctx or TreeContext.for_path(manifest_path)
     role, self_ip = ctx.role, ctx.self_ip
-    if not placement_matches(manifest, role):
+    if not placement_matches(manifest, role, self_ip=self_ip, org=ctx.org):
         # placement_matches returns False only when a placement is set and differs.
         placement = manifest.spec.placement
         assert placement is not None  # noqa: S101  # narrows the union for ty
@@ -3966,7 +3982,9 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         # all-in-one host, which placement_matches treats as owner of every
         # facility — the two sides must never disagree.
         owner = env_facility(facilities, _DATABASES_CAPABILITY)
-        owns_databases = owner is not None and placement_matches(owner, role)
+        owns_databases = owner is not None and placement_matches(
+            owner, role, self_ip=self_ip, org=org
+        )
         if not owns_databases:
             remote_ip = data_host_ip(org)
     db_env = provision_databases(
