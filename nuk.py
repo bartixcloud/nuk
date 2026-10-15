@@ -233,12 +233,17 @@ Role = Literal["edge", "data", "app", "hypervisor", "all-in-one"]
 class Placement(BaseModel):
     """`spec.placement` — the role whose hosts run this manifest's containers.
 
+    `host` optionally pins a manifest to ONE named host of that role, for a role
+    that has several hosts (spec §13's `selector:` seam). Absent it, the role must
+    resolve to a single host.
+
     Shared by both kinds (spec §4.2). Replaces the two implicit placement
     mechanisms it supersedes: "whichever host someone ran `nuk apply` on", and
     converge.sh's retired APPS environment variable.
     """
 
     role: Role
+    host: str | None = None
 
 
 class Health(_NullTolerant):
@@ -519,7 +524,7 @@ def _check_entry_and_mesh(hosts: list[Host], mesh: str) -> None:
             raise ValueError(msg)
 
 
-_SINGLETON_ROLES = frozenset({"app", "data"})
+_SINGLETON_ROLES = frozenset({"data"})
 
 
 def _check_singleton_roles(hosts: list[Host]) -> None:
@@ -527,8 +532,10 @@ def _check_singleton_roles(hosts: list[Host]) -> None:
 
     `edge`/`all-in-one` are already exactly-one via `_check_entry_and_mesh`;
     `hypervisor` is exempt — placement never targets it, and the broker needs
-    multi-metal to be legal. Multi-host roles are future work; the seam is a
-    `selector:` on placement, not a redesign (§13).
+    multi-metal to be legal. `app` is multi-host as of the selector work (§13):
+    an org may declare a second app host (e.g. a dedicated Kolbe VM), selected
+    via the placement `host` field; only `data` stays singleton. Multi-host
+    `data` remains future work; the seam is a `selector:` on placement.
     """
     for role in sorted(_SINGLETON_ROLES):
         named = [h.name for h in hosts if h.role == role]
@@ -607,6 +614,14 @@ class Org(BaseModel):
     def host_for(self, role: str) -> Host | None:
         """The host carrying `role`, or None (placement-target roles are singletons)."""
         return next((h for h in self.hosts if h.role == role), None)
+
+    def host_named(self, name: str) -> Host | None:
+        """The host with this `name`, or None."""
+        return next((h for h in self.hosts if h.name == name), None)
+
+    def app_host_count(self) -> int:
+        """How many hosts carry role `app` (the multi-host role)."""
+        return sum(1 for h in self.hosts if h.role == "app")
 
 
 def validate_ingress_hosts(org: Org, manifest: Deployment | Facility) -> None:
@@ -1880,7 +1895,14 @@ def _provided_capabilities(manifest: Facility) -> set[str]:
     return {p.capability for p in (provides.route, provides.env) if p is not None}
 
 
-def provision_remote_databases(tree: Path, role: str, facilities: list[Facility]) -> list[dict]:
+def provision_remote_databases(
+    tree: Path,
+    role: str,
+    facilities: list[Facility],
+    *,
+    self_ip: str | None = None,
+    org: Org | None = None,
+) -> list[dict]:
     """Provision every deployment's databases on this host IF it owns the capability.
 
     The placement-gate exception (spec §3.1): a deployment placed `app` is a
@@ -1892,7 +1914,7 @@ def provision_remote_databases(tree: Path, role: str, facilities: list[Facility]
     same password, so re-running converges to a no-op rather than rotating.
     """
     provider = env_facility(facilities, _DATABASES_CAPABILITY)
-    if provider is None or not placement_matches(provider, role):
+    if provider is None or not placement_matches(provider, role, self_ip=self_ip, org=org):
         return []
     out: list[dict] = []
     for path in sorted((tree / DEPLOYMENT_DIR).glob("*.yml")):
@@ -1951,7 +1973,7 @@ def _deployment_tree(ctx: TreeContext, manifest: Deployment, path: Path) -> Path
     return branch / path.relative_to(ctx.tree)
 
 
-def apply_tree(ctx: TreeContext) -> list[dict]:
+def apply_tree(ctx: TreeContext) -> list[dict]:  # noqa: C901  # placement ambiguity is recorded per manifest, not raised out of the loop
     """Apply this host's Facilities, then its Deployments (spec §7 steps 6-7).
 
     Facilities first within a cycle (§7.1): effect VOCABULARY is git-derived and
@@ -1993,7 +2015,14 @@ def apply_tree(ctx: TreeContext) -> list[dict]:
             except SystemExit as e:
                 results.append(_result(path.name, kind, "failed", _exit_reason(e, "load failed")))
                 continue
-            if manifest.kind != kind or not placement_matches(manifest, role):
+            if manifest.kind != kind:
+                continue
+            try:
+                matches = placement_matches(manifest, role, self_ip=ctx.self_ip, org=ctx.org)
+            except ValueError as e:
+                results.append(_result(manifest.metadata.name, kind, "failed", str(e)))
+                continue
+            if not matches:
                 continue
             apply_path = path
             if isinstance(manifest, Deployment):
@@ -2036,7 +2065,9 @@ def apply_tree(ctx: TreeContext) -> list[dict]:
     handled = {r["name"] for r in results if r["kind"] == "Deployment"}
     results.extend(
         r
-        for r in provision_remote_databases(tree, role, ctx.facilities)
+        for r in provision_remote_databases(
+            tree, role, ctx.facilities, self_ip=ctx.self_ip, org=ctx.org
+        )
         if r["name"] not in handled
     )
     return results
@@ -2356,8 +2387,14 @@ def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> i
         return code
 
 
-def placement_matches(manifest: Deployment | Facility, role: str) -> bool:
-    """Whether THIS host, with `role`, is the one that runs `manifest`.
+def placement_matches(
+    manifest: Deployment | Facility,
+    role: str,
+    *,
+    self_ip: str | None = None,
+    org: Org | None = None,
+) -> bool:
+    """Whether THIS host, with `role` at `self_ip`, runs `manifest`.
 
     The convergence loop hands every host the same tree; each applies the subset
     it owns. A manifest placed elsewhere is another host's job, not an error —
@@ -2368,11 +2405,47 @@ def placement_matches(manifest: Deployment | Facility, role: str) -> bool:
         It applies wherever it is run, exactly as it did before.
       * role `all-in-one` — a real composition of edge + data + app (spec §3.1),
         so it owns every placement.
+
+    `placement.host` pins a manifest to one named host: it matches only where that
+    host's `privateIp == self_ip`. A Deployment placed `app` with no `host` is
+    ambiguous once the org has more than one app host — a loud error, never a
+    silent double-deploy. A Facility is shared substrate and matches every host of
+    its role (each app host runs its own `router`).
     """
     placement = manifest.spec.placement
     if placement is None or role == "all-in-one":
         return True
-    return placement.role == role
+    if placement.role != role:
+        return False
+    if placement.host is not None:
+        host = org.host_named(placement.host) if org is not None else None
+        return host is not None and host.private_ip == self_ip
+    if (
+        isinstance(manifest, Deployment)
+        and role == "app"
+        and org is not None
+        and org.app_host_count() > 1
+    ):
+        count = org.app_host_count()
+        msg = (
+            f"{manifest.metadata.name}: placement.role='app' is ambiguous — the org has "
+            f"{count} app hosts; set spec.placement.host to pin one."
+        )
+        # `ValidationError` is pydantic's (a ValueError, so `apply_tree`'s failure
+        # guard catches it); in v2 it cannot be raised with a bare message, so build
+        # one carrying `msg` through the supported constructor.
+        raise ValidationError.from_exception_data(
+            manifest.metadata.name,
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("spec", "placement", "host"),
+                    "input": None,
+                    "ctx": {"error": ValueError(msg)},
+                }
+            ],
+        )
+    return True
 
 
 # Facility manifests live in <tree>/facilities/*.yml, where <tree> is the git tree
@@ -2586,7 +2659,8 @@ def backend_address(
 
     Raises:
         ValueError: If the deployment has no placement (the edge cannot guess
-            which host runs it), or the org declares no host with that role.
+            which host runs it), the org declares no host with that role, or the
+            placement names a `host` the org does not declare.
     """
     if ing.get("address"):
         return ing["address"]
@@ -2597,13 +2671,22 @@ def backend_address(
             f"cannot resolve a backend without knowing which host runs it."
         )
         raise ValueError(msg)
-    host = org.host_for(placement.role)
-    if host is None:
-        msg = (
-            f"{manifest.metadata.name}: placement.role={placement.role!r} but the org "
-            f"manifest declares no host with role {placement.role!r}."
-        )
-        raise ValueError(msg)
+    if placement.host is not None:
+        host = org.host_named(placement.host)
+        if host is None:
+            msg = (
+                f"{manifest.metadata.name}: placement.host={placement.host!r} but the "
+                f"org manifest declares no host with that name."
+            )
+            raise ValueError(msg)
+    else:
+        host = org.host_for(placement.role)
+        if host is None:
+            msg = (
+                f"{manifest.metadata.name}: placement.role={placement.role!r} but the org "
+                f"manifest declares no host with role {placement.role!r}."
+            )
+            raise ValueError(msg)
     if router_present and placement.role == "app":
         return f"{host.private_ip}:{ROUTER_PORT}"
     return f"{host.private_ip}:{_published_port(ing)}"
@@ -3802,7 +3885,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         sys.exit(1)
     ctx = ctx or TreeContext.for_path(manifest_path)
     role, self_ip = ctx.role, ctx.self_ip
-    if not placement_matches(manifest, role):
+    if not placement_matches(manifest, role, self_ip=self_ip, org=ctx.org):
         # placement_matches returns False only when a placement is set and differs.
         placement = manifest.spec.placement
         assert placement is not None  # noqa: S101  # narrows the union for ty
@@ -3909,7 +3992,9 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         # all-in-one host, which placement_matches treats as owner of every
         # facility — the two sides must never disagree.
         owner = env_facility(facilities, _DATABASES_CAPABILITY)
-        owns_databases = owner is not None and placement_matches(owner, role)
+        owns_databases = owner is not None and placement_matches(
+            owner, role, self_ip=self_ip, org=org
+        )
         if not owns_databases:
             remote_ip = data_host_ip(org)
     db_env = provision_databases(

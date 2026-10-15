@@ -69,6 +69,53 @@ DEPLOYMENT = """
 """
 
 
+TWO_APP_HOSTS_ORG = {
+    "apiVersion": "nukorg/v1",
+    "kind": "Org",
+    "metadata": {"name": "astrojones"},
+    "domains": ["jonaheidsick.de"],
+    "platformDomain": "jonaheidsick.de",
+    "acmeEmail": "admin@jonaheidsick.de",
+    "hosts": [
+        {
+            "name": "ingress",
+            "provider": "incus",
+            "metal": "metal",
+            "role": "edge",
+            "privateIp": "10.0.10.241",
+        },
+        {
+            "name": "metal",
+            "provider": "manual",
+            "ip": "1.2.3.4",
+            "role": "hypervisor",
+            "privateIp": "10.0.2.2",
+        },
+        {
+            "name": "deploy",
+            "provider": "incus",
+            "metal": "metal",
+            "role": "app",
+            "privateIp": "10.0.10.107",
+        },
+        {
+            "name": "kolbe-app",
+            "provider": "incus",
+            "metal": "metal",
+            "role": "app",
+            "privateIp": "10.0.10.190",
+        },
+    ],
+    "facilities": {
+        "dns": "wildcard",
+        "tls": "dns01",
+        "dnsProvider": "hetzner",
+        "secrets": "sops",
+        "runners": "ephemeral",
+    },
+}
+
+
 def _load(tmp_path: Path, body: str, name: str):
     doc = tmp_path / name
     doc.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
@@ -175,6 +222,12 @@ def test_host_for_finds_the_role_host_and_returns_none_otherwise(tmp_path):
     org = nuk.load_org(_load(tmp_path, ORG, "org.yml"))
     assert org.host_for("app").private_ip == "10.0.10.107"  # type: ignore[union-attr]
     assert org.host_for("nope") is None
+
+
+def test_host_named_finds_by_name(tmp_path):
+    org = nuk.Org.model_validate(TWO_APP_HOSTS_ORG)
+    assert org.host_named("kolbe-app").private_ip == "10.0.10.190"  # type: ignore[union-attr]
+    assert org.host_named("nope") is None
 
 
 # --- the published-port invariant ---------------------------------------------

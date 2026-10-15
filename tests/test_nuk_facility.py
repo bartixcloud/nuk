@@ -48,6 +48,70 @@ DEPLOYMENT_HELLO = """
 """
 
 
+ROUTER_FACILITY = """
+    apiVersion: nuk/v1
+    kind: Facility
+    metadata: {name: router}
+    spec:
+      placement: {role: app}
+"""
+
+PINNED_DEPLOYMENT = """
+    apiVersion: nuk/v1
+    kind: Deployment
+    metadata: {name: kolbe-test}
+    spec:
+      source: {repo: https://github.com/kolbeapp-de/lernstanderfassung.git}
+      placement: {role: app, host: kolbe-app}
+"""
+
+TWO_APP_HOSTS_ORG = {
+    "apiVersion": "nukorg/v1",
+    "kind": "Org",
+    "metadata": {"name": "astrojones"},
+    "domains": ["jonaheidsick.de"],
+    "platformDomain": "jonaheidsick.de",
+    "acmeEmail": "admin@jonaheidsick.de",
+    "hosts": [
+        {
+            "name": "ingress",
+            "provider": "incus",
+            "metal": "metal",
+            "role": "edge",
+            "privateIp": "10.0.10.241",
+        },
+        {
+            "name": "metal",
+            "provider": "manual",
+            "ip": "1.2.3.4",
+            "role": "hypervisor",
+            "privateIp": "10.0.2.2",
+        },
+        {
+            "name": "deploy",
+            "provider": "incus",
+            "metal": "metal",
+            "role": "app",
+            "privateIp": "10.0.10.107",
+        },
+        {
+            "name": "kolbe-app",
+            "provider": "incus",
+            "metal": "metal",
+            "role": "app",
+            "privateIp": "10.0.10.190",
+        },
+    ],
+    "facilities": {
+        "dns": "wildcard",
+        "tls": "dns01",
+        "dnsProvider": "hetzner",
+        "secrets": "sops",
+        "runners": "ephemeral",
+    },
+}
+
+
 def test_load_returns_facility_for_kind_facility(tmp_path):
     m = nuk.load(_write(tmp_path, FACILITY_AUTH))
     assert isinstance(m, nuk.Facility)
@@ -143,6 +207,28 @@ def test_placement_does_not_match_other_role(tmp_path):
     assert nuk.placement_matches(m, "edge") is False
 
 
+def test_placement_parses_optional_host(tmp_path):
+    m = nuk.load(
+        _write(
+            tmp_path,
+            """
+            apiVersion: nuk/v1
+            kind: Deployment
+            metadata: {name: pinned}
+            spec:
+              source: {repo: https://github.com/bartixcloud/x.git}
+              placement: {role: app, host: kolbe-app}
+            """,
+        )
+    )
+    assert m.spec.placement.host == "kolbe-app"
+
+
+def test_placement_host_defaults_to_none(tmp_path):
+    m = nuk.load(_write(tmp_path, DEPLOYMENT_HELLO))
+    assert m.spec.placement.host is None
+
+
 def test_unplaced_manifest_matches_every_role(tmp_path):
     """No placement = legacy manifest. It applies wherever it is run, as before."""
     m = nuk.load(
@@ -167,6 +253,28 @@ def test_all_in_one_matches_every_placement(tmp_path):
     assert nuk.placement_matches(m, "all-in-one") is True
     f = nuk.load(_write(tmp_path, FACILITY_AUTH, name="f.yml"))
     assert nuk.placement_matches(f, "all-in-one") is True
+
+
+def test_placement_host_matches_only_its_ip(tmp_path):
+    m = nuk.load(_write(tmp_path, PINNED_DEPLOYMENT))
+    org = nuk.Org.model_validate(TWO_APP_HOSTS_ORG)
+    assert nuk.placement_matches(m, "app", self_ip="10.0.10.107", org=org) is False
+    assert nuk.placement_matches(m, "app", self_ip="10.0.10.190", org=org) is True
+
+
+def test_unpinned_app_deployment_is_ambiguous_with_two_app_hosts(tmp_path):
+    m = nuk.load(_write(tmp_path, DEPLOYMENT_HELLO))
+    org = nuk.Org.model_validate(TWO_APP_HOSTS_ORG)
+    with pytest.raises(nuk.ValidationError, match="ambiguous"):
+        nuk.placement_matches(m, "app", self_ip="10.0.10.107", org=org)
+
+
+def test_facility_without_host_stays_unambiguous(tmp_path):
+    """A Facility is shared substrate: it matches every host of its role."""
+    f = nuk.load(_write(tmp_path, ROUTER_FACILITY, name="f.yml"))
+    org = nuk.Org.model_validate(TWO_APP_HOSTS_ORG)
+    assert nuk.placement_matches(f, "app", self_ip="10.0.10.107", org=org) is True
+    assert nuk.placement_matches(f, "app", self_ip="10.0.10.190", org=org) is True
 
 
 def test_facility_apply_refuses_when_unprivileged(tmp_path, monkeypatch, capsys):
