@@ -2700,7 +2700,8 @@ def backend_address(
 
     Raises:
         ValueError: If the deployment has no placement (the edge cannot guess
-            which host runs it), the org declares no host with that role, or the
+            which host runs it), the org declares no host with that role, the role
+            has several hosts and none is marked default (ambiguous), or the
             placement names a `host` the org does not declare.
     """
     if ing.get("address"):
@@ -2721,14 +2722,23 @@ def backend_address(
             )
             raise ValueError(msg)
     else:
-        host = org.default_host(placement.role) or org.host_for(placement.role)
-    if host is None:
-        msg = (
-            f"{manifest.metadata.name}: placement.role={placement.role!r} is unresolvable — the "
-            f"org declares no host with role {placement.role!r}, or several such hosts and none "
-            f"is marked default."
-        )
-        raise ValueError(msg)
+        # No `or host_for` fallback: several hosts and no default is AMBIGUOUS, and
+        # picking the first would disagree with placement_matches (which raises).
+        host = org.default_host(placement.role)
+        if host is None:
+            of_role = [h for h in org.hosts if h.role == placement.role]
+            if not of_role:
+                msg = (
+                    f"{manifest.metadata.name}: placement.role={placement.role!r} but the org "
+                    f"manifest declares no host with role {placement.role!r}."
+                )
+            else:
+                msg = (
+                    f"{manifest.metadata.name}: placement.role={placement.role!r} is ambiguous — "
+                    f"{len(of_role)} hosts and none marked default; set spec.placement.host or a "
+                    f"host default."
+                )
+            raise ValueError(msg)
     if router_present and placement.role == "app":
         return f"{host.private_ip}:{ROUTER_PORT}"
     return f"{host.private_ip}:{_published_port(ing)}"
