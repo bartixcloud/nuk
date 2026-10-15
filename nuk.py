@@ -615,6 +615,14 @@ class Org(BaseModel):
         """The host carrying `role`, or None (placement-target roles are singletons)."""
         return next((h for h in self.hosts if h.role == role), None)
 
+    def host_named(self, name: str) -> Host | None:
+        """The host with this `name`, or None."""
+        return next((h for h in self.hosts if h.name == name), None)
+
+    def app_host_count(self) -> int:
+        """How many hosts carry role `app` (the multi-host role)."""
+        return sum(1 for h in self.hosts if h.role == "app")
+
 
 def validate_ingress_hosts(org: Org, manifest: Deployment | Facility) -> None:
     """Assert every ingress host in `manifest` ends on one of the org's domains.
@@ -2363,8 +2371,14 @@ def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> i
         return code
 
 
-def placement_matches(manifest: Deployment | Facility, role: str) -> bool:
-    """Whether THIS host, with `role`, is the one that runs `manifest`.
+def placement_matches(
+    manifest: Deployment | Facility,
+    role: str,
+    *,
+    self_ip: str | None = None,
+    org: Org | None = None,
+) -> bool:
+    """Whether THIS host, with `role` at `self_ip`, runs `manifest`.
 
     The convergence loop hands every host the same tree; each applies the subset
     it owns. A manifest placed elsewhere is another host's job, not an error —
@@ -2375,11 +2389,47 @@ def placement_matches(manifest: Deployment | Facility, role: str) -> bool:
         It applies wherever it is run, exactly as it did before.
       * role `all-in-one` — a real composition of edge + data + app (spec §3.1),
         so it owns every placement.
+
+    `placement.host` pins a manifest to one named host: it matches only where that
+    host's `privateIp == self_ip`. A Deployment placed `app` with no `host` is
+    ambiguous once the org has more than one app host — a loud error, never a
+    silent double-deploy. A Facility is shared substrate and matches every host of
+    its role (each app host runs its own `router`).
     """
     placement = manifest.spec.placement
     if placement is None or role == "all-in-one":
         return True
-    return placement.role == role
+    if placement.role != role:
+        return False
+    if placement.host is not None:
+        host = org.host_named(placement.host) if org is not None else None
+        return host is not None and host.private_ip == self_ip
+    if (
+        isinstance(manifest, Deployment)
+        and role == "app"
+        and org is not None
+        and org.app_host_count() > 1
+    ):
+        count = org.app_host_count()
+        msg = (
+            f"{manifest.metadata.name}: placement.role='app' is ambiguous — the org has "
+            f"{count} app hosts; set spec.placement.host to pin one."
+        )
+        # `ValidationError` is pydantic's (a ValueError, so `apply_tree`'s failure
+        # guard catches it); in v2 it cannot be raised with a bare message, so build
+        # one carrying `msg` through the supported constructor.
+        raise ValidationError.from_exception_data(
+            manifest.metadata.name,
+            [
+                {
+                    "type": "value_error",
+                    "loc": ("spec", "placement", "host"),
+                    "input": None,
+                    "ctx": {"error": ValueError(msg)},
+                }
+            ],
+        )
+    return True
 
 
 # Facility manifests live in <tree>/facilities/*.yml, where <tree> is the git tree
