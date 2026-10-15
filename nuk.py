@@ -474,6 +474,9 @@ class Host(BaseModel):
     metal: str | None = None  # libvirt: the hypervisor host it runs on
     vcpu: int | None = None
     memory: str | None = None
+    # The default host for its role: where an UNPINNED deployment of that role runs
+    # when the role has more than one host (spec §13 selector follow-up).
+    default: bool = False
 
 
 def _ip_in_cidr(ip: str, cidr: str) -> bool:
@@ -547,6 +550,15 @@ def _check_singleton_roles(hosts: list[Host]) -> None:
             raise ValueError(msg)
 
 
+def _check_one_default_per_role(hosts: list[Host]) -> None:
+    """Raise if any role marks more than one host `default: true`."""
+    for role in {h.role for h in hosts}:
+        marked = [h.name for h in hosts if h.role == role and h.default]
+        if len(marked) > 1:
+            msg = f"at most one default host per role {role!r} — found: {', '.join(marked)}"
+            raise ValueError(msg)
+
+
 def _check_vm_hosts(hosts: list[Host]) -> None:
     """Raise unless every libvirt/incus host names an existing hypervisor host in `metal`."""
     hypervisors = {h.name for h in hosts if h.role == "hypervisor"}
@@ -599,13 +611,15 @@ class Org(BaseModel):
         Raises:
             ValueError: On any violated invariant (unique names/IPs, exactly one
                 entry-point host, mesh/host-count coupling, libvirt→hypervisor,
-                at most one host per placement-target role, platformDomain membership,
-                and private-IP subnet placement).
+                at most one host per placement-target role, at most one default
+                host per role, platformDomain membership, and private-IP subnet
+                placement).
         """
         _check_domains(self.platform_domain, self.domains)
         _check_unique(self.hosts)
         _check_entry_and_mesh(self.hosts, self.mesh)
         _check_singleton_roles(self.hosts)
+        _check_one_default_per_role(self.hosts)
         _check_vm_hosts(self.hosts)
         if self.network is not None:
             _check_subnets(self.hosts, self.network)
@@ -622,6 +636,16 @@ class Org(BaseModel):
     def app_host_count(self) -> int:
         """How many hosts carry role `app` (the multi-host role)."""
         return sum(1 for h in self.hosts if h.role == "app")
+
+    def default_host(self, role: str) -> Host | None:
+        """The role's default host: the `default: true` one, or its sole host."""
+        of_role = [h for h in self.hosts if h.role == role]
+        marked = [h for h in of_role if h.default]
+        if marked:
+            return marked[0]
+        if len(of_role) == 1:
+            return of_role[0]
+        return None
 
 
 def validate_ingress_hosts(org: Org, manifest: Deployment | Facility) -> None:
@@ -2407,10 +2431,11 @@ def placement_matches(
         so it owns every placement.
 
     `placement.host` pins a manifest to one named host: it matches only where that
-    host's `privateIp == self_ip`. A Deployment placed `app` with no `host` is
-    ambiguous once the org has more than one app host — a loud error, never a
-    silent double-deploy. A Facility is shared substrate and matches every host of
-    its role (each app host runs its own `router`).
+    host's `privateIp == self_ip`, and a pin naming a host the org does not declare
+    is a loud error. A Deployment placed `app` with no `host` resolves to the org's
+    default app host once the org has more than one app host; without a default it
+    is a loud error, never a silent double-deploy. A Facility is shared substrate
+    and matches every host of its role (each app host runs its own `router`).
     """
     placement = manifest.spec.placement
     if placement is None or role == "all-in-one":
@@ -2418,33 +2443,49 @@ def placement_matches(
     if placement.role != role:
         return False
     if placement.host is not None:
-        host = org.host_named(placement.host) if org is not None else None
-        return host is not None and host.private_ip == self_ip
-    if (
-        isinstance(manifest, Deployment)
-        and role == "app"
-        and org is not None
-        and org.app_host_count() > 1
-    ):
+        if org is None:
+            return False
+        host = org.host_named(placement.host)
+        if host is None:
+            msg = (
+                f"{manifest.metadata.name}: placement.host={placement.host!r} — the org "
+                f"manifest declares no host of that name."
+            )
+            raise ValidationError.from_exception_data(
+                manifest.metadata.name,
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("spec", "placement", "host"),
+                        "input": placement.host,
+                        "ctx": {"error": ValueError(msg)},
+                    }
+                ],
+            )
+        return host.private_ip == self_ip
+    if isinstance(manifest, Deployment) and role == "app" and org is not None:
         count = org.app_host_count()
-        msg = (
-            f"{manifest.metadata.name}: placement.role='app' is ambiguous — the org has "
-            f"{count} app hosts; set spec.placement.host to pin one."
-        )
-        # `ValidationError` is pydantic's (a ValueError, so `apply_tree`'s failure
-        # guard catches it); in v2 it cannot be raised with a bare message, so build
-        # one carrying `msg` through the supported constructor.
-        raise ValidationError.from_exception_data(
-            manifest.metadata.name,
-            [
-                {
-                    "type": "value_error",
-                    "loc": ("spec", "placement", "host"),
-                    "input": None,
-                    "ctx": {"error": ValueError(msg)},
-                }
-            ],
-        )
+        if count > 1 and org.default_host("app") is None:
+            msg = (
+                f"{manifest.metadata.name}: placement.role='app' is ambiguous — the org has "
+                f"{count} app hosts and none is the default; set spec.placement.host to pin one."
+            )
+            # `ValidationError` is pydantic's (a ValueError, so `apply_tree`'s failure
+            # guard catches it); in v2 it cannot be raised with a bare message, so
+            # build one carrying `msg` through the supported constructor.
+            raise ValidationError.from_exception_data(
+                manifest.metadata.name,
+                [
+                    {
+                        "type": "value_error",
+                        "loc": ("spec", "placement", "host"),
+                        "input": None,
+                        "ctx": {"error": ValueError(msg)},
+                    }
+                ],
+            )
+        default = org.default_host("app")
+        return default is None or default.private_ip == self_ip
     return True
 
 
@@ -2659,7 +2700,8 @@ def backend_address(
 
     Raises:
         ValueError: If the deployment has no placement (the edge cannot guess
-            which host runs it), the org declares no host with that role, or the
+            which host runs it), the org declares no host with that role, the role
+            has several hosts and none is marked default (ambiguous), or the
             placement names a `host` the org does not declare.
     """
     if ing.get("address"):
@@ -2679,13 +2721,32 @@ def backend_address(
                 f"org manifest declares no host with that name."
             )
             raise ValueError(msg)
-    else:
-        host = org.host_for(placement.role)
-        if host is None:
+        if host.role != placement.role:
+            # placement_matches gates the pin behind `placement.role == self role`,
+            # so a pin to another role's host matches NO host on converge. The edge
+            # must refuse it too, not emit a route nothing serves.
             msg = (
-                f"{manifest.metadata.name}: placement.role={placement.role!r} but the org "
-                f"manifest declares no host with role {placement.role!r}."
+                f"{manifest.metadata.name}: placement.host={placement.host!r} has role "
+                f"{host.role!r}, not {placement.role!r} — no host runs this placement."
             )
+            raise ValueError(msg)
+    else:
+        # No `or host_for` fallback: several hosts and no default is AMBIGUOUS, and
+        # picking the first would disagree with placement_matches (which raises).
+        host = org.default_host(placement.role)
+        if host is None:
+            of_role = [h for h in org.hosts if h.role == placement.role]
+            if not of_role:
+                msg = (
+                    f"{manifest.metadata.name}: placement.role={placement.role!r} but the org "
+                    f"manifest declares no host with role {placement.role!r}."
+                )
+            else:
+                msg = (
+                    f"{manifest.metadata.name}: placement.role={placement.role!r} is ambiguous — "
+                    f"{len(of_role)} hosts and none marked default; set spec.placement.host or a "
+                    f"host default."
+                )
             raise ValueError(msg)
     if router_present and placement.role == "app":
         return f"{host.private_ip}:{ROUTER_PORT}"

@@ -411,6 +411,7 @@ def test_cmd_status_overview_all_includes_soll_vs_ist(tmp_path, monkeypatch, cap
             "metal": None,
             "vcpu": None,
             "memory": None,
+            "default": False,
         }
     ]
     assert data["sollVsIst"] == {
