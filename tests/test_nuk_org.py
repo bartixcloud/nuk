@@ -98,6 +98,20 @@ def _hosts(hosts: list[dict], **over: object) -> dict:
     return {**ORG_DOC, "hosts": hosts, **over}
 
 
+# One edge plus the app host marked `default: true`. Add a second (unmarked) app
+# host to get the multi-host case, or a second marked one to trip the validator.
+_TWO_APP_ONE_MARKED = [
+    {"name": "edge", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
+    {
+        "name": "deploy",
+        "provider": "hcloud",
+        "role": "app",
+        "privateIp": "10.10.1.3",
+        "default": True,
+    },
+]
+
+
 # --- schema ------------------------------------------------------------------
 
 
@@ -478,3 +492,36 @@ def test_org_allows_two_hypervisors():
     ]
     org = nuk.Org.model_validate(_hosts(hosts))
     assert [h.name for h in org.hosts] == ["edge", "m1", "m2"]
+
+
+# --- default host per role (spec §13 selector follow-up) ------------------------
+
+
+def test_default_host_is_the_sole_host_of_a_role():
+    org = nuk.Org.model_validate(_hosts(_TWO_APP_ONE_MARKED))
+    assert org.default_host("app").name == "deploy"
+
+
+def test_default_host_is_none_when_two_app_hosts_and_none_marked():
+    hosts = [
+        {"name": "edge", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
+        {"name": "deploy", "provider": "hcloud", "role": "app", "privateIp": "10.10.1.3"},
+        {"name": "kolbe-app", "provider": "hcloud", "role": "app", "privateIp": "10.10.1.4"},
+    ]
+    org = nuk.Org.model_validate(_hosts(hosts))
+    assert org.default_host("app") is None
+
+
+def test_org_rejects_two_default_hosts_for_one_role():
+    hosts = [
+        *_TWO_APP_ONE_MARKED,
+        {
+            "name": "kolbe-app",
+            "provider": "hcloud",
+            "role": "app",
+            "privateIp": "10.10.1.4",
+            "default": True,
+        },
+    ]
+    with pytest.raises(nuk.ValidationError, match="at most one default host"):
+        nuk.Org.model_validate(_hosts(hosts))

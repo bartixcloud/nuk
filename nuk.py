@@ -550,6 +550,15 @@ def _check_singleton_roles(hosts: list[Host]) -> None:
             raise ValueError(msg)
 
 
+def _check_one_default_per_role(hosts: list[Host]) -> None:
+    """Raise if any role marks more than one host `default: true`."""
+    for role in {h.role for h in hosts}:
+        marked = [h.name for h in hosts if h.role == role and h.default]
+        if len(marked) > 1:
+            msg = f"at most one default host per role {role!r} — found: {', '.join(marked)}"
+            raise ValueError(msg)
+
+
 def _check_vm_hosts(hosts: list[Host]) -> None:
     """Raise unless every libvirt/incus host names an existing hypervisor host in `metal`."""
     hypervisors = {h.name for h in hosts if h.role == "hypervisor"}
@@ -602,13 +611,15 @@ class Org(BaseModel):
         Raises:
             ValueError: On any violated invariant (unique names/IPs, exactly one
                 entry-point host, mesh/host-count coupling, libvirt→hypervisor,
-                at most one host per placement-target role, platformDomain membership,
-                and private-IP subnet placement).
+                at most one host per placement-target role, at most one default
+                host per role, platformDomain membership, and private-IP subnet
+                placement).
         """
         _check_domains(self.platform_domain, self.domains)
         _check_unique(self.hosts)
         _check_entry_and_mesh(self.hosts, self.mesh)
         _check_singleton_roles(self.hosts)
+        _check_one_default_per_role(self.hosts)
         _check_vm_hosts(self.hosts)
         if self.network is not None:
             _check_subnets(self.hosts, self.network)
@@ -625,6 +636,16 @@ class Org(BaseModel):
     def app_host_count(self) -> int:
         """How many hosts carry role `app` (the multi-host role)."""
         return sum(1 for h in self.hosts if h.role == "app")
+
+    def default_host(self, role: str) -> Host | None:
+        """The role's default host: the `default: true` one, or its sole host."""
+        of_role = [h for h in self.hosts if h.role == role]
+        marked = [h for h in of_role if h.default]
+        if marked:
+            return marked[0]
+        if len(of_role) == 1:
+            return of_role[0]
+        return None
 
 
 def validate_ingress_hosts(org: Org, manifest: Deployment | Facility) -> None:
