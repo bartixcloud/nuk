@@ -1987,7 +1987,7 @@ def resolve_env_from(spec: Raw) -> list[str]:
 
 def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-contract API; one render pass
     name: str,  # noqa: ARG001  # kept for signature stability (frozen wire-contract API / tests)
-    ingress: list[Raw],
+    ingress: list[Ingress],
     db_env: str | None = None,
     env_from: list[str] | None = None,
     db_services: list[str] | None = None,
@@ -1995,7 +1995,7 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
     local_data: bool = True,
     *,
     colours: list[str] | None = None,
-) -> Raw | None:
+) -> ComposeOverride | None:
     """Compose override wiring services to the shared edge/data networks + secrets.
 
     Each service gets an `env_file` list so its container actually receives the
@@ -2044,7 +2044,8 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
         The override doc, or None when no service needs any wiring.
     """
     env_from = env_from or []
-    ingress_services = [ing["service"] for ing in ingress]
+    # An address-only entry (a backend outside this host) has no compose service to wire.
+    ingress_services = [ing.service for ing in ingress if ing.service is not None]
     db_targets = (list(ingress_services) if db_env else []) if db_services is None else db_services
     db_set = set(db_targets) if db_env else set()
     # Ingress order first, then any db-only (non-ingress) services, deduped.
@@ -2054,14 +2055,14 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
     publish_ports: dict[str, list[str]] = {}
     if publish_ip:
         for ing in ingress:
-            svc, port = ing.get("service"), ing.get("port")
+            svc, port = ing.service, ing.port
             if svc and port is not None:
                 host_port = _published_port(ing)
                 mapping = f"{publish_ip}:{host_port}:{port}"
                 publish_ports.setdefault(svc, [])
                 if mapping not in publish_ports[svc]:
                     publish_ports[svc].append(mapping)
-    services: dict[str, dict[str, list[str]]] = {}
+    services: dict[str, ServiceWiring] = {}
     uses_edge = False
     uses_data = False
     for svc_name in ordered:
@@ -2078,33 +2079,28 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
         # the same wiring (networks, creds, no published port) lands on the
         # containers the router actually resolves.
         for key in [f"{svc_name}-{c}" for c in colours] if colours else [svc_name]:
-            svc: dict[str, list[str]] = {"networks": list(nets)}
-            if publish_ip and svc_name in publish_ports:
-                svc["ports"] = list(publish_ports[svc_name])
-            if env_files:
-                svc["env_file"] = list(env_files)
-            services[key] = svc
+            services[key] = ServiceWiring(
+                networks=nets, ports=publish_ports.get(svc_name, []), env_file=env_files
+            )
     if not services:
         return None
-    networks: dict[str, dict[str, bool]] = {}
-    if uses_edge:
-        networks["edge"] = {"external": True}
-    if uses_data:
-        networks["data"] = {"external": True}
-    return {"services": services, "networks": networks}
+    external = [n for n, used in (("edge", uses_edge), ("data", uses_data)) if used]
+    return ComposeOverride(services=services, external_networks=external)
 
 
-def _published_port(ing: Raw) -> int:
+def _published_port(ing: Ingress) -> int:
     """The host port a non-entry host publishes an ingress on: `hostPort`, else `port`.
 
     The publish (build_override) and the edge's backend (backend_address) must agree.
     """
-    return ing.get("hostPort") or ing["port"]
+    port = ing.host_port or ing.port
+    assert port is not None  # noqa: S101  # narrows int|None for ty; a publish always has a port
+    return port
 
 
 def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override's frozen API
     name: str,
-    ingress: list[Raw],
+    ingress: list[Ingress],
     db_env: str | None = None,
     env_from: list[str] | None = None,
     db_services: list[str] | None = None,
@@ -2119,7 +2115,7 @@ def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override
     )
     if doc is None:
         return
-    (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc))
+    (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc.to_wire()))
 
 
 def compose_service_names(name: str, raw: Raw) -> list[str]:

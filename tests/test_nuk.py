@@ -241,12 +241,20 @@ def test_www_redirect_router_and_middleware():
     assert rr["permanent"] is True
 
 
+def _override(name, ingress, *args, **kwargs):
+    """Wire form of build_override for dict ingress entries; the no-wiring None is a test bug."""
+    parsed = [nuk.Ingress.model_validate(i) for i in ingress]
+    doc = nuk.build_override(name, parsed, *args, **kwargs)
+    assert doc is not None
+    return doc.to_wire()
+
+
 # --- override: edge-network join, dedup shared services -----------------------
 
 
 def test_override_dedups_shared_service():
     # both entries reference frontend; override must list it once
-    ov = nuk.build_override(
+    ov = _override(
         "kolbe",
         [
             {
@@ -279,7 +287,7 @@ def test_override_empty_is_none():
 
 
 def test_override_with_db_joins_data_and_env_file():
-    ov = nuk.build_override(
+    ov = _override(
         "nukview",
         [{"host": "nuk.astrojones.de", "service": "nukview", "port": 3000}],
         db_env="/opt/nuklaut/secrets/nukview-db.env",
@@ -319,7 +327,7 @@ def test_override_env_from_injected_into_ingress_service(tmp_path):
     """
     secret = tmp_path / "app.env"
     secret.write_text("API_KEY=shh\n")
-    ov = nuk.build_override(
+    ov = _override(
         "kolbe",
         [{"host": "kolbe.astrojones.de", "service": "backend", "port": 8000}],
         env_from=[str(secret)],
@@ -341,7 +349,7 @@ def test_override_env_from_and_db_env_both_present_db_env_last(tmp_path):
     secret = tmp_path / "app.env"
     secret.write_text("API_KEY=shh\n")
     db_env = "/opt/nuklaut/secrets/nukview-db.env"
-    ov = nuk.build_override(
+    ov = _override(
         "nukview",
         [{"host": "nuk.astrojones.de", "service": "nukview", "port": 3000}],
         db_env=db_env,
@@ -360,7 +368,7 @@ def test_override_env_from_and_db_env_both_present_db_env_last(tmp_path):
 
 
 def test_override_without_env_from_or_db_env_has_no_env_file():
-    ov = nuk.build_override("bartix", [{"host": "bartix.de", "service": "web", "port": 8080}])
+    ov = _override("bartix", [{"host": "bartix.de", "service": "web", "port": 8080}])
     assert ov["services"] == {"web": {"networks": ["edge"]}}
     assert "env_file" not in ov["services"]["web"]
 
@@ -379,7 +387,7 @@ def test_write_override_includes_env_from(tmp_path, monkeypatch):
 
     nuk.write_override(
         "kolbe",
-        [{"host": "kolbe.astrojones.de", "service": "backend", "port": 8000}],
+        [nuk.Ingress(host="kolbe.astrojones.de", service="backend", port=8000)],
         env_from=[str(secret)],
     )
     doc = yaml.safe_load((deploys / "kolbe" / "compose.override.yml").read_text())
@@ -406,7 +414,7 @@ def test_databases_parses_attach_selectors():
 def test_override_db_services_default_is_ingress_backcompat():
     """db_services=None keeps the legacy behaviour: ingress services get the db."""
     db_env = "/opt/nuklaut/secrets/app-db.env"
-    ov = nuk.build_override(
+    ov = _override(
         "app", [{"host": "app.de", "service": "web", "port": 8080}], db_env=db_env
     )
     assert ov["services"]["web"] == {"networks": ["edge", "data"], "env_file": [db_env]}
@@ -418,7 +426,7 @@ def test_override_attaches_db_to_explicit_non_ingress_service():
     that has no ingress, while the ingress service keeps edge + db.
     """
     db_env = "/opt/nuklaut/secrets/app-db.env"
-    ov = nuk.build_override(
+    ov = _override(
         "app",
         [{"host": "app.de", "service": "web", "port": 8080}],
         db_env=db_env,
@@ -435,7 +443,7 @@ def test_override_worker_only_app_receives_db_url_without_edge():
     nothing uses — is omitted entirely.
     """
     db_env = "/opt/nuklaut/secrets/batch-db.env"
-    ov = nuk.build_override("batch", [], db_env=db_env, db_services=["worker"])
+    ov = _override("batch", [], db_env=db_env, db_services=["worker"])
     assert ov["services"] == {"worker": {"networks": ["data"], "env_file": [db_env]}}
     assert ov["networks"] == {"data": {"external": True}}
 
@@ -447,7 +455,7 @@ def test_override_attach_to_excluding_ingress_keeps_secrets_but_not_db(tmp_path)
     secret = tmp_path / "app.env"
     secret.write_text("API_KEY=shh\n")
     db_env = "/opt/nuklaut/secrets/app-db.env"
-    ov = nuk.build_override(
+    ov = _override(
         "app",
         [{"host": "app.de", "service": "web", "port": 8080}],
         db_env=db_env,
@@ -460,7 +468,7 @@ def test_override_attach_to_excluding_ingress_keeps_secrets_but_not_db(tmp_path)
 
 def test_build_override_remote_db_skips_local_data_network(tmp_path):
     db_env = str(tmp_path / "app-db.env")
-    ov = nuk.build_override(
+    ov = _override(
         "app",
         [{"host": "app.example.com", "service": "web", "port": 8080}],
         db_env,
@@ -477,7 +485,7 @@ def test_build_override_remote_db_skips_local_data_network(tmp_path):
 
 def test_build_override_local_db_still_joins_data_network(tmp_path):
     db_env = str(tmp_path / "app-db.env")
-    ov = nuk.build_override(
+    ov = _override(
         "app",
         [{"host": "app.example.com", "service": "web", "port": 8080}],
         db_env,
@@ -1157,7 +1165,7 @@ def test_read_self_absent_defaults_to_entry_role(tmp_path, monkeypatch):
 
 
 def test_override_publish_ip_binds_private_ip_and_drops_edge():
-    ov = nuk.build_override(
+    ov = _override(
         "hello",
         [{"host": "hello.modl-agent.com", "service": "web", "port": 8080}],
         publish_ip="10.0.1.20",
@@ -1167,7 +1175,7 @@ def test_override_publish_ip_binds_private_ip_and_drops_edge():
 
 
 def test_override_publish_ip_with_db_keeps_data_network():
-    ov = nuk.build_override(
+    ov = _override(
         "hello",
         [{"host": "hello.modl-agent.com", "service": "web", "port": 8080}],
         db_env="/opt/nuklaut/secrets/hello-db.env",
@@ -1181,9 +1189,7 @@ def test_override_publish_ip_with_db_keeps_data_network():
 
 def test_override_publish_ip_none_is_byte_identical_to_legacy():
     ingress = [{"host": "hello.modl-agent.com", "service": "web", "port": 8080}]
-    assert nuk.build_override("hello", ingress, publish_ip=None) == nuk.build_override(
-        "hello", ingress
-    )
+    assert _override("hello", ingress, publish_ip=None) == _override("hello", ingress)
 
 
 def test_host_port_overrides_publish_to_avoid_collision():
@@ -1191,7 +1197,7 @@ def test_host_port_overrides_publish_to_avoid_collision():
     hostPort remaps the HOST side the app publishes on.
     """
     ingress = [{"host": "b.modl-agent.com", "service": "web", "port": 8080, "hostPort": 8081}]
-    ov = nuk.build_override("b", ingress, publish_ip="10.0.1.20")
+    ov = _override("b", ingress, publish_ip="10.0.1.20")
     assert ov["services"]["web"]["ports"] == ["10.0.1.20:8081:8080"]  # host 8081 -> container 8080
 
 
