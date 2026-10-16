@@ -117,8 +117,47 @@ def test_run_migrations_failure_is_fail_closed(tmp_path, monkeypatch):
         raise subprocess.CalledProcessError(1, cmd)
 
     m = _migrate(tmp_path, monkeypatch, boom)
-    with pytest.raises(subprocess.CalledProcessError):
+    with pytest.raises(SystemExit):
         nuk._run_migrations("kolbe", _MIGRATE_DEP, m, None, "sha256:cafe")
+    assert nuk.migrated_digest("kolbe") is None
+
+
+def test_run_migrations_timeout_stops_the_container(tmp_path, monkeypatch):
+    """A timeout must stop the migration container, not just the compose client."""
+    calls: list = []
+
+    def slow(*cmd, **kw):
+        raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+    def fake_run(*cmd, **kw):  # noqa: ARG001
+        calls.append(cmd)
+        return type("P", (), {"stdout": "", "returncode": 0})()
+
+    m = _migrate(tmp_path, monkeypatch, slow)
+    monkeypatch.setattr(nuk.subprocess, "run", fake_run)
+    with pytest.raises(SystemExit):
+        nuk._run_migrations("kolbe", _MIGRATE_DEP, m, None, "sha256:cafe")
+    assert any(c[4:7] == ("rm", "-sf", "backend") for c in calls)
+
+
+def test_rollout_key_uses_the_configured_image_not_the_running_one(monkeypatch):
+    """`compose images` reports the running (old) release — the gate must not use it."""
+    monkeypatch.setattr(nuk, "_compose_images", lambda name, raw: ["ghcr.io/x/backend:v_new"])
+    monkeypatch.setattr(
+        nuk.subprocess,
+        "run",
+        lambda *a, **k: type("P", (), {"stdout": "sha256:new\n", "returncode": 0})(),
+    )
+    assert nuk._rollout_key("kolbe", {}) == "sha256:new"
+
+
+def test_rollout_key_is_none_when_unresolvable(monkeypatch):
+    """An unresolvable key must not collapse to the `-` revision sentinel."""
+    monkeypatch.setattr(nuk, "_compose_images", lambda name, raw: [])
+    monkeypatch.setattr(nuk, "_applied_revision", lambda name: "-")
+    assert nuk._rollout_key("kolbe", {}) is None
+    monkeypatch.setattr(nuk, "_applied_revision", lambda name: "abc1234")
+    assert nuk._rollout_key("kolbe", {}) == "abc1234"
 
 
 def test_run_migrations_timeout_becomes_systemexit(tmp_path, monkeypatch):
@@ -180,7 +219,7 @@ def _profile_ups(lines: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
 def test_cmd_apply_runs_migration_before_idle_up(tmp_path, monkeypatch):
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
-    monkeypatch.setattr(nuk, "_resolve_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
     nuk.cmd_apply(_write(tmp_path, _bg_yml(migrate=True)), None)
     runs = _migrate_calls(lines)
     assert len(runs) == 1
@@ -191,7 +230,7 @@ def test_cmd_apply_runs_migration_before_idle_up(tmp_path, monkeypatch):
 def test_cmd_apply_skips_migration_when_digest_unchanged(tmp_path, monkeypatch):
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
-    monkeypatch.setattr(nuk, "_resolve_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
     doc = _write(tmp_path, _bg_yml(migrate=True))
     nuk.cmd_apply(doc, None)
     lines.clear()
@@ -207,7 +246,7 @@ def test_cmd_apply_skips_migration_on_a_digest_rollback(tmp_path, monkeypatch):
     """
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
-    monkeypatch.setattr(nuk, "_resolve_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
     monkeypatch.setattr(nuk, "_pin_image", lambda *_a, **_k: None)
     nuk.cmd_apply(
         _write(tmp_path, _bg_yml(migrate=True)),
@@ -221,7 +260,7 @@ def test_cmd_apply_runs_migration_on_a_signed_apply(tmp_path, monkeypatch):
     """A signed deployment is applied with `pin_commit` set and STILL migrates."""
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
-    monkeypatch.setattr(nuk, "_resolve_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
     nuk.cmd_apply(_write(tmp_path, _bg_yml(migrate=True)), None, pin_commit="0" * 40)
     assert len(_migrate_calls(lines)) == 1
 
@@ -229,6 +268,25 @@ def test_cmd_apply_runs_migration_on_a_signed_apply(tmp_path, monkeypatch):
 def test_cmd_apply_without_migrate_never_runs(tmp_path, monkeypatch):
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
-    monkeypatch.setattr(nuk, "_resolve_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
     nuk.cmd_apply(_write(tmp_path, _bg_yml(migrate=False)), None)
     assert _migrate_calls(lines) == []
+
+
+def test_cmd_apply_migration_failure_aborts_before_the_idle_up(tmp_path, monkeypatch):
+    """Fail-closed: a failed migration must suppress the rollout entirely."""
+    failures: list[tuple[str, ...]] = []
+
+    def sh(*cmd, **_kw):
+        if "run" in cmd and "--no-deps" in cmd:
+            raise subprocess.CalledProcessError(1, cmd)
+        failures.append(cmd)
+
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    monkeypatch.setattr(nuk, "sh", sh)
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
+    with pytest.raises(SystemExit):
+        nuk.cmd_apply(_write(tmp_path, _bg_yml(migrate=True)), None)
+    assert _profile_ups(lines) == []
+    assert nuk.migrated_digest("kolbe") is None

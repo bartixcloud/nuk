@@ -4149,7 +4149,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         # revision it restores may predate the current migration head. A
         # blue-green colour flip never reaches here at all.
         key = _rollout_key(name, raw)
-        if key != migrated_digest(name):
+        if key is None or key != migrated_digest(name):
             _run_migrations(name, raw, migrate, strategy, key)
     if strategy is not None and strategy.type == "blue-green":
         # Blue-green replaces "ingress -> up -d" with a colour rollout: bring the
@@ -4232,7 +4232,14 @@ def _run_migrations(
     try:
         sh(*argv, timeout=migrate.timeout)
     except subprocess.TimeoutExpired:
+        # SIGKILL reaches the compose client, not the container it started; stop
+        # the one-off by hand so a hung migration cannot keep running against the DB.
+        subprocess.run(  # noqa: S603  # fixed argv, no shell
+            [*compose_args(name, raw), "rm", "-sf", service], check=False
+        )
         sys.exit(f"{name}: migration timed out after {migrate.timeout}s — deploy aborted")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"{name}: migration failed (exit {e.returncode}): {migrate.command}")
     if digest:
         record_migrated_digest(name, digest)
 
@@ -4350,15 +4357,42 @@ def cmd_get() -> None:
         print(f"{name:24} {ps:32} {hosts}")
 
 
-def _rollout_key(name: str, raw: dict) -> str:
-    """The key a rollout is compared by: the app image digest, else the revision.
+def _configured_image_digest(name: str, raw: dict) -> str | None:
+    """Digest of the image the compose file CONFIGURES, or None if unresolvable.
+
+    `docker compose images` reports the RUNNING containers — the previous release
+    before a rollout — so it cannot answer "is this a new rollout". The
+    configured reference (`compose config --images`) is the new tree's.
+    """
+    images = _compose_images(name, raw)
+    if not images:
+        return None
+    try:
+        digest = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            ["docker", "inspect", "--format", "{{index .RepoDigests 0}}", images[0]],  # noqa: S607  # docker on PATH
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        ).stdout.strip()
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return digest or None
+
+
+def _rollout_key(name: str, raw: dict) -> str | None:
+    """The key a rollout is compared by: the configured image digest, else the revision.
 
     The converge loop re-applies every cycle, so `spec.migrate` must key off what
-    actually changes on a new rollout. The resolved image digest is the precise
-    signal; when it is unresolvable (workflow-managed, `.git`-less tree) the
-    applied revision stands in.
+    actually changes on a new rollout. `None` means neither resolved: the caller
+    re-runs the (idempotent) migration rather than recording a sentinel that would
+    collide across releases.
     """
-    return _resolve_image_digest(name, raw) or _applied_revision(name)
+    digest = _configured_image_digest(name, raw)
+    if digest:
+        return digest
+    revision = _applied_revision(name)
+    return None if revision == "-" else revision
 
 
 def _applied_revision(name: str) -> str:
