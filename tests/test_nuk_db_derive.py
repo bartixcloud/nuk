@@ -71,14 +71,14 @@ def test_derive_password_is_url_safe_ascii():
 
 
 def test_load_db_seed_absent_is_none(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "DB_SEED_ENV", tmp_path / "nope.env")
+    monkeypatch.setattr(nuk.paths, "DB_SEED_ENV", tmp_path / "nope.env")
     assert nuk.load_db_seed() is None
 
 
 def test_load_db_seed_reads_value(tmp_path, monkeypatch):
     p = tmp_path / "db-seed.env"
     p.write_text("NUK_DB_SEED=abc123\n")
-    monkeypatch.setattr(nuk, "DB_SEED_ENV", p)
+    monkeypatch.setattr(nuk.paths, "DB_SEED_ENV", p)
     assert nuk.load_db_seed() == b"abc123"
 
 
@@ -108,7 +108,7 @@ def test_ensure_redis_uses_derived_password_when_seeded(monkeypatch):
 
 def test_remote_mode_writes_private_ip_urls(tmp_path, monkeypatch):
     seed = b"\x07" * 32
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
     monkeypatch.setattr(nuk, "load_db_seed", lambda: seed)
     monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
 
@@ -241,7 +241,7 @@ def _data_facility(tmp_path):
 
 def test_capability_owner_provisions_a_placement_skipped_deployment(tmp_path, monkeypatch):
     tree = _data_facility(_db_deployment(tmp_path, "hello"))
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path / "secrets")
     monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
     monkeypatch.setattr(nuk, "load_db_seed", lambda: b"\x08" * 32)
     seen = []
@@ -273,7 +273,7 @@ def test_non_owner_does_not_provision(tmp_path, monkeypatch):
 
 def test_sweep_is_idempotent_no_rotation(tmp_path, monkeypatch):
     tree = _data_facility(_db_deployment(tmp_path, "hello"))
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path / "secrets")
     monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
     seed = b"\x09" * 32
     monkeypatch.setattr(nuk, "load_db_seed", lambda: seed)
@@ -302,7 +302,7 @@ def test_sweep_catches_called_process_error_not_just_systemexit(tmp_path, monkey
     rather than propagate out of apply_tree and abort the data host's cycle.
     """
     tree = _data_facility(_db_deployment(tmp_path, "hello"))
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path / "secrets")
     monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
     monkeypatch.setattr(nuk, "load_db_seed", lambda: b"\x0a" * 32)
 
@@ -326,7 +326,7 @@ def test_apply_tree_survives_a_malformed_facility(tmp_path, monkeypatch):
     """
     tree = _data_facility(_db_deployment(tmp_path, "hello"))
     (tree / "facilities" / "broken.yml").write_text("kind: Nonsense\n", encoding="utf-8")
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path / "secrets")
     monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
     applied = []
     monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp, **_k: applied.append(path.stem))
@@ -380,8 +380,8 @@ def test_all_in_one_owner_derives_local_not_remote(tmp_path, monkeypatch):
     )
     doc = tree / "deployments" / "hello.yml"
     monkeypatch.setattr(nuk, "read_self", lambda: ("all-in-one", "10.0.10.10"))
-    monkeypatch.setattr(nuk, "DYNAMIC", tree / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tree / "deploys")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tree / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tree / "deploys")
     monkeypatch.setattr(nuk, "project_dir", lambda name: tree / "proj" / name)
     monkeypatch.setattr(nuk, "sh", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])

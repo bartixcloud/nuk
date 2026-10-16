@@ -13,15 +13,14 @@ nuk = "nuk:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
-# nuk stays a single top-level module (NOT a src/ package): release-please bumps
-# __version__ via the x-release-please-version marker, the script entry is
-# nuk:main, and tests `import nuk` with pythonpath=["."]. Point hatchling at the
-# lone module.
+# nuk is a flat package (NOT a src/ layout): release-please bumps __version__ in
+# nuk/__init__.py via the x-release-please-version marker, the script entry is
+# nuk:main, and tests `import nuk` with pythonpath=["."].
 [tool.hatch.build.targets.wheel]
-only-include = ["nuk.py"]
+packages = ["nuk"]
 
 [tool.hatch.build.targets.sdist]
-include = ["nuk.py", "tests", "README.md"]
+include = ["nuk", "tests", "README.md"]
 
 [dependency-groups]
 dev = ["ty", "pytest", "pytest-cov", "pytest-asyncio", "ruff", "pre-commit"]
@@ -56,6 +55,11 @@ max-returns = 6
 max-nested-blocks = 5
 
 [tool.ruff.lint.per-file-ignores]
+"nuk/__init__.py" = [
+    # RUF067 (module split, in progress): __init__ still holds the code being
+    # extracted into nuk/*.py. Drop this ignore once it is re-exports only.
+    "RUF067",
+]
 "tests/**/*.py" = [
     # D205: existing terse test docstrings use a one-line summary directly
     # followed by detail (no blank line) — test-only formatting, not worth

@@ -75,13 +75,13 @@ def test_strategy_rejects_unknown_type(tmp_path):
 
 
 def test_active_colour_defaults_to_blue(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path)
     assert nuk.active_colour("kolbe") == "blue"
     assert nuk.idle_colour("blue") == "green"
 
 
 def test_record_active_colour_persists(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path)
     nuk.record_active_colour("kolbe", "green")
     assert nuk.active_colour("kolbe") == "green"
     assert nuk.idle_colour("green") == "blue"
@@ -89,7 +89,7 @@ def test_record_active_colour_persists(tmp_path, monkeypatch):
 
 def test_router_dialect_defaults_to_edge_when_unset(tmp_path, monkeypatch):
     """An app with no persisted dialect marker is an edge deployment."""
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path)
     assert nuk.router_dialect("kolbe") == "edge"
 
 
@@ -536,7 +536,7 @@ def test_router_mode_digest_rollback_keeps_the_mesh_router(tmp_path, monkeypatch
         + "\n",
         encoding="utf-8",
     )
-    monkeypatch.setattr(nuk, "RELEASES", releases)
+    monkeypatch.setattr(nuk.paths, "RELEASES", releases)
 
     nuk.cmd_rollback("kolbe", to=None, show=False)
 
@@ -577,8 +577,8 @@ def test_rollback_to_an_explicit_index_does_not_flip_a_blue_green_app(tmp_path, 
     (deployments / "kolbe" / "manifest.yml").write_text(
         _blue_green_yml(keep_previous=True), encoding="utf-8"
     )
-    monkeypatch.setattr(nuk, "RELEASES", releases)
-    monkeypatch.setattr(nuk, "DEPLOYS", deployments)
+    monkeypatch.setattr(nuk.paths, "RELEASES", releases)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", deployments)
     monkeypatch.setattr(nuk, "project_dir", lambda name: deployments / name)
     seen: dict[str, str | None] = {}
     monkeypatch.setattr(
@@ -609,8 +609,8 @@ def test_blue_green_rollback_refuses_without_a_recorded_colour(tmp_path, monkeyp
     (deployments / "kolbe" / "manifest.yml").write_text(
         _blue_green_yml(keep_previous=True), encoding="utf-8"
     )
-    monkeypatch.setattr(nuk, "RELEASES", tmp_path / "releases")
-    monkeypatch.setattr(nuk, "DEPLOYS", deployments)
+    monkeypatch.setattr(nuk.paths, "RELEASES", tmp_path / "releases")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", deployments)
     monkeypatch.setattr(nuk, "project_dir", lambda name: deployments / name)
     calls: list[tuple[str, ...]] = []
     monkeypatch.setattr(nuk, "sh", lambda *cmd, **_k: calls.append(cmd))
@@ -631,10 +631,10 @@ def test_blue_green_rollback_flips_back_even_when_keep_previous_kept_it(tmp_path
     (deployments / "kolbe" / "manifest.yml").write_text(
         _blue_green_yml(keep_previous=True), encoding="utf-8"
     )
-    monkeypatch.setattr(nuk, "RELEASES", tmp_path / "releases")
-    monkeypatch.setattr(nuk, "DEPLOYS", deployments)
+    monkeypatch.setattr(nuk.paths, "RELEASES", tmp_path / "releases")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", deployments)
     (tmp_path / "dynamic").mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
     monkeypatch.setattr(nuk, "project_dir", lambda name: deployments / name)
     monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
     monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["compose", "-p", "kolbe"])
@@ -667,10 +667,10 @@ def test_blue_green_rollback_never_recreates_the_previous_colour(tmp_path, monke
     (deployments / "kolbe" / "manifest.yml").write_text(
         _blue_green_yml(keep_previous=True), encoding="utf-8"
     )
-    monkeypatch.setattr(nuk, "RELEASES", tmp_path / "releases")
-    monkeypatch.setattr(nuk, "DEPLOYS", deployments)
+    monkeypatch.setattr(nuk.paths, "RELEASES", tmp_path / "releases")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", deployments)
     (tmp_path / "dynamic").mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
     monkeypatch.setattr(nuk, "project_dir", lambda name: deployments / name)
     monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
     monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["compose", "-p", "kolbe"])

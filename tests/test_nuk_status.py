@@ -73,11 +73,11 @@ def _stand_up(  # noqa: PLR0913  # test fixture helper — one knob per axis und
     releases = tmp_path / "releases"
     dynamic.mkdir(parents=True)
     secrets.mkdir(parents=True)
-    monkeypatch.setattr(nuk, "ROOT", root)
-    monkeypatch.setattr(nuk, "DEPLOYS", deploys)
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
-    monkeypatch.setattr(nuk, "SECRETS", secrets)
-    monkeypatch.setattr(nuk, "RELEASES", releases)
+    monkeypatch.setattr(nuk.paths, "ROOT", root)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", deploys)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "SECRETS", secrets)
+    monkeypatch.setattr(nuk.paths, "RELEASES", releases)
 
     pdir = deploys / name
     pdir.mkdir(parents=True)
@@ -118,7 +118,7 @@ def test_build_overview_top_level_shape(tmp_path, monkeypatch):
     assert set(overview) == {"apps", "liveRoutingAvailable", "nukRoot", "generatedAt", "errors"}
     assert overview["errors"] == []
     assert overview["liveRoutingAvailable"] is False
-    assert overview["nukRoot"] == str(nuk.ROOT)
+    assert overview["nukRoot"] == str(nuk.paths.ROOT)
     # generatedAt is a real ISO-8601 UTC timestamp
     datetime.fromisoformat(overview["generatedAt"])
     assert len(overview["apps"]) == 1
@@ -132,7 +132,7 @@ def test_build_overview_top_level_shape(tmp_path, monkeypatch):
 
 def test_build_overview_missing_deploys_degrades(tmp_path, monkeypatch):
     """No /opt/nuklaut/deployments -> empty apps + a top-level error, never raises."""
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "nonexistent" / "deployments")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "nonexistent" / "deployments")
     overview = nuk.build_overview().to_wire()
     assert overview["apps"] == []
     assert overview["errors"]
@@ -146,9 +146,9 @@ def test_build_overview_lists_apps_without_manifest_too(tmp_path, monkeypatch):
     root = tmp_path / "opt-nuklaut"
     deploys = root / "deployments"
     (deploys / "ghost").mkdir(parents=True)
-    monkeypatch.setattr(nuk, "ROOT", root)
-    monkeypatch.setattr(nuk, "DEPLOYS", deploys)
-    monkeypatch.setattr(nuk, "DYNAMIC", root / "traefik" / "dynamic")
+    monkeypatch.setattr(nuk.paths, "ROOT", root)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", deploys)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", root / "traefik" / "dynamic")
     overview = nuk.build_overview().to_wire()
     assert [a["name"] for a in overview["apps"]] == ["ghost"]
     assert "manifest.yml unreadable" in overview["apps"][0]["notes"]
@@ -201,9 +201,9 @@ def test_read_app_overview_drift_when_dynamic_file_absent(tmp_path, monkeypatch)
 def test_read_app_overview_degrades_on_missing_manifest(tmp_path, monkeypatch):
     root = tmp_path / "opt-nuklaut"
     (root / "deployments" / "app").mkdir(parents=True)
-    monkeypatch.setattr(nuk, "ROOT", root)
-    monkeypatch.setattr(nuk, "DEPLOYS", root / "deployments")
-    monkeypatch.setattr(nuk, "DYNAMIC", root / "traefik" / "dynamic")
+    monkeypatch.setattr(nuk.paths, "ROOT", root)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", root / "deployments")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", root / "traefik" / "dynamic")
     app = nuk._read_app_overview("app").to_wire()
     assert "manifest.yml unreadable" in app["notes"]
     assert app["hosts"] == []
@@ -438,11 +438,11 @@ def _apply_manifest(tmp_path, monkeypatch, *, name="app"):
     """
     root = tmp_path / "opt-nuklaut"
     releases = tmp_path / "releases"
-    monkeypatch.setattr(nuk, "ROOT", root)
-    monkeypatch.setattr(nuk, "DEPLOYS", root / "deployments")
-    monkeypatch.setattr(nuk, "DYNAMIC", root / "traefik" / "dynamic")
-    monkeypatch.setattr(nuk, "SECRETS", root / "secrets")
-    monkeypatch.setattr(nuk, "RELEASES", releases)
+    monkeypatch.setattr(nuk.paths, "ROOT", root)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", root / "deployments")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", root / "traefik" / "dynamic")
+    monkeypatch.setattr(nuk.paths, "SECRETS", root / "secrets")
+    monkeypatch.setattr(nuk.paths, "RELEASES", releases)
 
     manifest_path = tmp_path / "deployment.yml"
     manifest = {

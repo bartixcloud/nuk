@@ -406,7 +406,7 @@ def test_write_override_includes_env_from(tmp_path, monkeypatch):
     """
     deploys = tmp_path / "deployments"
     deploys.mkdir()
-    monkeypatch.setattr(nuk, "DEPLOYS", deploys)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", deploys)
     (deploys / "kolbe").mkdir()
 
     secret = tmp_path / "app.env"
@@ -524,7 +524,7 @@ def test_build_override_local_db_still_joins_data_network(tmp_path):
 
 
 def test_compose_service_names_reads_repo_compose(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path)
     repo = tmp_path / "app" / "repo"
     repo.mkdir(parents=True)
     (repo / "docker-compose.yml").write_text(
@@ -537,7 +537,7 @@ def test_compose_service_names_with_bare_string_compose(tmp_path, monkeypatch):
     """spec.compose as a bare string (as shipped by data-stack.yml/ingress.yml)
     must resolve the same as the {file: ...} dict form, not raise AttributeError.
     """
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path)
     repo = tmp_path / "app" / "repo"
     repo.mkdir(parents=True)
     (repo / "docker-compose.data.yml").write_text(
@@ -549,7 +549,7 @@ def test_compose_service_names_with_bare_string_compose(tmp_path, monkeypatch):
 
 def test_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
     """compose_args must not crash when spec.compose is a bare string."""
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path)
     project_dir = tmp_path / "app" / "repo"
     project_dir.mkdir(parents=True)
     spec = nuk.Spec.model_validate({"compose": "docker-compose.data.yml"})
@@ -559,7 +559,7 @@ def test_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
 
 def test_compose_args_with_dict_compose_still_works(tmp_path, monkeypatch):
     """Regression guard: the existing {file: ...} dict form is unaffected."""
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path)
     project_dir = tmp_path / "app" / "repo"
     project_dir.mkdir(parents=True)
     spec = nuk.Spec.model_validate({"compose": {"file": "docker-compose.data.yml"}})
@@ -571,7 +571,7 @@ def test_load_then_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
     """End-to-end: nuk.load() on a manifest with compose as a bare string
     feeds compose_args via manifest.spec without crashing.
     """
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path)
     project_dir = tmp_path / "app" / "repo"
     project_dir.mkdir(parents=True)
     manifest_path = tmp_path / "app.yml"
@@ -615,7 +615,7 @@ def test_resolve_db_services_attach_to_wins():
 
 
 def test_resolve_db_services_attach_all_enumerates_compose(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path)
     repo = tmp_path / "batch" / "repo"
     repo.mkdir(parents=True)
     (repo / "docker-compose.yml").write_text(
@@ -660,7 +660,7 @@ def test_provision_databases_noop_without_request():
 
 
 def test_db_env_roundtrip(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
     written = nuk.write_db_env(
         "app",
         {
@@ -677,7 +677,7 @@ def test_db_env_roundtrip(tmp_path, monkeypatch):
 
 
 def test_read_db_env_absent_is_empty(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
     assert nuk.read_db_env("nope") == {}
 
 
@@ -712,7 +712,7 @@ def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
     """`postgres: {driver: asyncpg}` passes the driver through; `postgres: true`
     passes None (the backward-compatible bare-URL path nukview relies on).
     """
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
     monkeypatch.setattr(nuk, "preflight_data_stack", lambda *a, **k: None)
     monkeypatch.setattr(nuk, "env_facility", lambda *a, **k: object())
     seen: list[str | None] = []
@@ -837,7 +837,7 @@ def test_provision_databases_runs_preflight_before_exec(tmp_path, monkeypatch):
     """provision_databases preflights before any ensure_* exec and aborts when the
     stack is down — ensure_postgres must never run against an absent container.
     """
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
     monkeypatch.setattr(nuk, "_container_state", lambda name: (False, False))
     monkeypatch.setattr(nuk, "env_facility", lambda *a, **k: object())
 
@@ -859,7 +859,7 @@ def test_data_stack_compose_is_vendored_and_well_formed():
     """
     from pathlib import Path
 
-    path = Path(nuk.__file__).parent / "files" / "docker-compose.data.yml"
+    path = Path(nuk.__file__).parent.parent / "files" / "docker-compose.data.yml"
     doc = yaml.safe_load(path.read_text())
     svcs = doc["services"]
     cnames = {s.get("container_name") for s in svcs.values()}
@@ -974,7 +974,7 @@ def test_version_flag_prints_version_and_exits_zero(capsys, monkeypatch):
     works on any machine.
     """
     assert isinstance(nuk.__version__, str) and nuk.__version__
-    monkeypatch.setattr(nuk.sys, "argv", ["nuk", "--version"])
+    monkeypatch.setattr(nuk.cli.sys, "argv", ["nuk", "--version"])
     with pytest.raises(SystemExit) as exc:
         nuk.main()
     assert exc.value.code == 0
@@ -1005,8 +1005,8 @@ def _write_deployment(tmp_path, monkeypatch, *, name="app", with_git=True, manif
     deploys = tmp_path / "deployments"
     secrets = tmp_path / "secrets"
     secrets.mkdir(parents=True)
-    monkeypatch.setattr(nuk, "DEPLOYS", deploys)
-    monkeypatch.setattr(nuk, "SECRETS", secrets)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", deploys)
+    monkeypatch.setattr(nuk.paths, "SECRETS", secrets)
     pdir = deploys / name
     pdir.mkdir(parents=True)
     if manifest is None:
@@ -1027,7 +1027,7 @@ def _write_deployment(tmp_path, monkeypatch, *, name="app", with_git=True, manif
 
 def test_status_unknown_deployment_exits(tmp_path, monkeypatch):
     """`nuk status <missing>` aborts (no manifest on the controller)."""
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deployments")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deployments")
     with pytest.raises(SystemExit, match="nope"):
         nuk.cmd_status("nope")
 
@@ -1107,7 +1107,7 @@ def test_completion_options_exposed():
 
 def test_known_deployments_enumerates_manifest_dirs(tmp_path, monkeypatch):
     """The completer source mirrors cmd_get: only dirs carrying a manifest.yml."""
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path)
     for n in ("alpha", "beta"):
         (tmp_path / n).mkdir()
         (tmp_path / n / "manifest.yml").write_text("x")
@@ -1117,12 +1117,12 @@ def test_known_deployments_enumerates_manifest_dirs(tmp_path, monkeypatch):
 
 def test_known_deployments_empty_when_root_absent(tmp_path, monkeypatch):
     """Off-controller (no /opt/nuklaut), completion degrades to empty, never raises."""
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "missing")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "missing")
     assert nuk._known_deployments() == []
 
 
 def test_complete_deployment_name_prefix_filters(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path)
     for n in ("alpha", "apex", "beta"):
         (tmp_path / n).mkdir()
         (tmp_path / n / "manifest.yml").write_text("x")
@@ -1138,7 +1138,7 @@ def test_deployment_name_arg_completes_real_apps(command, tmp_path, monkeypatch)
     import typer.main
     from typer.main import _click as click  # typer 0.26 bundles its own click
 
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path)
     (tmp_path / "kolbe").mkdir()
     (tmp_path / "kolbe" / "manifest.yml").write_text("x")
     cmd = typer.main.get_command(nuk.app).commands[command]
@@ -1176,12 +1176,12 @@ def test_resolve_manifest_returns_original_when_neither_exists(tmp_path):
 def test_read_self_parses_role_and_ip(tmp_path, monkeypatch):
     he = tmp_path / "host.env"
     he.write_text("ROLE=app\nPRIVATE_IP=10.0.1.20\n")
-    monkeypatch.setattr(nuk, "HOST_ENV", he)
+    monkeypatch.setattr(nuk.paths, "HOST_ENV", he)
     assert nuk.read_self() == ("app", "10.0.1.20")
 
 
 def test_read_self_absent_defaults_to_entry_role(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "nope.env")
+    monkeypatch.setattr(nuk.paths, "HOST_ENV", tmp_path / "nope.env")
     role, ip = nuk.read_self()
     assert role in nuk._ENTRY_ROLES  # legacy single-host controller keeps writing locally
     assert ip is None

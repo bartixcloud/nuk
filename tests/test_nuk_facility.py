@@ -331,14 +331,14 @@ def test_deployment_apply_is_not_gated_by_privilege(tmp_path, monkeypatch):
 
 
 def test_is_privileged_true_for_root(monkeypatch):
-    monkeypatch.setattr(nuk.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(nuk.rollout.os, "geteuid", lambda: 0)
     assert nuk._is_privileged() is True
 
 
 def test_is_privileged_false_without_group(monkeypatch):
-    monkeypatch.setattr(nuk.os, "geteuid", lambda: 1000)
-    monkeypatch.setattr(nuk.os, "getgroups", lambda: [1000])
-    monkeypatch.setattr(nuk.grp, "getgrnam", _raise_keyerror)
+    monkeypatch.setattr(nuk.rollout.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(nuk.rollout.os, "getgroups", lambda: [1000])
+    monkeypatch.setattr(nuk.rollout.grp, "getgrnam", _raise_keyerror)
     assert nuk._is_privileged() is False
 
 
@@ -346,9 +346,9 @@ def test_is_privileged_true_via_group(monkeypatch):
     class _Grp:
         gr_gid = 4242
 
-    monkeypatch.setattr(nuk.os, "geteuid", lambda: 1000)
-    monkeypatch.setattr(nuk.os, "getgroups", lambda: [1000, 4242])
-    monkeypatch.setattr(nuk.grp, "getgrnam", lambda _name: _Grp())
+    monkeypatch.setattr(nuk.rollout.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(nuk.rollout.os, "getgroups", lambda: [1000, 4242])
+    monkeypatch.setattr(nuk.rollout.grp, "getgrnam", lambda _name: _Grp())
     assert nuk._is_privileged() is True
 
 
@@ -381,8 +381,8 @@ def test_sourceless_facility_mirrors_its_payload(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "sh", lambda *cmd: commands.append(cmd))
     monkeypatch.setattr(nuk, "read_self", lambda: ("data", "10.0.10.180"))
     monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deployments")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deployments")
     monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
     monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
@@ -417,8 +417,8 @@ def test_sourceless_facility_without_payload_refuses(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(nuk, "read_self", lambda: ("data", "10.0.10.180"))
     monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deployments")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deployments")
     with pytest.raises(SystemExit, match="payload directory"):
         nuk.cmd_apply(manifest, None)
 
@@ -429,8 +429,8 @@ def test_declaration_only_facility_without_spec_applies(tmp_path, monkeypatch):
     doc.write_text("apiVersion: nuk/v1\nkind: Facility\nmetadata: {name: decl}\n", encoding="utf-8")
     monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
     monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deployments")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deployments")
     monkeypatch.setattr(nuk, "load_facilities", lambda _t, **_k: [])
     monkeypatch.setattr(nuk, "load_org", lambda _p: object())
     monkeypatch.setattr(nuk, "write_provenance", lambda *_a, **_k: None)
@@ -439,11 +439,11 @@ def test_declaration_only_facility_without_spec_applies(tmp_path, monkeypatch):
 
 
 def test_is_privileged_false_when_nss_is_broken(monkeypatch):
-    monkeypatch.setattr(nuk.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(nuk.rollout.os, "geteuid", lambda: 1000)
 
     def boom(_name):
         msg = "NSS unavailable"
         raise OSError(msg)
 
-    monkeypatch.setattr(nuk.grp, "getgrnam", boom)
+    monkeypatch.setattr(nuk.rollout.grp, "getgrnam", boom)
     assert nuk._is_privileged() is False

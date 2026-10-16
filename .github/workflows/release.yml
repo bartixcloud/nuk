@@ -1,7 +1,7 @@
 name: release
 
 # No-PR release: on push to main, the shared workflow derives the next version
-# from conventional commits, stamps it into nuk.py + pyproject.toml, commits that
+# from conventional commits, stamps it into nuk/__init__.py + pyproject.toml, commits that
 # to main ([skip ci]), and creates the tag + GitHub release — no PR.
 #
 # We no longer ship a built binary: nuk is installed/updated straight from this
@@ -31,5 +31,5 @@ jobs:
       # ephemeral build tier (platform CI never on GitHub-hosted runners).
       runs-on: '["self-hosted","build"]'
       version-files: |
-        nuk.py
+        nuk/__init__.py
         pyproject.toml

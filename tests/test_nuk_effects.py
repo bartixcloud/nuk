@@ -122,8 +122,8 @@ def _manifest(tree: Path, subdir: str, filename: str, body: str) -> Path:
 
 def _stub_apply(tmp_path: Path, monkeypatch, role: str = "app") -> None:
     """Stub everything cmd_apply touches outside the tree — disk, docker, git."""
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
     monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
     monkeypatch.setattr(nuk, "sh", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
@@ -317,7 +317,7 @@ def test_write_ingress_colour_urls_the_active_colour_service(tmp_path, monkeypat
     """With a colour the backend is that colour's docker service container."""
     import yaml
 
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path)
     nuk.write_ingress("kolbe", KOLBE_INGRESS, {}, colour="green")
     doc = yaml.safe_load((tmp_path / "kolbe.yml").read_text(encoding="utf-8"))
     url = doc["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
@@ -328,7 +328,7 @@ def test_write_ingress_without_colour_is_unchanged(tmp_path, monkeypatch):
     """No colour -> the current single-service URL, byte-for-byte as before."""
     import yaml
 
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path)
     nuk.write_ingress("kolbe", KOLBE_INGRESS, {})
     doc = yaml.safe_load((tmp_path / "kolbe.yml").read_text(encoding="utf-8"))
     url = doc["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
@@ -344,7 +344,7 @@ def test_mesh_dialect_has_no_tls_or_edge_middleware(tmp_path, monkeypatch):
     """
     import yaml
 
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path)
     nuk.write_ingress("kolbe", KOLBE_INGRESS, {}, colour="green", dialect="mesh")
     doc = yaml.safe_load((tmp_path / "kolbe.yml").read_text(encoding="utf-8"))
     router = doc["http"]["routers"][next(iter(doc["http"]["routers"]))]
@@ -472,8 +472,8 @@ def test_unhealthy_facility_apply_does_not_append_provenance(tmp_path, monkeypat
 
     repo_src = tmp_path / "src"
     repo_src.mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deployments")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deployments")
     monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
     monkeypatch.setattr(nuk, "sh", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "_is_privileged", lambda: True)

@@ -43,8 +43,8 @@ def stub_apply(
     end and need the same perimeter (tree paths, the privilege check, the apply
     loop's side effects) stubbed so only the rollout logic is under test.
     """
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
     monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
     monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
     monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
