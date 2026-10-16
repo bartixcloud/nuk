@@ -771,7 +771,7 @@ def load_org(path: Path) -> Org:
 # --- tenant registry (bartixcloud/infra/tenants.yml, contracts C2) ------------------
 # The platform repo owns the schema and its validator. nuk models only the fields it
 # consumes and re-checks the invariant its own isolation depends on: unique names and
-# no two tenants claiming the same domain (spec §4 anti-hijack).
+# no two tenants claiming the same domain pattern (spec §1/§3).
 
 TENANTS_FILE = "tenants.yml"
 
@@ -792,16 +792,13 @@ class TenantRow(BaseModel):
     signer_principal: str | None = None
 
 
-def _domains_overlap(x: str, y: str) -> bool:
-    """Whether two domain entries can name the same host (`*.` = any depth, never the apex)."""
-    x, y = x.lower(), y.lower()
-    if x.startswith("*.") and y.startswith("*."):
-        return x.endswith(y[1:]) or y.endswith(x[1:])
-    if x.startswith("*."):
-        return y.endswith(x[1:])
-    if y.startswith("*."):
-        return x.endswith(y[1:])
-    return x == y
+def specificity(pattern: str) -> int:
+    """The pattern's specificity: its number of literal labels (spec §3).
+
+    A `*.` label is not literal, so `*.c` ranks like `c`; the tie is broken in
+    favour of the exact pattern by the resolver, not here.
+    """
+    return len([label for label in pattern.lower().split(".") if label != "*"])
 
 
 class TenantRegistry(BaseModel):
@@ -811,7 +808,11 @@ class TenantRegistry(BaseModel):
 
     @model_validator(mode="after")
     def _check_unique(self) -> TenantRegistry:
-        """Refuse duplicate tenant names and any domain two tenants could both match.
+        """Refuse duplicate tenant names and any domain pattern two tenants both claim.
+
+        Overlap between tenants is allowed (spec §1: one owns a zone, another may be
+        lent a subdomain); only the *same* pattern — compared case-insensitively — is
+        a conflict.
 
         Raises:
             ValueError: On either violation.
@@ -820,16 +821,14 @@ class TenantRegistry(BaseModel):
         if len(names) != len(set(names)):
             msg = "tenants[].name must be unique"
             raise ValueError(msg)
-        for i, a in enumerate(self.tenants):
-            for b in self.tenants[i + 1 :]:
-                for da in a.domains:
-                    for db in b.domains:
-                        if _domains_overlap(da, db):
-                            msg = (
-                                f"domains overlap between tenants {a.name!r} and {b.name!r}: "
-                                f"{da!r} / {db!r}"
-                            )
-                            raise ValueError(msg)
+        seen: set[str] = set()
+        for t in self.tenants:
+            for domain in t.domains:
+                key = domain.lower()
+                if key in seen:
+                    msg = f"domain pattern {domain!r} is claimed by more than one tenant"
+                    raise ValueError(msg)
+                seen.add(key)
         return self
 
     def get(self, name: str) -> TenantRow | None:
