@@ -48,7 +48,7 @@ from pydantic import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
 
 __version__ = "2.4.1"  # bumped on release by .github/workflows/release.yml
 
@@ -836,6 +836,17 @@ class TenantRegistry(BaseModel):
         return next((t for t in self.tenants if t.name == name), None)
 
 
+class Delegation(_NullTolerant):
+    """One borrowed host: `host` (a §1 pattern) is lent to tenant `to` (spec §2).
+
+    Lives in the owner's `delegations.yml`; the loader (Task 3) fills it. Both
+    fields are trimmed and non-empty.
+    """
+
+    host: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    to: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
 def load_tenants(tree: Path) -> TenantRegistry:
     """Parse `<tree>/tenants.yml` (the platform tree).
 
@@ -867,6 +878,102 @@ def host_in_domains(host: str, domains: list[str]) -> bool:
         elif h == d:
             return True
     return False
+
+
+def _owner_of(host: str, claims: Iterable[tuple[str, list[str]]]) -> tuple[str, int] | None:
+    """The `(tenant, specificity)` of the most specific claim covering `host`.
+
+    `claims` is a stream of `(tenant name, owned patterns)`. A tie between two
+    tenants is structurally impossible once `TenantRegistry._check_unique` rejects
+    duplicate patterns; `die` anyway rather than pick a winner (spec §3.5: the
+    resolution must never be non-deterministic).
+    """
+    best: tuple[str, int] | None = None
+    for name, domains in claims:
+        for pattern in domains:
+            if not host_in_domains(host, [pattern]):
+                continue
+            rank = specificity(pattern)
+            if best is None or rank > best[1]:
+                best = (name, rank)
+            elif rank == best[1] and name != best[0]:
+                die(f"nuk: host {host!r} is claimed by both {best[0]!r} and {name!r}")
+    return best
+
+
+def _claims(registry: TenantRegistry) -> list[tuple[str, list[str]]]:
+    """Each tenant's `(name, owned patterns)` pairs, in registry order."""
+    return [(t.name, t.domains) for t in registry.tenants]
+
+
+def zone_owner(host: str, registry: TenantRegistry) -> str | None:
+    """The tenant with the most specific owned pattern covering `host`, or None (spec §3.1).
+
+    Raises:
+        NukError: Defensively, if two tenants tie on specificity (see `_owner_of`).
+    """
+    match = _owner_of(host, _claims(registry))
+    return match[0] if match else None
+
+
+def _resolve(
+    host: str,
+    claims: Iterable[tuple[str, list[str]]],
+    delegations: dict[str, list[Delegation]],
+) -> str | None:
+    """The authorized tenant for `host`: its zone owner, minus a covering delegation.
+
+    A delegation transfers only when its `host` covers `host` **and** is at least as
+    specific as the owned pattern that made its owner the zone owner — a delegation
+    broader than the owner's winning claim does not reach this host (spec §3.2).
+    """
+    match = _owner_of(host, claims)
+    if match is None:
+        return None
+    owner, owner_rank = match
+    for delegation in delegations.get(owner, []):
+        if host_in_domains(host, [delegation.host]) and specificity(delegation.host) >= owner_rank:
+            return delegation.to
+    return owner
+
+
+def resolve_host_owner(
+    host: str,
+    registry: TenantRegistry,
+    delegations: dict[str, list[Delegation]],
+) -> str | None:
+    """The tenant authorized to render `host`: its zone owner minus delegations (spec §3).
+
+    Returns None when no tenant owns `host` (a platform name, spec §6).
+    """
+    return _resolve(host, _claims(registry), delegations)
+
+
+def check_cross_zone_patterns(
+    registry: TenantRegistry,
+    delegations: dict[str, list[Delegation]],
+) -> None:
+    """Refuse a pattern that falls into another tenant's zone without a delegation (spec §3.3).
+
+    A `domains` entry of one tenant lying in another's zone is not an authorization —
+    it is the very overlap that must not grant rights. The owning tenant must delegate
+    it. The check excludes the listing tenant's own patterns when deciding whose zone
+    the pattern falls in (otherwise the pattern would "own itself" by specificity).
+
+    Raises:
+        NukError: For every such undelegated foreign pattern.
+    """
+    for tenant in registry.tenants:
+        others = [(t.name, t.domains) for t in registry.tenants if t.name != tenant.name]
+        for pattern in tenant.domains:
+            owner = _owner_of(pattern, others)
+            if owner is None:
+                continue
+            if _resolve(pattern, others, delegations) != tenant.name:
+                die(
+                    f"nuk: tenant {tenant.name!r} lists {pattern!r}, which falls in "
+                    f"{owner[0]!r}'s zone and is not delegated to it"
+                )
 
 
 def org_get(org: Org, dotted: str) -> object:
