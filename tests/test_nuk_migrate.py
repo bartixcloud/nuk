@@ -10,6 +10,9 @@ import textwrap
 from typing import TYPE_CHECKING
 
 import pytest
+from pydantic import ValidationError
+
+from conftest import stub_apply as _stub_apply
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -21,6 +24,11 @@ def _write(tmp_path: Path, body: str, name: str = "m.yml") -> Path:
     p = tmp_path / name
     p.write_text(textwrap.dedent(body).lstrip(), encoding="utf-8")
     return p
+
+
+def _after(argv: tuple[str, ...], flag: str) -> str:
+    """The token that follows `flag` in an argv — reads positionally, not by index."""
+    return argv[argv.index(flag) + 1]
 
 
 MIGRATE_YML = """\
@@ -109,7 +117,9 @@ def test_run_migrations_suffixes_the_idle_colour_for_blue_green(tmp_path, monkey
         {"type": "blue-green", "health": {"service": "backend", "path": "/health"}}
     )
     nuk._run_migrations("kolbe", _MIGRATE_DEP, m, strategy, "sha256:cafe")
-    assert calls[0][0][6:8] == ("--no-deps", "backend-green")
+    argv = calls[0][0]
+    assert _after(argv, "--profile") == "green"
+    assert _after(argv, "--no-deps") == "backend-green"
 
 
 def test_run_migrations_failure_is_fail_closed(tmp_path, monkeypatch):
@@ -160,40 +170,15 @@ def test_rollout_key_is_none_when_unresolvable(monkeypatch):
     assert nuk._rollout_key("kolbe", {}) == "abc1234"
 
 
-def test_run_migrations_timeout_becomes_systemexit(tmp_path, monkeypatch):
-    def slow(*cmd, **kw):
-        raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
-
-    m = _migrate(tmp_path, monkeypatch, slow)
-    with pytest.raises(SystemExit):
-        nuk._run_migrations("kolbe", _MIGRATE_DEP, m, None, "sha256:cafe")
-
-
 # --- cmd_apply wiring (Tasks 4) ---------------------------------------------
+# `_stub_apply` (the shared `cmd_apply` perimeter stub) lives in tests/conftest.py
 
 
-def _stub_apply(tmp_path: Path, monkeypatch, lines: list[tuple[str, ...]]) -> None:
-    """Stub everything cmd_apply touches outside the tree; record `sh` calls."""
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
-    monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
-    monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
-    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
-    monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
-    monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
-    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
-    monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
-    monkeypatch.setattr(nuk, "persist_manifest", lambda *_a: None)
-    monkeypatch.setattr(nuk, "write_provenance", lambda *_a, **_k: None)
-    monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["compose", "-p", "kolbe"])
-    monkeypatch.setattr(nuk, "sh", lambda *cmd, **_k: lines.append(cmd))
-
-
-def _bg_yml(*, migrate: bool) -> str:
+def _bg_yml(*, migrate: bool, kind: str = "Deployment") -> str:
     mig = 'migrate: {service: backend, command: "alembic upgrade head"}' if migrate else ""
     return f"""\
         apiVersion: nuk/v1
-        kind: Deployment
+        kind: {kind}
         metadata: {{name: kolbe}}
         spec:
           placement: {{role: app}}
@@ -290,3 +275,59 @@ def test_cmd_apply_migration_failure_aborts_before_the_idle_up(tmp_path, monkeyp
         nuk.cmd_apply(_write(tmp_path, _bg_yml(migrate=True)), None)
     assert _profile_ups(lines) == []
     assert nuk.migrated_digest("kolbe") is None
+
+
+# --- model validation --------------------------------------------------------
+
+
+def test_migrate_rejects_a_blank_service_or_command():
+    """A blank field is a config error, not a silent run with the image's own CMD."""
+    with pytest.raises(ValidationError):
+        nuk.Migrate.model_validate({"service": "", "command": "alembic upgrade head"})
+    with pytest.raises(ValidationError):
+        nuk.Migrate.model_validate({"service": "backend", "command": "   "})
+
+
+def test_migrate_rejects_a_non_positive_timeout():
+    with pytest.raises(ValidationError):
+        nuk.Migrate.model_validate({"service": "backend", "command": "x", "timeout": 0})
+
+
+def test_migrate_strips_surrounding_whitespace():
+    m = nuk.Migrate.model_validate({"service": " backend ", "command": " alembic upgrade head "})
+    assert m.service == "backend"
+    assert m.command == "alembic upgrade head"
+
+
+# --- profile + kind ----------------------------------------------------------
+
+
+def test_run_migrations_without_a_strategy_carries_no_profile(tmp_path, monkeypatch):
+    calls: list = []
+    m = _migrate(tmp_path, monkeypatch, lambda *cmd, **kw: calls.append((cmd, kw)))
+    nuk._run_migrations("kolbe", _MIGRATE_DEP, m, None, "sha256:cafe")
+    assert "--profile" not in calls[0][0]
+
+
+def test_run_migrations_enables_the_idle_profile(tmp_path, monkeypatch):
+    """`run` on a colour-profile service carries `--profile <idle>` explicitly.
+
+    Redundant where Compose enables the named service's profile implicitly, but
+    it removes the dependence on that (undocumented-in-our-compose) behaviour.
+    """
+    calls: list = []
+    m = _migrate(tmp_path, monkeypatch, lambda *cmd, **kw: calls.append((cmd, kw)))
+    strategy = nuk.Strategy.model_validate(
+        {"type": "blue-green", "health": {"service": "backend", "path": "/health"}}
+    )
+    nuk._run_migrations("kolbe", _MIGRATE_DEP, m, strategy, "sha256:cafe")
+    assert _after(calls[0][0], "--profile") == "green"
+
+
+def test_cmd_apply_ignores_migrate_on_a_facility(tmp_path, monkeypatch):
+    """`spec.migrate` is a Deployment concern (spec §3); a Facility never migrates."""
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
+    nuk.cmd_apply(_write(tmp_path, _bg_yml(migrate=True, kind="Facility")), None)
+    assert _migrate_calls(lines) == []
