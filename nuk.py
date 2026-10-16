@@ -3766,7 +3766,7 @@ def _router_present(facilities: list[Facility]) -> bool:
 
 
 def backend_address(
-    org: Org, manifest: Deployment, ing: Raw, *, router_present: bool = False
+    org: Org, manifest: Deployment, ing: Ingress, *, router_present: bool = False
 ) -> str:
     """Where the edge should send traffic for one ingress entry.
 
@@ -3785,8 +3785,8 @@ def backend_address(
             has several hosts and none is marked default (ambiguous), or the
             placement names a `host` the org does not declare.
     """
-    if ing.get("address"):
-        return ing["address"]
+    if ing.address:
+        return ing.address
     placement = manifest.spec.placement
     if placement is None:
         msg = (
@@ -3889,8 +3889,8 @@ def _refuse_route(host: str, owner: str | None, refused: list[str]) -> None:
 
 
 def _authorized_ingress(
-    ingress: list[Raw], tenant: str, auth: HostAuth | None, refused: list[str]
-) -> list[Raw]:
+    ingress: list[Ingress], tenant: str, auth: HostAuth | None, refused: list[str]
+) -> list[Ingress]:
     """The ingress entries a tenant source may render, `www.` included (spec §3/§6).
 
     A host resolving to anyone but `tenant` is refused. `www.<host>` is a second,
@@ -3898,20 +3898,20 @@ def _authorized_ingress(
     too, or the redirect router is an unauthenticated hijack vector. Without that
     coverage the variant is dropped — the apex router still renders.
     """
-    allowed: list[Raw] = []
+    allowed: list[Ingress] = []
     for ing in ingress:
-        host = str(ing.get("host", ""))
+        host = ing.host
         owner = auth.resolve(host) if auth is not None else None
         if owner != tenant:
             _refuse_route(host, owner, refused)
             continue
         entry = ing
-        if ing.get("www"):
+        if ing.www:
             www_host = f"www.{host}"
             www_owner = auth.resolve(www_host) if auth is not None else None
             if www_owner != tenant:
                 _refuse_route(www_host, www_owner, refused)
-                entry = {k: v for k, v in ing.items() if k != "www"}
+                entry = ing.model_copy(update={"www": False})
         allowed.append(entry)
     return allowed
 
@@ -3972,7 +3972,7 @@ def _render_routers(
     rendered: list[str] = []
     refused: list[str] = []
     for manifest in deployments:
-        ingress = manifest.raw.get("spec", {}).get("ingress") or []
+        ingress = manifest.spec.ingress
         if not ingress:
             continue
         # A deployment placed on an entry host runs ALONGSIDE Traefik, so
@@ -3994,8 +3994,14 @@ def _render_routers(
                 continue
             ingress = allowed
         resolved = [
-            {k: v for k, v in ing.items() if k not in {"service", "port", "hostPort"}}
-            | {"address": backend_address(org, manifest, ing, router_present=router_present)}
+            ing.model_copy(
+                update={
+                    "address": backend_address(org, manifest, ing, router_present=router_present),
+                    "service": None,
+                    "port": None,
+                    "host_port": None,
+                }
+            )
             for ing in ingress
         ]
         name = manifest.metadata.name
