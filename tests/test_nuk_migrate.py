@@ -158,16 +158,16 @@ def test_rollout_key_uses_the_configured_image_not_the_running_one(monkeypatch):
         "run",
         lambda *a, **k: type("P", (), {"stdout": "sha256:new\n", "returncode": 0})(),
     )
-    assert nuk._rollout_key("kolbe", {}) == "sha256:new"
+    assert nuk._rollout_key("kolbe", nuk.Spec()) == "sha256:new"
 
 
 def test_rollout_key_is_none_when_unresolvable(monkeypatch):
     """An unresolvable key must not collapse to the `-` revision sentinel."""
     monkeypatch.setattr(nuk, "_compose_images", lambda name, raw: [])
     monkeypatch.setattr(nuk, "_applied_revision", lambda name: "-")
-    assert nuk._rollout_key("kolbe", {}) is None
+    assert nuk._rollout_key("kolbe", nuk.Spec()) is None
     monkeypatch.setattr(nuk, "_applied_revision", lambda name: "abc1234")
-    assert nuk._rollout_key("kolbe", {}) == "abc1234"
+    assert nuk._rollout_key("kolbe", nuk.Spec()) == "abc1234"
 
 
 # --- cmd_apply wiring (Tasks 4) ---------------------------------------------

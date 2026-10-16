@@ -5435,14 +5435,14 @@ def cmd_get() -> None:
         print(f"{name:24} {ps:32} {hosts}")
 
 
-def _configured_image_digest(name: str, raw: Raw) -> str | None:
+def _configured_image_digest(name: str, spec: Spec) -> str | None:
     """Digest of the image the compose file CONFIGURES, or None if unresolvable.
 
     `docker compose images` reports the RUNNING containers — the previous release
     before a rollout — so it cannot answer "is this a new rollout". The
     configured reference (`compose config --images`) is the new tree's.
     """
-    images = _compose_images(name, raw)
+    images = _compose_images(name, spec)
     if not images:
         return None
     try:
@@ -5458,7 +5458,7 @@ def _configured_image_digest(name: str, raw: Raw) -> str | None:
     return digest or None
 
 
-def _rollout_key(name: str, raw: Raw) -> str | None:
+def _rollout_key(name: str, spec: Spec) -> str | None:
     """The key a rollout is compared by: the configured image digest, else the revision.
 
     The converge loop re-applies every cycle, so `spec.migrate` must key off what
@@ -5466,7 +5466,7 @@ def _rollout_key(name: str, raw: Raw) -> str | None:
     re-runs the (idempotent) migration rather than recording a sentinel that would
     collide across releases.
     """
-    digest = _configured_image_digest(name, raw)
+    digest = _configured_image_digest(name, spec)
     if digest:
         return digest
     revision = _applied_revision(name)
@@ -5545,17 +5545,17 @@ def cmd_status_overview(
     """
     overview = build_overview(probe_enabled=probe)
     converge = read_converge_status()
-    if converge:
-        overview["converge"] = converge
+    if converge is not None:
+        overview = replace(overview, converge=converge)
     if show_all:
-        overview.update(_soll_vs_ist(overview, org_file))
-    print(json.dumps(overview, indent=2 if pretty else None))
+        overview = _soll_vs_ist(overview, org_file)
+    print(json.dumps(overview.to_wire(), indent=2 if pretty else None))
 
 
 def cmd_logs(name: str) -> None:
     """Follow compose logs for a deployment."""
     manifest = load(_manifest_file(name))
-    sh(*compose_args(name, manifest.raw), "logs", "-f")
+    sh(*compose_args(name, manifest.spec), "logs", "-f")
 
 
 def cmd_rollout(name: str) -> None:
@@ -5565,15 +5565,15 @@ def cmd_rollout(name: str) -> None:
     if (repo / ".git").exists():
         sh("git", "-C", str(repo), "pull", "--ff-only")
     # else: workflow-managed deployment — re-trigger the workflow to update the tree.
-    sh(*compose_args(name, manifest.raw), "pull")
-    sh(*compose_args(name, manifest.raw), "up", "-d")
+    sh(*compose_args(name, manifest.spec), "pull")
+    sh(*compose_args(name, manifest.spec), "up", "-d")
 
 
-def _compose_images(name: str, raw: Raw) -> list[str]:
+def _compose_images(name: str, spec: Spec) -> list[str]:
     """The image references the compose project resolves to, in service order."""
     try:
         proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
-            [*compose_args(name, raw), "config", "--images"],
+            [*compose_args(name, spec), "config", "--images"],
             capture_output=True,
             text=True,
             check=True,
@@ -5584,7 +5584,7 @@ def _compose_images(name: str, raw: Raw) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
-def _pin_image(name: str, raw: Raw, pin_digest: str) -> None:
+def _pin_image(name: str, spec: Spec, pin_digest: str) -> None:
     """Point the app's compose image reference at the pinned digest (spec §8).
 
     The digest is the identity of the re-applied release. Order matters:
@@ -5601,7 +5601,7 @@ def _pin_image(name: str, raw: Raw, pin_digest: str) -> None:
     """
     repo_name = pin_digest.split("@", maxsplit=1)[0]
     refs = [
-        ref for ref in _compose_images(name, raw) if ref.split("@")[0].split(":")[0] == repo_name
+        ref for ref in _compose_images(name, spec) if ref.split("@")[0].split(":")[0] == repo_name
     ]
     if not refs:
         die(
