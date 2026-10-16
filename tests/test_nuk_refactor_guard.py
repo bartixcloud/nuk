@@ -264,9 +264,11 @@ def test_host_port_is_the_same_number_on_the_publish_and_the_backend(tmp_path):
 
 
 def test_published_port_is_host_port_or_port():
-    assert nuk._published_port({"port": 8080}) == 8080
-    assert nuk._published_port({"port": 8080, "hostPort": 18080}) == 18080
-    assert nuk._published_port({"port": 8080, "hostPort": 0}) == 8080
+    assert nuk._published_port(nuk.Ingress(host="h", service="s", port=8080)) == 8080
+    assert nuk._published_port(nuk.Ingress(host="h", service="s", port=8080, hostPort=18080)) == (
+        18080
+    )
+    assert nuk._published_port(nuk.Ingress(host="h", service="s", port=8080, hostPort=0)) == 8080
 
 
 # --- the idempotent Traefik write ---------------------------------------------
