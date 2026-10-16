@@ -2798,7 +2798,7 @@ def provision_remote_databases(
     *,
     self_ip: str | None = None,
     org: Org | None = None,
-) -> list[dict[str, str | None]]:
+) -> list[ManifestResult]:
     """Provision every deployment's databases on this host IF it owns the capability.
 
     The placement-gate exception (spec §3.1): a deployment placed `app` is a
@@ -2812,20 +2812,21 @@ def provision_remote_databases(
     provider = env_facility(facilities, _DATABASES_CAPABILITY)
     if provider is None or not placement_matches(provider, role, self_ip=self_ip, org=org):
         return []
-    out: list[dict[str, str | None]] = []
+    out: list[ManifestResult] = []
     for path in sorted((tree / DEPLOYMENT_DIR).glob("*.yml")):
         try:
             manifest = load(path)
         except SystemExit as e:
-            out.append(_result(path.name, "Database", "failed", _exit_reason(e, "load failed")))
+            out.append(
+                ManifestResult(path.name, "Database", "failed", _exit_reason(e, "load failed"))
+            )
             continue
         if manifest.kind != "Deployment":
             continue
-        dbs = manifest.raw.get("spec", {}).get("databases") or {}
-        if not (dbs.get("postgres") or dbs.get("redis")):
+        dbs = manifest.spec.databases
+        if not (dbs.wants_postgres or dbs.wants_redis):
             continue
         name = manifest.metadata.name
-        entry = _result(name, "Database")
         try:
             # remote_ip=None → the LOCAL data stack is provisioned, on this host.
             provision_databases(name, dbs, facilities, remote_ip=None)
@@ -2834,18 +2835,15 @@ def provision_remote_databases(
             # `_psql` uses check=True, so a SQL failure (disk full, role/db
             # conflict, container hiccup) surfaces as CalledProcessError, not
             # SystemExit. The data host still writes converge-status.json.
-            entry["result"] = "failed"
-            if isinstance(e, SystemExit):
-                entry["error"] = _exit_reason(e, "provision failed")
-            else:
-                entry["error"] = f"provision failed: {e}"
-        out.append(entry)
+            error = (
+                _exit_reason(e, "provision failed")
+                if isinstance(e, SystemExit)
+                else f"provision failed: {e}"
+            )
+            out.append(ManifestResult(name, "Database", "failed", error))
+            continue
+        out.append(ManifestResult(name, "Database"))
     return out
-
-
-def _result(name: str, kind: str, result: str = "ok", error: str | None = None) -> dict[str, str | None]:
-    """One converge-status manifest entry (spec §7.6)."""
-    return {"name": name, "kind": kind, "result": result, "error": error}
 
 
 def _exit_reason(e: SystemExit, default: str) -> str:
@@ -2869,7 +2867,7 @@ def _deployment_tree(ctx: TreeContext, manifest: Deployment, path: Path) -> Path
     return branch / path.relative_to(ctx.tree)
 
 
-def apply_tree(ctx: TreeContext) -> list[dict[str, str | None]]:  # noqa: C901  # placement ambiguity is recorded per manifest, not raised out of the loop
+def apply_tree(ctx: TreeContext) -> list[ManifestResult]:  # noqa: C901  # placement ambiguity is recorded per manifest, not raised out of the loop
     """Apply this host's Facilities, then its Deployments (spec §7 steps 6-7).
 
     Facilities first within a cycle (§7.1): effect VOCABULARY is git-derived and
@@ -2895,28 +2893,33 @@ def apply_tree(ctx: TreeContext) -> list[dict[str, str | None]]:  # noqa: C901  
         ctx: The source's tree, this host's identity and what the source may change.
 
     Returns:
-        One `{"name", "kind", "result", "error"}` entry per manifest this host
-        owns, facilities first, each directory in filename order. `result` is
-        "ok", "failed", or "refused".
+        One ManifestResult per manifest this host owns, facilities first, each
+        directory in filename order. `result` is "ok", "failed", or "refused".
     """
     tree, role = ctx.tree, ctx.role
-    results: list[dict[str, str | None]] = []
+    results: list[ManifestResult] = []
     failed_caps: set[str] = set()
-    for kind, directory in (("Facility", FACILITY_DIR), ("Deployment", DEPLOYMENT_DIR)):
+    kinds: tuple[tuple[ManifestKind, str], ...] = (
+        ("Facility", FACILITY_DIR),
+        ("Deployment", DEPLOYMENT_DIR),
+    )
+    for kind, directory in kinds:
         if directory not in ctx.apply:
             continue
         for path in sorted((tree / directory).glob("*.yml")):
             try:
                 manifest = load(path)
             except SystemExit as e:
-                results.append(_result(path.name, kind, "failed", _exit_reason(e, "load failed")))
+                results.append(
+                    ManifestResult(path.name, kind, "failed", _exit_reason(e, "load failed"))
+                )
                 continue
             if manifest.kind != kind:
                 continue
             try:
                 matches = placement_matches(manifest, role, self_ip=ctx.self_ip, org=ctx.org)
             except ValueError as e:
-                results.append(_result(manifest.metadata.name, kind, "failed", str(e)))
+                results.append(ManifestResult(manifest.metadata.name, kind, "failed", str(e)))
                 continue
             if not matches:
                 continue
@@ -2928,7 +2931,7 @@ def apply_tree(ctx: TreeContext) -> list[dict[str, str | None]]:  # noqa: C901  
                         f"consumes {sorted(poisoned)} from a facility that "
                         f"failed its health gate this cycle (spec §7.5)"
                     )
-                    results.append(_result(manifest.metadata.name, kind, "refused", reason))
+                    results.append(ManifestResult(manifest.metadata.name, kind, "refused", reason))
                     continue
                 apply_path = _deployment_tree(ctx, manifest, path)
             # A signed (non-unsigned) deployment must BUILD the signed tag, not the
@@ -2945,29 +2948,27 @@ def apply_tree(ctx: TreeContext) -> list[dict[str, str | None]]:  # noqa: C901  
                 if isinstance(manifest, Deployment) and not manifest.spec.source.unsigned
                 else None
             )
-            entry = _result(manifest.metadata.name, kind)
             try:
                 cmd_apply(apply_path, None, ctx=ctx, pin_commit=pin_commit)
             except (SystemExit, ValueError, subprocess.CalledProcessError, OSError) as e:
-                entry["result"] = "failed"
-                entry["error"] = (
-                    _exit_reason(e, "apply failed") if isinstance(e, SystemExit) else str(e)
-                )
+                error = _exit_reason(e, "apply failed") if isinstance(e, SystemExit) else str(e)
+                results.append(ManifestResult(manifest.metadata.name, kind, "failed", error))
                 if isinstance(manifest, Facility):
                     failed_caps |= _provided_capabilities(manifest)
-            results.append(entry)
+                continue
+            results.append(ManifestResult(manifest.metadata.name, kind))
     # The placement exception (spec §3.1) runs in addition to the filter above: a
     # `{placement: app}` deployment is a container/ingress no-op here but its
     # `spec.databases` fragment is still this host's job when it owns the
     # facility. A deployment the loop already produced (applied, refused, failed)
     # was provisioned by `cmd_apply` itself — the sweep must not double it.
-    handled = {r["name"] for r in results if r["kind"] == "Deployment"}
+    handled = {r.name for r in results if r.kind == "Deployment"}
     results.extend(
         r
         for r in provision_remote_databases(
             tree, role, ctx.facilities, self_ip=ctx.self_ip, org=ctx.org
         )
-        if r["name"] not in handled
+        if r.name not in handled
     )
     return results
 

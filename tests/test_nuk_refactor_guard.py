@@ -168,13 +168,13 @@ def test_git_try_returns_stripped_stdout_in_a_real_repo(tmp_path):
 
 
 def test_result_builds_one_converge_status_entry():
-    assert nuk._result("x", "Deployment") == {
+    assert nuk.ManifestResult("x", "Deployment").to_wire() == {
         "name": "x",
         "kind": "Deployment",
         "result": "ok",
         "error": None,
     }
-    assert nuk._result("x", "Facility", "refused", "why") == {
+    assert nuk.ManifestResult("x", "Facility", "refused", "why").to_wire() == {
         "name": "x",
         "kind": "Facility",
         "result": "refused",
