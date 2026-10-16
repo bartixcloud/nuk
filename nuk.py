@@ -4251,9 +4251,9 @@ def _run_migrations(
         subprocess.run(  # noqa: S603  # fixed argv, no shell
             [*compose_args(name, raw), "rm", "-sf", service], check=False
         )
-        sys.exit(f"{name}: migration timed out after {migrate.timeout}s — deploy aborted")
+        die(f"{name}: migration timed out after {migrate.timeout}s — deploy aborted")
     except subprocess.CalledProcessError as e:
-        sys.exit(f"{name}: migration failed (exit {e.returncode}): {migrate.command}")
+        die(f"{name}: migration failed (exit {e.returncode}): {migrate.command}")
     if digest:
         record_migrated_digest(name, digest)
 
