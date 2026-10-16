@@ -5700,10 +5700,10 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
             print(f"{name}: no releases recorded")
             return
         for i, entry in enumerate(history):
-            commit = (entry.get("commit") or "-")[:12]
-            digest = (entry.get("imageDigest") or "-").split("@")[-1][:12]
+            commit = (entry.commit or "-")[:12]
+            digest = (entry.image_digest or "-").split("@")[-1][:12]
             marker = "  (current)" if i == len(history) - 1 else ""
-            print(f"{i:>3}  {commit}  {digest}  {entry.get('appliedAt', '?')}{marker}")
+            print(f"{i:>3}  {commit}  {digest}  {entry.applied_at or '?'}{marker}")
         return
     manifest = _manifest_file(name)
     if not manifest.exists():
@@ -5744,8 +5744,7 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
         # until the next converge cycle corrects it.
         ctx = TreeContext.for_path(manifest)
         vocab = route_vocabulary(ctx.facilities) if ctx.facilities else DEFAULT_ROUTE_VOCAB
-        ingress = (raw.get("spec") or {}).get("ingress", []) or []
-        _rollback_blue_green(name, raw, ingress, vocab, strategy)
+        _rollback_blue_green(name, parsed.spec, parsed.spec.ingress, vocab, strategy)
         return
     if to is None and len(history) < 2:  # noqa: PLR2004  # need a current AND a previous
         die(f"{name}: no previous release recorded — nothing to roll back to")
@@ -5754,21 +5753,21 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
         entry = history[index]
     except IndexError:
         die(f"{name}: no release at index {to} (history has {len(history)} entries)")
-    digest = entry.get("imageDigest")
+    digest = entry.image_digest
     if not digest:
         die(
             f"{name}: the release at index {index} has no recorded imageDigest "
             f"(a source-built deploy, or one predating digest resolution) — it cannot "
             f"be re-applied by digest (spec §8). Roll forward, or re-apply its commit by hand."
         )
-    commit = entry.get("commit")
+    commit = entry.commit
     if not commit:
         die(
             f"{name}: the release at index {index} has no recorded commit "
             f"(a workflow deploy from a .git-less tree) — its compose tree is "
             f"unreproducible, cannot re-apply it"
         )
-    print(f"{name}: rolling back to {digest} (applied {entry.get('appliedAt', '?')})")
+    print(f"{name}: rolling back to {digest} (applied {entry.applied_at or '?'})")
     cmd_apply(manifest, None, pin_commit=commit, pin_digest=digest)
 
 
@@ -5777,7 +5776,7 @@ def cmd_delete(name: str, purge: bool) -> None:
     pdir = project_dir(name)
     if (pdir / "manifest.yml").exists():
         manifest = load(pdir / "manifest.yml")
-        subprocess.run([*compose_args(name, manifest.raw), "down", "-v"], check=False)  # noqa: S603  # argv built from fixed verbs
+        subprocess.run([*compose_args(name, manifest.spec), "down", "-v"], check=False)  # noqa: S603  # argv built from fixed verbs
     _router_file(name).unlink(missing_ok=True)
     shutil.rmtree(pdir, ignore_errors=True)
     # The app's database is kept by default — its creds file (in SECRETS, not
