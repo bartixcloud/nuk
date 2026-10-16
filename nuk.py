@@ -2355,7 +2355,10 @@ def apply_tree(ctx: TreeContext) -> list[dict]:  # noqa: C901  # placement ambig
             # tag commit. An unsigned deployment stays on the branch head. A context
             # without a recorded tag commit (hand-run `for_path`, or Task 10's
             # `build()` asymmetry with `commits={}`) degrades to today's behaviour —
-            # no pin — rather than raising.
+            # no pin — rather than raising. (`cmd_apply` refuses a TENANT deployment
+            # whose payload repo is not the source's own, so this pin always has the
+            # commit it names: a tenant ships its payload in its own repo or in the
+            # tree.)
             pin_commit = (
                 ctx.commits.get("tag")
                 if isinstance(manifest, Deployment) and not manifest.spec.source.unsigned
@@ -2517,6 +2520,7 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
         platform=platform,
         trees={"tag": tag_tree, "branch": branch_tree},
         commits={"tag": tag_sha, "branch": branch_sha},
+        source_repo=src.repo,
     )
 
 
@@ -3097,6 +3101,9 @@ class TreeContext:
     # signed deployment's). Task 11 picks per deployment from `trees`/`commits`.
     trees: dict[Literal["tag", "branch"], Path] = field(default_factory=dict)
     commits: dict[Literal["tag", "branch"], str] = field(default_factory=dict)
+    # The source's own repo URL (`sources.yml`): a tenant Deployment may name only this
+    # repo as its payload repo — anything else is refused before a clone (cmd_apply).
+    source_repo: str | None = None
 
     @classmethod
     def build(  # noqa: PLR0913  # one field per attribute; a wrapper object buys nothing
@@ -3110,6 +3117,7 @@ class TreeContext:
         platform: Path | None = None,
         trees: dict[Literal["tag", "branch"], Path] | None = None,
         commits: dict[Literal["tag", "branch"], str] | None = None,
+        source_repo: str | None = None,
     ) -> TreeContext:
         """Load the platform-wide inputs from `platform` (default: `tree` itself)."""
         base = platform or tree
@@ -3126,6 +3134,7 @@ class TreeContext:
             tenants=load_tenants(base) if tenants_path.is_file() else None,
             trees=trees if trees is not None else {"tag": tree},
             commits=commits if commits is not None else {},
+            source_repo=source_repo,
         )
 
     @classmethod
@@ -4419,6 +4428,22 @@ def _is_privileged() -> bool:
     return gid in os.getgroups()
 
 
+def _repo_identity(url: str) -> str:
+    """A repo URL reduced to `host/owner/name`, so transport forms compare equal."""
+    s = url.strip().rstrip("/")
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    if "@" in s:
+        s = s.split("@", 1)[1]
+    s = s.replace(":", "/", 1)  # scp-style `host:owner/name`
+    return s.removesuffix(".git").rstrip("/").lower()
+
+
+def _same_repo(left: str | None, right: str | None) -> bool:
+    """Whether two manifests name the same repo; `None` (a sourceless payload) never matches."""
+    return left is not None and right is not None and _repo_identity(left) == _repo_identity(right)
+
+
 def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline; splitting it would scatter the reconcile order
     manifest_path: Path,
     repo_path: str | None,
@@ -4487,6 +4512,17 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     DYNAMIC.mkdir(parents=True, exist_ok=True)
     DEPLOYS.mkdir(parents=True, exist_ok=True)
     source = manifest.spec.source
+    if ctx.tenant is not None and source.repo and not _same_repo(source.repo, ctx.source_repo):
+        # The tree is the review unit (P1): a tenant source may ship its compose payload
+        # under deployments/<name>/, or name the tenant's OWN repo — the one whose signed
+        # tag this cycle verified. Naming any other repo would have the app host clone it
+        # as root with ambient credentials, and the signed-tag pin could never resolve
+        # there. Refuse before anything is fetched.
+        die(
+            f"{manifest_path}: a tenant source may only name its own repo "
+            f"({ctx.source_repo}), or ship its compose payload under deployments/{name}/ — "
+            f"{source.repo!r} is not allowed"
+        )
     # A declaration-only Facility (e.g. facilities/basic.yml)
     # provides a route capability and nothing else: no source to clone, no
     # compose payload to mirror, no services to bring up. Applying it is pure
@@ -4532,23 +4568,23 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             sh("git", "-C", str(repo), "checkout", "--quiet", "--detach", pin_commit)
     elif declaration_only:
         pass  # nothing to mirror — the manifest IS the whole facility
-    elif manifest.kind == "Facility":
-        # A sourceless Facility (data-stack, ingress): its compose payload ships
-        # beside its manifest at <tree>/facilities/<name>/ — the manifest's own
-        # directory is the tree root for a hand-run apply, the loop passes the
-        # archive root. Mirror it into the project dir exactly like a cloned
-        # repo, so compose_args' existing `-f repo/<file>` resolution works
-        # unchanged.
+    else:
+        # A sourceless manifest — a Facility like data-stack, or a Deployment whose
+        # compose ships with the tree — carries its payload beside its manifest at
+        # <tree>/facilities|deployments/<name>/ (the manifest's own directory is the
+        # tree root for a hand-run apply, the archive root for the loop). Mirror it
+        # into the project dir exactly like a cloned repo, so compose_args' existing
+        # `-f repo/<file>` resolution works unchanged. rsync --delete converges
+        # repo/ in place: removing it first would hand running containers a new
+        # inode under their bind mounts on every cycle.
         payload = manifest_path.resolve().parent / name
         if not payload.is_dir():
+            where = f"{manifest_path.resolve().parent.name}/{name}/"
             die(
-                f"{manifest_path}: Facility {name} has no source.repo and no "
-                f"facilities/{name}/ payload directory — nothing to apply"
+                f"{manifest_path}: {manifest.kind} {name} has no source.repo and no "
+                f"{where} payload directory — nothing to apply"
             )
-        shutil.rmtree(repo, ignore_errors=True)
         sh("rsync", "-a", "--delete", f"{payload}/", str(repo) + "/")
-    else:
-        die(f"{manifest_path}: spec.source.repo is required unless --repo-path is given")
     if pin_digest:
         _pin_image(name, raw, pin_digest)
     ingress = raw_spec.get("ingress", []) or []
