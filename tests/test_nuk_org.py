@@ -372,12 +372,12 @@ def test_org_get_missing_key_exits():
 
 
 def test_origin_org_from_github_url(monkeypatch):
-    monkeypatch.setattr(nuk, "git_origin", lambda _p: "https://github.com/ekd-akd/oauth")
+    monkeypatch.setattr(nuk.util, "git_origin", lambda _p: "https://github.com/ekd-akd/oauth")
     assert nuk.origin_org() == "ekd-akd"
 
 
 def test_origin_org_none_without_remote(monkeypatch):
-    monkeypatch.setattr(nuk, "git_origin", lambda _p: None)
+    monkeypatch.setattr(nuk.util, "git_origin", lambda _p: None)
     assert nuk.origin_org() is None
 
 
