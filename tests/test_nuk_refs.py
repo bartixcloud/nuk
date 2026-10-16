@@ -251,7 +251,7 @@ def test_sync_source_refuses_a_source_whose_remote_has_no_main_branch(tmp_path):
 def test_prepare_source_archives_the_tag_tree_and_the_branch_tree(two_ref_origin, tmp_path):
     """Task 10: two trees are archived and both commits stored on the context."""
     origin, signers_dir, tag_sha, branch_sha = two_ref_origin
-    block: dict = {}
+    block = nuk.SourceBlock()
     ctx = nuk._prepare_source(
         _src(origin, apply=("facilities",)),
         block,
@@ -262,8 +262,8 @@ def test_prepare_source_archives_the_tag_tree_and_the_branch_tree(two_ref_origin
         scratch=tmp_path / "scratch",
         platform=None,
     )
-    assert block["tag"] == "v1.0.0"
-    assert block["commit"] == tag_sha
+    assert block.tag == "v1.0.0"
+    assert block.commit == tag_sha
     assert ctx.trees["tag"] != ctx.trees["branch"]
     assert (ctx.trees["tag"] / "f").read_text(encoding="utf-8") == "1\n"
     assert (ctx.trees["branch"] / "f").read_text(encoding="utf-8") == "2\n"
