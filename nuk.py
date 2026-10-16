@@ -679,9 +679,9 @@ def validate_ingress_hosts(org: Org, manifest: Deployment | Facility) -> None:
             sys.exit(f"nuk: ingress host {ing.host!r} is not under a managed domain {org.domains}")
 
 
-def sh(*cmd: str, cwd: Path | None = None) -> None:
-    """Run a command, raising on non-zero exit."""
-    subprocess.run(cmd, cwd=cwd, check=True)  # noqa: S603  # fixed argv, no shell
+def sh(*cmd: str, cwd: Path | None = None, timeout: float | None = None) -> None:
+    """Run a command, raising on non-zero exit (or on `timeout`)."""
+    subprocess.run(cmd, cwd=cwd, check=True, timeout=timeout)  # noqa: S603  # fixed argv, no shell
 
 
 def load(path: Path) -> Deployment | Facility:
@@ -4185,6 +4185,30 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         )
     except OSError as e:
         print(f"{name}: provenance not recorded ({e})")
+
+
+def _run_migrations(name: str, raw: dict, migrate: Migrate, digest: str | None) -> None:
+    """Run the deployment's one-shot migration, failing the deploy on any error.
+
+    The compose service supplies the image, env and network; nuk supplies the
+    argv. A non-zero exit propagates as `CalledProcessError` (the apply pipeline
+    records the manifest `failed`), a timeout becomes a fail-closed `SystemExit`.
+    The digest is recorded only after success, so a crash mid-migration re-runs.
+    """
+    argv = compose_args(name, raw) + [
+        "run",
+        "--rm",
+        "--no-deps",
+        migrate.service,
+        *shlex.split(migrate.command),
+    ]
+    print(f"{name}: migrating ({migrate.service}: {migrate.command})")
+    try:
+        sh(*argv, timeout=migrate.timeout)
+    except subprocess.TimeoutExpired:
+        sys.exit(f"{name}: migration timed out after {migrate.timeout}s — deploy aborted")
+    if digest:
+        record_migrated_digest(name, digest)
 
 
 def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/dialect, one per concern
