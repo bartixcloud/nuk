@@ -620,8 +620,9 @@ def test_pw_from_url_roundtrip():
 
 
 def test_provision_databases_noop_without_request():
-    assert nuk.provision_databases("app", {}, []) is None
-    assert nuk.provision_databases("app", {"postgres": False, "redis": False}, []) is None
+    assert nuk.provision_databases("app", nuk.Databases.model_validate({}), []) is None
+    off = nuk.Databases.model_validate({"postgres": False, "redis": False})
+    assert nuk.provision_databases("app", off, []) is None
 
 
 def test_db_env_roundtrip(tmp_path, monkeypatch):
@@ -687,11 +688,13 @@ def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
         return (f"postgresql+{driver}" if driver else "postgresql") + f"://{app}:x@h:5432/{app}"
 
     monkeypatch.setattr(nuk, "ensure_postgres", fake_pg)
-    nuk.provision_databases("app", {"postgres": {"driver": "asyncpg"}}, [])
+    nuk.provision_databases(
+        "app", nuk.Databases.model_validate({"postgres": {"driver": "asyncpg"}}), []
+    )
     assert seen == ["asyncpg"]
     assert nuk.read_db_env("app")["DATABASE_URL"].startswith("postgresql+asyncpg://")
 
-    nuk.provision_databases("app", {"postgres": True}, [])
+    nuk.provision_databases("app", nuk.Databases.model_validate({"postgres": True}), [])
     assert seen == ["asyncpg", None]
 
 
@@ -809,7 +812,7 @@ def test_provision_databases_runs_preflight_before_exec(tmp_path, monkeypatch):
 
     monkeypatch.setattr(nuk, "ensure_postgres", fail)
     with pytest.raises(SystemExit):
-        nuk.provision_databases("app", {"postgres": True}, [])
+        nuk.provision_databases("app", nuk.Databases.model_validate({"postgres": True}), [])
 
 
 # --- vendored data stack (issue #10): the owned, reproducible source ----------

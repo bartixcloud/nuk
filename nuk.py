@@ -4446,13 +4446,13 @@ def data_host_ip(org: Org) -> str | None:
 
 
 def provision_databases(
-    app: str, databases: Raw, facilities: list[Facility], *, remote_ip: str | None = None
+    app: str, databases: Databases, facilities: list[Facility], *, remote_ip: str | None = None
 ) -> str | None:
     """Provision the databases a manifest requested.
 
     Args:
         app: The app name.
-        databases: The raw `spec.databases` dict.
+        databases: The manifest's `spec.databases`.
         facilities: The tree's Facility manifests, to check the `databases`
             env capability is actually declared before binding against it.
         remote_ip: The data host's private IP when this host is NOT the data
@@ -4463,9 +4463,8 @@ def provision_databases(
         The path to the creds env-file the override should inject, or None when
         no databases are requested.
     """
-    pg = databases.get("postgres")
-    want_pg = bool(pg)
-    want_redis = bool(databases.get("redis"))
+    want_pg = databases.wants_postgres
+    want_redis = databases.wants_redis
     if not (want_pg or want_redis):
         return None
     # Fail closed before touching the data stack: binding against a facility the
@@ -4494,7 +4493,7 @@ def provision_databases(
         env: dict[str, str] = {}  # remote mode derives fresh; never carry stale keys
         if want_pg:
             pw = derive_db_password(seed, "pg", app)
-            env["DATABASE_URL"] = _pg_url(app, pw, remote_ip, _pg_driver(pg))
+            env["DATABASE_URL"] = _pg_url(app, pw, remote_ip, databases.postgres_driver)
         if want_redis:
             env["REDIS_URL"] = _redis_url(app, derive_db_password(seed, "redis", app), remote_ip)
         return write_db_env(app, env)
@@ -4502,7 +4501,9 @@ def provision_databases(
     prev = read_db_env(app)
     env = {}
     if want_pg:
-        env["DATABASE_URL"] = ensure_postgres(app, prev.get("DATABASE_URL"), _pg_driver(pg))
+        env["DATABASE_URL"] = ensure_postgres(
+            app, prev.get("DATABASE_URL"), databases.postgres_driver
+        )
     if want_redis:
         env["REDIS_URL"] = ensure_redis(app, prev.get("REDIS_URL"))
     return write_db_env(app, env)
