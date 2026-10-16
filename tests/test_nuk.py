@@ -24,8 +24,10 @@ def test_legacy_single_host_gets_maintenance_only():
     definition — so http.middlewares stays empty when nothing strips/redirects.
     """
     doc = nuk.build_ingress(
-        "bartix", [{"host": "bartix.de", "service": "web", "port": 8080}], nuk.DEFAULT_ROUTE_VOCAB
-    )
+        "bartix",
+        [nuk.Ingress.model_validate({"host": "bartix.de", "service": "web", "port": 8080})],
+        nuk.DEFAULT_ROUTE_VOCAB,
+    ).to_wire()
     assert doc == {
         "http": {
             "routers": {
@@ -58,17 +60,21 @@ def test_kolbe_pathprefix_split():
     doc = nuk.build_ingress(
         "kolbe",
         [
-            {
-                "host": "kolbe.astrojones.de",
-                "path": "/api",
-                "stripPrefix": True,
-                "service": "backend",
-                "port": 8000,
-            },
-            {"host": "kolbe.astrojones.de", "service": "frontend", "port": 80},
+            nuk.Ingress.model_validate(
+                {
+                    "host": "kolbe.astrojones.de",
+                    "path": "/api",
+                    "stripPrefix": True,
+                    "service": "backend",
+                    "port": 8000,
+                }
+            ),
+            nuk.Ingress.model_validate(
+                {"host": "kolbe.astrojones.de", "service": "frontend", "port": 80}
+            ),
         ],
         nuk.DEFAULT_ROUTE_VOCAB,
-    )
+    ).to_wire()
     routers = doc["http"]["routers"]
     services = doc["http"]["services"]
     mws = doc["http"]["middlewares"]
@@ -94,8 +100,10 @@ def test_path_without_strip_has_no_local_middleware():
     still inherits the maintenance-errors reference.
     """
     doc = nuk.build_ingress(
-        "a", [{"host": "h", "path": "/x", "service": "s", "port": 1}], nuk.DEFAULT_ROUTE_VOCAB
-    )
+        "a",
+        [nuk.Ingress.model_validate({"host": "h", "path": "/x", "service": "s", "port": 1})],
+        nuk.DEFAULT_ROUTE_VOCAB,
+    ).to_wire()
     assert doc["http"]["routers"]["a-0"]["rule"] == "Host(`h`) && PathPrefix(`/x`)"
     assert doc["http"]["routers"]["a-0"]["middlewares"] == ["maintenance-errors@file"]
     # no app-local middleware DEFINITIONS (maintenance-errors lives in global.yml)
@@ -106,9 +114,13 @@ def test_every_app_router_inherits_maintenance_errors():
     """The www-redirect router is the one exception — it 301s, no backend to guard."""
     doc = nuk.build_ingress(
         "kolbeapp",
-        [{"host": "kolbeapp.de", "service": "frontend", "port": 80, "www": True}],
+        [
+            nuk.Ingress.model_validate(
+                {"host": "kolbeapp.de", "service": "frontend", "port": 80, "www": True}
+            )
+        ],
         nuk.DEFAULT_ROUTE_VOCAB,
-    )
+    ).to_wire()
     routers = doc["http"]["routers"]
     assert routers["kolbeapp-0"]["middlewares"] == ["maintenance-errors@file"]
     assert routers["kolbeapp-0-www"]["middlewares"] == ["kolbeapp-0-www-redirect"]
@@ -120,9 +132,13 @@ def test_auth_basic_prepends_the_gate_ahead_of_maintenance_errors():
     """
     doc = nuk.build_ingress(
         "nukview",
-        [{"host": "nuk.example.de", "service": "nukview", "port": 3000, "auth": "basic"}],
+        [
+            nuk.Ingress.model_validate(
+                {"host": "nuk.example.de", "service": "nukview", "port": 3000, "auth": "basic"}
+            )
+        ],
         nuk.DEFAULT_ROUTE_VOCAB,
-    )
+    ).to_wire()
     assert doc["http"]["routers"]["nukview-0"]["middlewares"] == [
         "auth@file",
         "maintenance-errors@file",
@@ -135,17 +151,19 @@ def test_auth_basic_with_pathprefix_orders_basic_then_strip():
     doc = nuk.build_ingress(
         "api",
         [
-            {
-                "host": "h",
-                "path": "/api",
-                "stripPrefix": True,
-                "service": "s",
-                "port": 1,
-                "auth": "basic",
-            }
+            nuk.Ingress.model_validate(
+                {
+                    "host": "h",
+                    "path": "/api",
+                    "stripPrefix": True,
+                    "service": "s",
+                    "port": 1,
+                    "auth": "basic",
+                }
+            )
         ],
         nuk.DEFAULT_ROUTE_VOCAB,
-    )
+    ).to_wire()
     assert doc["http"]["routers"]["api-0"]["middlewares"] == [
         "auth@file",
         "api-0-strip",
@@ -163,13 +181,12 @@ def test_unknown_auth_value_refuses_to_render_instead_of_publishing(bad):
 
     Regression for a fail-open authentication control: `auth` was an unvalidated `str` and
     the render matched it with if/elif and no else, so a typo produced a router with no auth
-    middleware and no error. build_ingress works on raw dicts (it does not see the Literal),
-    so it refuses on its own.
+    middleware and no error. model_construct skips the Literal validation a loaded manifest
+    gets, so build_ingress must refuse on its own.
     """
+    entry = nuk.Ingress.model_construct(host="h", service="s", port=1, auth=bad)
     with pytest.raises(ValueError, match="no facility in the tree provides"):
-        nuk.build_ingress(
-            "demo", [{"host": "h", "service": "s", "port": 1, "auth": bad}], nuk.DEFAULT_ROUTE_VOCAB
-        )
+        nuk.build_ingress("demo", [entry], nuk.DEFAULT_ROUTE_VOCAB)
 
 
 @pytest.mark.parametrize("retired", ["oauth", "authentik", "oauth2-proxy"])
@@ -186,8 +203,10 @@ def test_ingress_auth_accepts_only_basic():
 
 def test_explicit_priority():
     doc = nuk.build_ingress(
-        "a", [{"host": "h", "service": "s", "port": 1, "priority": 100}], nuk.DEFAULT_ROUTE_VOCAB
-    )
+        "a",
+        [nuk.Ingress.model_validate({"host": "h", "service": "s", "port": 1, "priority": 100})],
+        nuk.DEFAULT_ROUTE_VOCAB,
+    ).to_wire()
     assert doc["http"]["routers"]["a-0"]["priority"] == 100
 
 
@@ -197,9 +216,13 @@ def test_explicit_priority():
 def test_address_backend_bypasses_local_container_naming():
     doc = nuk.build_ingress(
         "hello",
-        [{"host": "hello.astrojones.guru", "address": "10.10.2.4:8080"}],
+        [
+            nuk.Ingress.model_validate(
+                {"host": "hello.astrojones.guru", "address": "10.10.2.4:8080"}
+            )
+        ],
         nuk.DEFAULT_ROUTE_VOCAB,
-    )
+    ).to_wire()
     servers = doc["http"]["services"]["hello-0"]["loadBalancer"]["servers"]
     assert servers == [{"url": "http://10.10.2.4:8080"}]
 
@@ -224,10 +247,12 @@ def test_www_redirect_router_and_middleware():
     doc = nuk.build_ingress(
         "kolbeapp",
         [
-            {"host": "kolbeapp.de", "service": "frontend", "port": 80, "www": True},
+            nuk.Ingress.model_validate(
+                {"host": "kolbeapp.de", "service": "frontend", "port": 80, "www": True}
+            ),
         ],
         nuk.DEFAULT_ROUTE_VOCAB,
-    )
+    ).to_wire()
     routers = doc["http"]["routers"]
     mws = doc["http"]["middlewares"]
     # main router unchanged

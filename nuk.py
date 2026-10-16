@@ -2148,11 +2148,11 @@ def resolve_db_services(name: str, spec: Spec, db_env: str | None) -> list[str]:
     return [i.service for i in spec.ingress if i.service]
 
 
-def _rule(ing: Raw) -> str:
+def _rule(ing: Ingress) -> str:
     """Build the Traefik router rule for one ingress entry."""
-    rule = f"Host(`{ing['host']}`)"
-    if ing.get("path"):
-        rule += f" && PathPrefix(`{ing['path']}`)"
+    rule = f"Host(`{ing.host}`)"
+    if ing.path:
+        rule += f" && PathPrefix(`{ing.path}`)"
     return rule
 
 
@@ -2180,12 +2180,12 @@ def _container_name(name: str, service: str, colour: str | None = None) -> str:
 
 def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; clean extraction would obscure the per-field ordering
     name: str,
-    ingress: list[Raw],
+    ingress: list[Ingress],
     vocab: dict[str, list[str]],
     *,
     colour: str | None = None,
     dialect: str = "edge",
-) -> Raw | None:
+) -> TraefikConfig | None:
     """Render the Traefik file-provider doc, or None to remove the dynamic file.
 
     Each entry needs host + (service/port, a local docker "edge"-network
@@ -2225,22 +2225,19 @@ def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; cle
         return None
     is_mesh = dialect == "mesh"
     entry_point = "mesh" if is_mesh else "websecure"
-    routers, services, middlewares = {}, {}, {}
+    cert_resolver = None if is_mesh else "letsencrypt"
+    routers: dict[str, TraefikRouter] = {}
+    services: dict[str, TraefikService] = {}
+    middlewares: dict[str, TraefikMiddleware] = {}
     for i, ing in enumerate(ingress):
         rid = f"{name}-{i}"
-        router = {
-            "rule": _rule(ing),
-            "entryPoints": [entry_point],
-            "service": rid,
-            **({} if is_mesh else {"tls": {"certResolver": "letsencrypt"}}),
-        }
-        mw = []
+        mw: list[str] = []
         # ⚠ The refusals below are load-bearing. The chain this replaced once had no
         #   `else`, and an unrecognised value fell through to a router with no auth
         #   middleware and no error — a security control failing OPEN. The lookup
         #   keeps that closed and widens it: an undeclared capability, and a
         #   capability whose chain is empty, are BOTH refusals (spec §5.4).
-        want = ing.get("auth")
+        want = ing.auth
         if want is not None:
             capability = want
             if capability not in vocab:
@@ -2259,9 +2256,9 @@ def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; cle
                 )
                 raise ValueError(msg)
             mw += vocab[capability]
-        if ing.get("path") and ing.get("stripPrefix"):
+        if ing.path and ing.strip_prefix:
             sid = f"{rid}-strip"
-            middlewares[sid] = {"stripPrefix": {"prefixes": [ing["path"]]}}
+            middlewares[sid] = StripPrefix(prefixes=[ing.path])
             mw.append(sid)
         # Every app router inherits the controller-wide branded maintenance page:
         # 502-504 from the backend → the maintenance service (see global.yml). The
@@ -2269,45 +2266,46 @@ def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; cle
         # Only the edge ships that file; the mesh dialect leaves it off.
         if not is_mesh:
             mw.append("maintenance-errors@file")
-        if mw:
-            router["middlewares"] = mw
-        if "priority" in ing:
-            router["priority"] = ing["priority"]
-        routers[rid] = router
+        routers[rid] = TraefikRouter(
+            rule=_rule(ing),
+            entry_points=[entry_point],
+            service=rid,
+            tls_cert_resolver=cert_resolver,
+            middlewares=mw,
+            priority=ing.priority,
+        )
         # `address` (remote host:port) bypasses the local edge-network container
         # naming convention entirely — used for backends on another host (e.g. a
         # libvirt VM reached over the private vswitch/cloud-network).
-        if ing.get("address"):
-            backend = ing["address"]
+        if ing.address:
+            backend = ing.address
         else:
-            backend = f"{_container_name(name, ing['service'], colour)}:{ing['port']}"
-        services[rid] = {"loadBalancer": {"servers": [{"url": f"http://{backend}"}]}}
-        if ing.get("www"):
-            host = ing["host"]
+            # The Ingress validator requires service+port unless address is set.
+            assert ing.service is not None  # noqa: S101  # narrows the optional for ty
+            assert ing.port is not None  # noqa: S101  # narrows the optional for ty
+            backend = f"{_container_name(name, ing.service, colour)}:{ing.port}"
+        services[rid] = TraefikService(url=f"http://{backend}")
+        if ing.www:
+            host = ing.host
             wid, rdid = f"{rid}-www", f"{rid}-www-redirect"
-            middlewares[rdid] = {
-                "redirectRegex": {
-                    "regex": rf"^https?://www\.{re.escape(host)}/(.*)",
-                    "replacement": f"https://{host}/${{1}}",
-                    "permanent": True,
-                }
-            }
-            routers[wid] = {
-                "rule": f"Host(`www.{host}`)",
-                "entryPoints": [entry_point],
-                "service": rid,
-                "middlewares": [rdid],
-                **({} if is_mesh else {"tls": {"certResolver": "letsencrypt"}}),
-            }
-    http = {"routers": routers, "services": services}
-    if middlewares:
-        http["middlewares"] = middlewares
-    return {"http": http}
+            middlewares[rdid] = RedirectRegex(
+                regex=rf"^https?://www\.{re.escape(host)}/(.*)",
+                replacement=f"https://{host}/${{1}}",
+                permanent=True,
+            )
+            routers[wid] = TraefikRouter(
+                rule=f"Host(`www.{host}`)",
+                entry_points=[entry_point],
+                service=rid,
+                tls_cert_resolver=cert_resolver,
+                middlewares=[rdid],
+            )
+    return TraefikConfig(routers=routers, services=services, middlewares=middlewares)
 
 
 def write_ingress(
     name: str,
-    ingress: list[Raw],
+    ingress: list[Ingress],
     vocab: dict[str, list[str]],
     *,
     colour: str | None = None,
@@ -2323,7 +2321,7 @@ def write_ingress(
     if doc is None:
         target.unlink(missing_ok=True)
         return
-    text = yaml.safe_dump(doc)
+    text = yaml.safe_dump(doc.to_wire())
     # Every write is an fsnotify event that makes Traefik rebuild its whole dynamic
     # config, and the loop re-applies every cycle — skip identical content.
     try:

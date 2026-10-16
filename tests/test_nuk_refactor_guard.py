@@ -274,6 +274,10 @@ def test_published_port_is_host_port_or_port():
 # --- the idempotent Traefik write ---------------------------------------------
 
 
+def _web(host: str) -> nuk.Ingress:
+    return nuk.Ingress.model_validate({"host": host, "service": "web", "port": 8080})
+
+
 def test_write_ingress_skips_a_byte_identical_rewrite(tmp_path, monkeypatch):
     """A rewrite every cycle is an fsnotify event every cycle.
 
@@ -281,7 +285,7 @@ def test_write_ingress_skips_a_byte_identical_rewrite(tmp_path, monkeypatch):
     must not attempt a write at all.
     """
     monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
-    ingress = [{"host": "a.example.com", "service": "web", "port": 8080}]
+    ingress = [_web("a.example.com")]
     nuk.write_ingress("app", ingress, {})
     target = tmp_path / "app.yml"
     assert target.exists()
@@ -293,16 +297,16 @@ def test_write_ingress_skips_a_byte_identical_rewrite(tmp_path, monkeypatch):
 def test_write_ingress_still_writes_changed_content(tmp_path, monkeypatch):
     """The other half of the guard: it is content-compared, not write-once."""
     monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
-    nuk.write_ingress("app", [{"host": "a.example.com", "service": "web", "port": 8080}], {})
+    nuk.write_ingress("app", [_web("a.example.com")], {})
     target = tmp_path / "app.yml"
     first = target.read_text(encoding="utf-8")
-    nuk.write_ingress("app", [{"host": "b.example.com", "service": "web", "port": 8080}], {})
+    nuk.write_ingress("app", [_web("b.example.com")], {})
     assert target.read_text(encoding="utf-8") != first
 
 
 def test_write_ingress_removes_the_file_when_the_render_is_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
-    nuk.write_ingress("app", [{"host": "a.example.com", "service": "web", "port": 8080}], {})
+    nuk.write_ingress("app", [_web("a.example.com")], {})
     target = tmp_path / "app.yml"
     assert target.exists()
     nuk.write_ingress("app", [], {})

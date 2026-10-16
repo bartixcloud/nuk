@@ -240,13 +240,17 @@ def test_a_deployment_consuming_nothing_gets_an_empty_set():
     assert nuk.consumes(dep) == set()
 
 
-HELLO_INGRESS = [{"host": "hello.example.com", "service": "web", "port": 8080}]
+HELLO_INGRESS = [
+    nuk.Ingress.model_validate({"host": "hello.example.com", "service": "web", "port": 8080})
+]
 
 
 def test_route_renders_declared_middlewares_in_order(tmp_path):
     """Spec §12: a capability with declared middlewares renders them in order."""
     vocab = nuk.route_vocabulary(nuk.load_facilities(_tree(tmp_path, gate=GATE_FACILITY)))
-    doc = nuk.build_ingress("hello", [{**HELLO_INGRESS[0], "auth": "basic"}], vocab)
+    doc = nuk.build_ingress(
+        "hello", [HELLO_INGRESS[0].model_copy(update={"auth": "basic"})], vocab
+    ).to_wire()
     assert doc["http"]["routers"]["hello-0"]["middlewares"] == [
         "auth@file",
         "maintenance-errors@file",
@@ -257,7 +261,7 @@ def test_route_refuses_an_undeclared_capability(tmp_path):
     """Spec §5.4: capability not declared by any facility -> refuse."""
     vocab = nuk.route_vocabulary(nuk.load_facilities(_tree(tmp_path, tls=TLS_FACILITY)))
     with pytest.raises(ValueError, match="which no facility in the tree provides"):
-        nuk.build_ingress("hello", [{**HELLO_INGRESS[0], "auth": "basic"}], vocab)
+        nuk.build_ingress("hello", [HELLO_INGRESS[0].model_copy(update={"auth": "basic"})], vocab)
 
 
 def test_route_refuses_an_empty_middleware_list(tmp_path):
@@ -268,18 +272,18 @@ def test_route_refuses_an_empty_middleware_list(tmp_path):
     """
     vocab = nuk.route_vocabulary(nuk.load_facilities(_tree(tmp_path, tls=TLS_FACILITY)))
     with pytest.raises(ValueError, match="EMPTY middleware list"):
-        nuk.build_ingress("hello", [{**HELLO_INGRESS[0], "auth": "tls"}], vocab)
+        nuk.build_ingress("hello", [HELLO_INGRESS[0].model_copy(update={"auth": "tls"})], vocab)
 
 
 def test_route_refuses_when_the_vocabulary_is_empty(tmp_path):
     """A tree with no facilities gates nothing. It must not render ungated."""
     with pytest.raises(ValueError, match="which no facility in the tree provides"):
-        nuk.build_ingress("hello", [{**HELLO_INGRESS[0], "auth": "basic"}], {})
+        nuk.build_ingress("hello", [HELLO_INGRESS[0].model_copy(update={"auth": "basic"})], {})
 
 
 def test_route_without_auth_needs_no_vocabulary():
     """An ungated route was never gated. The empty vocabulary must still render it."""
-    doc = nuk.build_ingress("hello", HELLO_INGRESS, {})
+    doc = nuk.build_ingress("hello", HELLO_INGRESS, {}).to_wire()
     assert doc["http"]["routers"]["hello-0"]["middlewares"] == ["maintenance-errors@file"]
 
 
@@ -293,8 +297,10 @@ def test_default_vocab_reproduces_the_legacy_chain_byte_for_byte():
 
     for gate, expected in (("basic", ["auth@file", "maintenance-errors@file"]),):
         doc = nuk.build_ingress(
-            "hello", [{**HELLO_INGRESS[0], "auth": gate}], nuk.DEFAULT_ROUTE_VOCAB
-        )
+            "hello",
+            [HELLO_INGRESS[0].model_copy(update={"auth": gate})],
+            nuk.DEFAULT_ROUTE_VOCAB,
+        ).to_wire()
         assert doc["http"]["routers"]["hello-0"]["middlewares"] == expected
         assert yaml.safe_dump(doc)  # renders without error
 
@@ -302,7 +308,9 @@ def test_default_vocab_reproduces_the_legacy_chain_byte_for_byte():
 # --- blue-green: the router points at the active colour's service -------------
 
 
-KOLBE_INGRESS = [{"host": "kolbe.astrojones.de", "service": "frontend", "port": 80}]
+KOLBE_INGRESS = [
+    nuk.Ingress.model_validate({"host": "kolbe.astrojones.de", "service": "frontend", "port": 80})
+]
 
 
 def test_write_ingress_colour_urls_the_active_colour_service(tmp_path, monkeypatch):
