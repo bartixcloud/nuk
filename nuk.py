@@ -5073,9 +5073,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     """
     manifest_path = resolve_manifest(manifest_path)
     manifest = load(manifest_path)
-    raw = manifest.raw
     name = manifest.metadata.name
-    raw_spec = raw.get("spec") or {}
     if manifest.kind == "Facility" and not _is_privileged():
         print(
             f"{name}: Facility apply requires root or membership in group "
@@ -5138,7 +5136,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         manifest.kind == "Facility"
         and not repo_path
         and not source.repo
-        and not raw_spec.get("compose")
+        and not manifest.spec.compose.model_fields_set
     )
     pdir = project_dir(name)
     pdir.mkdir(parents=True, exist_ok=True)
@@ -5191,8 +5189,8 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             )
         sh("rsync", "-a", "--delete", f"{payload}/", str(repo) + "/")
     if pin_digest:
-        _pin_image(name, raw, pin_digest)
-    ingress = raw_spec.get("ingress", []) or []
+        _pin_image(name, manifest.spec, pin_digest)
+    ingress = manifest.spec.ingress
     org = ctx.org
     remote_ip = None
     if org is not None:
@@ -5207,17 +5205,15 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         )
         if not owns_databases:
             remote_ip = data_host_ip(org)
-    db_env = provision_databases(
-        name, raw_spec.get("databases") or {}, facilities, remote_ip=remote_ip
-    )
-    db_services = resolve_db_services(name, raw, db_env)
+    db_env = provision_databases(name, manifest.spec.databases, facilities, remote_ip=remote_ip)
+    db_services = resolve_db_services(name, manifest.spec, db_env)
     if db_env and not db_services:
         print(
             f"{name}: databases provisioned but no service to attach them to — "
             f"DATABASE_URL/REDIS_URL won't be injected. Add an ingress entry, or set "
             f"spec.databases.attachTo / attachAll to target a worker."
         )
-    env_from = resolve_env_from(raw_spec)
+    env_from = resolve_env_from(manifest.spec)
     if env_from and not ingress:
         print(
             f"{name}: spec.envFrom secrets resolved but no ingress service to "
@@ -5261,17 +5257,17 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         # `cmd_rollback`) never migrates — forward-only, and the recorded
         # revision it restores may predate the current migration head. A
         # blue-green colour flip never reaches here at all.
-        key = _rollout_key(name, raw)
+        key = _rollout_key(name, manifest.spec)
         if key is None or key != migrated_digest(name):
-            _run_migrations(name, raw, migrate, strategy, key)
+            _run_migrations(name, manifest.spec, migrate, strategy, key)
     if strategy is not None and strategy.type == "blue-green":
         # Blue-green replaces "ingress -> up -d" with a colour rollout: bring the
         # idle colour up (its compose profile), gate on its health, flip the
         # app-host file router to it, record it, then drain the old colour. The
         # app host owns its own router here (the edge routes stably to it), so
         # the colourless `edge_term` unlink below is deliberately bypassed.
-        persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
-        _apply_blue_green(name, raw, ingress, vocab, strategy, **mesh_kwargs)
+        persist_manifest(manifest_path, pdir / "manifest.yml", repo_path)
+        _apply_blue_green(name, manifest.spec, ingress, vocab, strategy, **mesh_kwargs)
     else:
         if edge_term and not router_mode:
             _router_file(name).unlink(missing_ok=True)  # inert here; the edge owns it
@@ -5281,13 +5277,13 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         # facilities-less re-apply — the digest-path rollback — re-decides router mode
         # from the marker rather than guessing `edge` and unlinking the app-host router.
         record_router_dialect(name, "mesh" if router_mode else "edge")
-        persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
+        persist_manifest(manifest_path, pdir / "manifest.yml", repo_path)
         # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
         # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
         # whose image id changed. A declaration-only Facility has no compose file at
         # all — there is nothing to bring up.
         if not declaration_only:
-            sh(*compose_args(name, raw), "up", "-d")
+            sh(*compose_args(name, manifest.spec), "up", "-d")
     # An unhealthy facility must not become "current": write_provenance is what
     # `nuk status`, `nuk rollback` and drift.sh read as the deployed state, so
     # appending here would both hide the breakage and put the last known-good
@@ -5303,7 +5299,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             repo=source.repo,
             branch=source.branch,
             commit=_full_commit_sha(repo) if (repo / ".git").exists() else None,
-            image_digest=_resolve_image_digest(name, raw),
+            image_digest=_resolve_image_digest(name, manifest.spec),
         )
     except OSError as e:
         print(f"{name}: provenance not recorded ({e})")
