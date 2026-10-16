@@ -50,7 +50,7 @@ from pydantic import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Iterator
 
-__version__ = "2.6.0"  # bumped on release by .github/workflows/release.yml
+__version__ = "2.6.1"  # bumped on release by .github/workflows/release.yml
 
 ROOT = Path("/opt/nuklaut")
 DEPLOYS = ROOT / "deployments"
