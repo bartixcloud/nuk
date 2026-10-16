@@ -281,8 +281,8 @@ def test_apply_tree_applies_facilities_before_deployments(tmp_path, monkeypatch)
     monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp, **_k: order.append(path.stem))
     results = nuk.apply_tree(_ctx(tree, "app"))
     assert order == ["data-stack", "hello"]
-    assert [r["result"] for r in results] == ["ok", "ok"]
-    assert [r["kind"] for r in results] == ["Facility", "Deployment"]
+    assert [r.result for r in results] == ["ok", "ok"]
+    assert [r.kind for r in results] == ["Facility", "Deployment"]
 
 
 def test_apply_tree_skips_manifests_placed_on_another_host(tmp_path, monkeypatch):
@@ -304,9 +304,9 @@ def test_ambiguous_app_deployment_fails_not_silently_skips(tmp_path, monkeypatch
     (tree / nuk.DEFAULT_ORG_FILE).write_text(TWO_APP_HOSTS_ORG_YML, encoding="utf-8")
     monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp, **_k: None)
     results = nuk.apply_tree(_ctx(tree, "app"))
-    entry = next(r for r in results if r["name"] == "hello")
-    assert entry["result"] == "failed"
-    assert "ambiguous" in entry["error"]
+    entry = next(r for r in results if r.name == "hello")
+    assert entry.result == "failed"
+    assert "ambiguous" in entry.error
 
 
 def test_one_failing_deployment_does_not_stop_the_rest(tmp_path, monkeypatch):
@@ -321,17 +321,17 @@ def test_one_failing_deployment_does_not_stop_the_rest(tmp_path, monkeypatch):
 
     monkeypatch.setattr(nuk, "cmd_apply", flaky)
     results = nuk.apply_tree(_ctx(tree, "app"))
-    assert [(r["name"], r["result"]) for r in results] == [("hello", "failed"), ("zulu", "ok")]
-    assert "image pull failed" in results[0]["error"]
+    assert [(r.name, r.result) for r in results] == [("hello", "failed"), ("zulu", "ok")]
+    assert "image pull failed" in results[0].error
 
 
 def test_a_malformed_manifest_is_recorded_not_raised(tmp_path, monkeypatch):
     tree = _tree(tmp_path, deployments={"hello": DEPLOYMENT_YML, "broken": "kind: Nonsense\n"})
     monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp, **_k: None)
     results = nuk.apply_tree(_ctx(tree, "app"))
-    by_name = {r["name"]: r for r in results}
-    assert by_name["broken.yml"]["result"] == "failed"
-    assert by_name["hello"]["result"] == "ok"
+    by_name = {r.name: r for r in results}
+    assert by_name["broken.yml"].result == "failed"
+    assert by_name["hello"].result == "ok"
 
 
 def test_apply_tree_tolerates_a_tree_with_neither_directory(tmp_path):
@@ -358,10 +358,10 @@ def test_a_deployment_consuming_a_failed_facility_is_refused(tmp_path, monkeypat
     monkeypatch.setattr(nuk, "cmd_apply", flaky)
     monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")  # db env files land here
     results = nuk.apply_tree(_ctx(tree, "app"))
-    by_name = {r["name"]: r for r in results}
-    assert by_name["data-stack"]["result"] == "failed"
-    assert by_name["hello"]["result"] == "refused"
-    assert "databases" in by_name["hello"]["error"]
+    by_name = {r.name: r for r in results}
+    assert by_name["data-stack"].result == "failed"
+    assert by_name["hello"].result == "refused"
+    assert "databases" in by_name["hello"].error
 
 
 def test_a_deployment_consuming_nothing_applies_despite_a_failed_facility(tmp_path, monkeypatch):
@@ -379,8 +379,8 @@ def test_a_deployment_consuming_nothing_applies_despite_a_failed_facility(tmp_pa
 
     monkeypatch.setattr(nuk, "cmd_apply", flaky)
     results = nuk.apply_tree(_ctx(tree, "app"))
-    by_name = {r["name"]: r for r in results}
-    assert by_name["hello"]["result"] == "ok"
+    by_name = {r.name: r for r in results}
+    assert by_name["hello"].result == "ok"
 
 
 def test_a_facility_placed_on_another_host_does_not_poison(tmp_path, monkeypatch):
@@ -392,8 +392,8 @@ def test_a_facility_placed_on_another_host_does_not_poison(tmp_path, monkeypatch
     )
     monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp, **_k: None)
     results = nuk.apply_tree(_ctx(tree, "app"))
-    assert [r["name"] for r in results] == ["hello"]
-    assert results[0]["result"] == "ok"
+    assert [r.name for r in results] == ["hello"]
+    assert results[0].result == "ok"
 
 
 # --- reap -----------------------------------------------------------------------
