@@ -84,3 +84,76 @@ def test_foreign_pattern_without_delegation_is_an_error():
     nuk.check_cross_zone_patterns(
         reg, {"astrojones": [nuk.Delegation(host="kolbe.astrojones.guru", to="kolbeapp-de")]}
     )  # ok
+
+
+DELEG_YML = """\
+apiVersion: nuk/v1
+kind: Delegations
+metadata: {name: astrojones}
+spec:
+  delegations:
+    - {host: kolbe.astrojones.guru, to: kolbeapp-de}
+"""
+
+
+def test_load_delegations_parses(tmp_path):
+    (tmp_path / "delegations.yml").write_text(DELEG_YML, encoding="utf-8")
+    dels = nuk.load_delegations(tmp_path)
+    assert [(d.host, d.to) for d in dels] == [("kolbe.astrojones.guru", "kolbeapp-de")]
+
+
+def test_load_delegations_missing_file_is_empty(tmp_path):
+    assert nuk.load_delegations(tmp_path) == []
+
+
+def test_load_delegations_malformed_refuses(tmp_path):
+    (tmp_path / "delegations.yml").write_text("kind: Delegations\n", encoding="utf-8")
+    with pytest.raises(SystemExit):
+        nuk.load_delegations(tmp_path)
+
+
+def test_validate_delegation_without_coverage_refuses():
+    reg = nuk.TenantRegistry(tenants=[{"name": "astrojones", "domains": ["astrojones.guru"]}])
+    with pytest.raises(SystemExit):
+        nuk.validate_delegations(
+            "astrojones", [nuk.Delegation(host="x.other.de", to="jonesh")], reg
+        )
+
+
+def test_validate_delegation_to_unknown_tenant_refuses():
+    reg = nuk.TenantRegistry(
+        tenants=[{"name": "astrojones", "domains": ["astrojones.guru", "*.astrojones.guru"]}]
+    )
+    with pytest.raises(SystemExit):
+        nuk.validate_delegations(
+            "astrojones", [nuk.Delegation(host="kolbe.astrojones.guru", to="nobody")], reg
+        )
+
+
+def test_validate_delegation_to_a_target_that_lists_the_host_refuses():
+    """Ein-Ebenen: das Ziel darf den verliehenen Host nicht selbst listen.
+
+    Täte es das, wäre es selbst Zonen-Eigentümer und könnte weiterverleihen.
+    """
+    reg = nuk.TenantRegistry(
+        tenants=[
+            {"name": "astrojones", "domains": ["astrojones.guru", "*.astrojones.guru"]},
+            {"name": "kolbeapp-de", "domains": ["kolbe.astrojones.guru"]},
+        ]
+    )
+    with pytest.raises(SystemExit):
+        nuk.validate_delegations(
+            "astrojones", [nuk.Delegation(host="kolbe.astrojones.guru", to="kolbeapp-de")], reg
+        )
+
+
+def test_validate_delegation_accepts_owner_zones_and_empty_target_domains():
+    reg = nuk.TenantRegistry(
+        tenants=[
+            {"name": "astrojones", "domains": ["astrojones.guru", "*.astrojones.guru"]},
+            {"name": "kolbeapp-de", "domains": []},
+        ]
+    )
+    nuk.validate_delegations(
+        "astrojones", [nuk.Delegation(host="kolbe.astrojones.guru", to="kolbeapp-de")], reg
+    )  # no raise

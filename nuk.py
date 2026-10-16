@@ -774,6 +774,7 @@ def load_org(path: Path) -> Org:
 # no two tenants claiming the same domain pattern (spec §1/§3).
 
 TENANTS_FILE = "tenants.yml"
+DELEGATIONS_FILE = "delegations.yml"
 
 
 class TenantRow(BaseModel):
@@ -845,6 +846,45 @@ class Delegation(_NullTolerant):
 
     host: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
     to: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class DelegationsSpec(_NullTolerant):
+    """`spec` of a `Delegations` document — the hosts the owner lends out."""
+
+    delegations: list[Delegation] = []
+
+
+class Delegations(_NullTolerant):
+    """The `<tenant-tree>/delegations.yml` document (spec §2): one tenant's loans."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    api_version: Literal["nuk/v1"] = Field(alias="apiVersion")
+    kind: Literal["Delegations"]
+    metadata: Metadata
+    spec: DelegationsSpec = DelegationsSpec()
+
+
+def load_delegations(tree: Path) -> list[Delegation]:
+    """Parse `<tree>/delegations.yml`, the owner's loans (spec §2).
+
+    A tree without the file lends nothing (returns `[]`); a malformed one is a
+    refusal, not a silent skip.
+
+    Raises:
+        NukError: If the file is unreadable or invalid.
+    """
+    path = tree / DELEGATIONS_FILE
+    if not path.is_file():
+        return []
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        die(f"{path}: {e}")
+    try:
+        return Delegations.model_validate(raw).spec.delegations
+    except ValidationError as e:
+        die(f"{path}: invalid delegations manifest\n{e}")
 
 
 def load_tenants(tree: Path) -> TenantRegistry:
@@ -974,6 +1014,32 @@ def check_cross_zone_patterns(
                     f"nuk: tenant {tenant.name!r} lists {pattern!r}, which falls in "
                     f"{owner[0]!r}'s zone and is not delegated to it"
                 )
+
+
+def validate_delegations(owner: str, dels: list[Delegation], registry: TenantRegistry) -> None:
+    """Check one owner's loans before they are honoured (spec §2).
+
+    Three refusals: the owner must actually own the lent host (coverage), the target
+    tenant must exist, and the target must not list the host itself — listing it would
+    make the target a competing owner and let it lend the host on (one-level rule).
+
+    Raises:
+        NukError: On any of the three.
+    """
+    row = registry.get(owner)
+    if row is None:
+        die(f"nuk: tenant {owner!r} has delegations but is not in the registry")
+    for d in dels:
+        if not host_in_domains(d.host, row.domains):
+            die(f"nuk: tenant {owner!r} cannot delegate {d.host!r}, which it does not own")
+        target = registry.get(d.to)
+        if target is None:
+            die(f"nuk: tenant {owner!r} delegates {d.host!r} to unknown tenant {d.to!r}")
+        if d.to != owner and host_in_domains(d.host, target.domains):
+            die(
+                f"nuk: tenant {d.to!r} lists {d.host!r} itself; a delegated host may be "
+                f"listed only by its owner {owner!r} (no re-delegation)"
+            )
 
 
 def org_get(org: Org, dotted: str) -> object:
