@@ -782,8 +782,11 @@ class TenantRow(BaseModel):
 def specificity(pattern: str) -> int:
     """The pattern's specificity: its number of literal labels (spec §3).
 
-    A `*.` label is not literal, so `*.c` ranks like `c`; the tie is broken in
-    favour of the exact pattern by the resolver, not here.
+    A `*.` label is not literal, so `*.c` ranks like `c`. Neither this function nor the
+    resolver breaks a tie: a specificity tie between two tenants is structurally
+    impossible, because `TenantRegistry._check_unique` already rejects a pattern two
+    tenants both list, and two distinct patterns that both cover one host cannot share a
+    rank.
     """
     return len([label for label in pattern.lower().split(".") if label != "*"])
 
@@ -946,12 +949,13 @@ def host_in_domains(host: str, domains: list[str]) -> bool:
 
 
 def _owner_of(host: str, claims: Iterable[tuple[str, list[str]]]) -> tuple[str, int] | None:
-    """The `(tenant, specificity)` of the most specific claim covering `host`.
+    """The `(tenant, specificity)` of the most specific claim covering `host`: its zone owner.
 
-    `claims` is a stream of `(tenant name, owned patterns)`. A tie between two
-    tenants is structurally impossible once `TenantRegistry._check_unique` rejects
-    duplicate patterns; `die` anyway rather than pick a winner (spec §3.5: the
-    resolution must never be non-deterministic).
+    `claims` is a stream of `(tenant name, owned patterns)`. This is spec §3.1's zone
+    owner — the tenant `resolve_host_owner` starts from and then subtracts delegations
+    from. A tie between two tenants is structurally impossible once
+    `TenantRegistry._check_unique` rejects duplicate patterns; `die` anyway rather than
+    pick a winner (spec §3.5: the resolution must never be non-deterministic).
     """
     best: tuple[str, int] | None = None
     for name, domains in claims:
@@ -971,35 +975,33 @@ def _claims(registry: TenantRegistry) -> list[tuple[str, list[str]]]:
     return [(t.name, t.domains) for t in registry.tenants]
 
 
-def zone_owner(host: str, registry: TenantRegistry) -> str | None:
-    """The tenant with the most specific owned pattern covering `host`, or None (spec §3.1).
-
-    Raises:
-        NukError: Defensively, if two tenants tie on specificity (see `_owner_of`).
-    """
-    match = _owner_of(host, _claims(registry))
-    return match[0] if match else None
-
-
 def _resolve(
     host: str,
     claims: Iterable[tuple[str, list[str]]],
     delegations: dict[str, list[Delegation]],
 ) -> str | None:
-    """The authorized tenant for `host`: its zone owner, minus a covering delegation.
+    """The authorized tenant for `host`: its zone owner, minus the most specific covering loan.
 
     A delegation transfers only when its `host` covers `host` **and** is at least as
     specific as the owned pattern that made its owner the zone owner — a delegation
-    broader than the owner's winning claim does not reach this host (spec §3.2).
+    broader than the owner's winning claim does not reach this host (spec §3.2). Among
+    several qualifying loans the most specific wins, so a loan is not shadowed by a
+    broader one earlier in the owner's `delegations.yml`.
     """
     match = _owner_of(host, claims)
     if match is None:
         return None
     owner, owner_rank = match
+    best: Delegation | None = None
+    best_rank = -1
     for delegation in delegations.get(owner, []):
-        if host_in_domains(host, [delegation.host]) and specificity(delegation.host) >= owner_rank:
-            return delegation.to
-    return owner
+        if not host_in_domains(host, [delegation.host]):
+            continue
+        rank = specificity(delegation.host)
+        if rank < owner_rank or rank <= best_rank:
+            continue
+        best, best_rank = delegation, rank
+    return best.to if best is not None else owner
 
 
 def resolve_host_owner(
@@ -1015,47 +1017,59 @@ def resolve_host_owner(
 
 
 def check_cross_zone_patterns(
+    tenant: str,
     registry: TenantRegistry,
     delegations: dict[str, list[Delegation]],
 ) -> None:
-    """Refuse a pattern that falls into another tenant's zone without a delegation (spec §3.3).
+    """Refuse a pattern of `tenant` that falls into another tenant's zone without a delegation.
 
-    A `domains` entry of one tenant lying in another's zone is not an authorization —
-    it is the very overlap that must not grant rights. The owning tenant must delegate
-    it. The check excludes the listing tenant's own patterns when deciding whose zone
-    the pattern falls in (otherwise the pattern would "own itself" by specificity).
+    A `domains` entry lying in another tenant's zone is not an authorization — it is the
+    very overlap that must not grant rights (spec §3.3). The owning tenant must delegate it
+    to `tenant`. The check excludes `tenant`'s own patterns when deciding whose zone a
+    pattern falls in (otherwise the pattern would "own itself" by specificity). Judging one
+    tenant at a time lets the cycle refuse the offending source rather than the whole run.
 
     Raises:
-        NukError: For every such undelegated foreign pattern.
+        NukError: For the first such undelegated foreign pattern.
     """
-    for tenant in registry.tenants:
-        others = [(t.name, t.domains) for t in registry.tenants if t.name != tenant.name]
-        for pattern in tenant.domains:
-            owner = _owner_of(pattern, others)
-            if owner is None:
-                continue
-            if _resolve(pattern, others, delegations) != tenant.name:
-                die(
-                    f"nuk: tenant {tenant.name!r} lists {pattern!r}, which falls in "
-                    f"{owner[0]!r}'s zone and is not delegated to it"
-                )
+    row = registry.get(tenant)
+    if row is None:
+        return
+    others = [(t.name, t.domains) for t in registry.tenants if t.name != tenant]
+    for pattern in row.domains:
+        owner = _owner_of(pattern, others)
+        if owner is None:
+            continue
+        if _resolve(pattern, others, delegations) != tenant:
+            die(
+                f"nuk: tenant {tenant!r} lists {pattern!r}, which falls in "
+                f"{owner[0]!r}'s zone and is not delegated to it"
+            )
 
 
 def validate_delegations(owner: str, dels: list[Delegation], registry: TenantRegistry) -> None:
     """Check one owner's loans before they are honoured (spec §2).
 
-    Three refusals: the owner must actually own the lent host (coverage), the target
-    tenant must exist, and the target must not list the host itself — listing it would
-    make the target a competing owner and let it lend the host on (one-level rule).
+    Four refusals: the owner must be the *zone owner* of the lent host — not merely list a
+    broader pattern covering it, which would make the loan a no-op (coverage), no host may
+    be lent twice (a specificity tie the resolver must not have to break), the target
+    tenant must exist, and the target must not list the host itself — listing it would make
+    the target a competing owner and let it lend the host on (one-level rule).
 
     Raises:
-        NukError: On any of the three.
+        NukError: On any of the four.
     """
     row = registry.get(owner)
     if row is None:
         die(f"nuk: tenant {owner!r} has delegations but is not in the registry")
+    seen: set[str] = set()
     for d in dels:
-        if not host_in_domains(d.host, row.domains):
+        key = d.host.lower()
+        if key in seen:
+            die(f"nuk: tenant {owner!r} delegates {d.host!r} more than once")
+        seen.add(key)
+        zone = _owner_of(d.host, _claims(registry))
+        if zone is None or zone[0] != owner:
             die(f"nuk: tenant {owner!r} cannot delegate {d.host!r}, which it does not own")
         target = registry.get(d.to)
         if target is None:
@@ -2579,43 +2593,114 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
     return block, ctx
 
 
+def _cycle_delegations(
+    prepared: list[tuple[SourceEntry, TreeContext]],
+    refused: list[SourceEntry],
+    *,
+    state_dir: Path,
+    platform_present: bool,
+) -> dict[str, list[Delegation]]:
+    """Every owner's loans for this cycle, keyed by owner (spec §2/§4).
+
+    Only sources with `routes` in `apply` contribute (spec §2). A prepared owner lends
+    its `delegations.yml`; a REFUSED one lends its last VERIFIED cache instead, so a
+    foreign fetch failure cannot pull a lent name away (spec §4). Without a verified
+    platform tree there is no registry to authorize against, so no cache is read.
+    """
+    delegations: dict[str, list[Delegation]] = {}
+    for src, ctx in prepared:
+        if ctx.tenant is not None and "routes" in src.apply:
+            delegations[ctx.tenant] = load_delegations(ctx.tree)
+    for src in refused:
+        if not src.is_platform and "routes" in src.apply and platform_present:
+            delegations[src.name] = load_cached_delegations(state_dir, src.name)
+    return delegations
+
+
+def _refuse_bad_declarations(
+    prepared: list[tuple[SourceEntry, TreeContext]],
+    refused: list[SourceEntry],
+    registry: TenantRegistry,
+    delegations: dict[str, list[Delegation]],
+    *,
+    blocks: dict[str, dict],
+) -> list[tuple[SourceEntry, TreeContext]]:
+    """Refuse each source whose declarations do not validate; return the survivors.
+
+    `validate_delegations` and `check_cross_zone_patterns` judge one tenant at a time, so
+    a violation refuses THAT source — its loans are dropped from `delegations` and the rest
+    of the fleet proceeds — instead of aborting the whole cycle (spec §2). A loan judged
+    against a bad declaration is therefore never honoured, so fail-closed holds. An
+    already-refused source whose cached loan is invalid is simply not honoured, never a
+    second refusal.
+    """
+    surviving: list[tuple[SourceEntry, TreeContext]] = []
+    for src, ctx in prepared:
+        if ctx.tenant is None:
+            surviving.append((src, ctx))
+            continue
+        dels = delegations.get(ctx.tenant, [])
+        try:
+            if dels:
+                validate_delegations(ctx.tenant, dels, registry)
+            check_cross_zone_patterns(ctx.tenant, registry, delegations)
+        except _SOURCE_FAILURES as e:
+            _refuse(src, blocks[src.name], e)
+            delegations.pop(ctx.tenant, None)
+            continue
+        surviving.append((src, ctx))
+    for src in refused:
+        if src.is_platform or "routes" not in src.apply:
+            continue
+        dels = delegations.get(src.name, [])
+        if not dels:
+            continue
+        try:
+            validate_delegations(src.name, dels, registry)
+        except _SOURCE_FAILURES:
+            delegations.pop(src.name, None)
+    return surviving
+
+
 def _host_auth(
     platform_ctx: TreeContext | None,
     prepared: list[tuple[SourceEntry, TreeContext]],
     *,
     state_dir: Path,
     refused: list[SourceEntry],
-) -> HostAuth:
+    blocks: dict[str, dict],
+) -> tuple[HostAuth, list[tuple[SourceEntry, TreeContext]]]:
     """Build the cycle's host authorization from the registry and every owner's loans.
 
     The registry is the platform tree's `tenants.yml`; without one no tenant owns
-    anything and every tenant render is refused (fail-closed, spec §3.4). Each prepared
-    tenant source lends from its own `delegations.yml`; a REFUSED one instead lends its
-    last VERIFIED loans from the cache, so a foreign fetch failure cannot pull a lent
-    name away (spec §4). `validate_delegations` and `check_cross_zone_patterns` guard
-    those loans — cached ones included — before they are honoured (spec §2/§3.3), and
-    only then is the verified state written back to each prepared owner's cache.
+    anything and every tenant render is refused (fail-closed, spec §3.4). Only sources
+    with `routes` in `apply` contribute loans (spec §2). Each such prepared tenant source
+    lends from its own `delegations.yml`; a REFUSED one instead lends its last VERIFIED
+    loans from the cache, so a foreign fetch failure cannot pull a lent name away (spec §4).
+
+    Validation is per source (`_refuse_bad_declarations`): a violation refuses THAT source
+    — its loans are dropped and the rest of the fleet proceeds — instead of aborting the
+    whole cycle (spec §2).
+
+    Returns:
+        The authorization and the prepared sources that survived validation (the ones the
+        caller may apply). A validation-refused source's block is filled via `_refuse`.
+        Only surviving, routable owners have their verified state written back to the cache.
     """
     registry = platform_ctx.tenants if platform_ctx is not None else None
     if registry is None:
         registry = TenantRegistry(tenants=[])
-    delegations: dict[str, list[Delegation]] = {}
-    for _src, ctx in prepared:
-        if ctx.tenant is not None:
-            delegations[ctx.tenant] = load_delegations(ctx.tree)
-    for src in refused:
-        # Without a verified platform tree there is no registry to authorize against, so
-        # the cache would add nothing but a spurious "not in the registry" refusal.
-        if not src.is_platform and platform_ctx is not None:
-            delegations[src.name] = load_cached_delegations(state_dir, src.name)
-    for owner, dels in delegations.items():
-        if dels:
-            validate_delegations(owner, dels, registry)
-    check_cross_zone_patterns(registry, delegations)
-    for _src, ctx in prepared:
-        if ctx.tenant is not None:
+    delegations = _cycle_delegations(
+        prepared,
+        refused,
+        state_dir=state_dir,
+        platform_present=platform_ctx is not None,
+    )
+    surviving = _refuse_bad_declarations(prepared, refused, registry, delegations, blocks=blocks)
+    for src, ctx in surviving:
+        if ctx.tenant is not None and "routes" in src.apply:
             store_delegations(state_dir, ctx.tenant, delegations[ctx.tenant])
-    return HostAuth(registry, delegations)
+    return HostAuth(registry, delegations), surviving
 
 
 def _logging_status(role: str, platform_ctx: TreeContext | None) -> dict | None:
@@ -2644,7 +2729,9 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
     all of a cycle's trees — and thus every owner's delegations.yml — are known before any
     render; then build the host authorization (spec §3) and APPLY each prepared source
     against it. A delegation declared by a later source is therefore effective in the same
-    cycle (spec §3.5).
+    cycle (spec §3.5). Building the authorization also validates each source's declarations
+    and refuses the offending source alone — a bad loan never halts the fleet, but the
+    cycle still ends not clean (spec §2).
 
     Returns:
         (orphan warnings, logging status, whether every source converged).
@@ -2668,13 +2755,15 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
                 platform_ctx = ctx if src.is_platform else platform_ctx
             else:
                 refused.append(src)
-        auth = _host_auth(platform_ctx, prepared, state_dir=state_dir, refused=refused)
-        for src, ctx in prepared:
+        auth, applied = _host_auth(
+            platform_ctx, prepared, state_dir=state_dir, refused=refused, blocks=blocks
+        )
+        for src, ctx in applied:
             try:
                 _apply_source(src, ctx, blocks[src.name], state_dir, auth)
             except _SOURCE_FAILURES as e:
                 _refuse(src, blocks[src.name], e)
-        trees = [ctx.tree for _src, ctx in prepared]
+        trees = [ctx.tree for _src, ctx in applied]
         clean = all(b["result"] == "ok" for b in blocks.values())
         # A refused source has no tree this cycle, so its apps would all read as orphans;
         # only a clean cycle can tell what is really undeclared.
@@ -3185,8 +3274,10 @@ def _render_routers(
 
     A tenant source's router set is authoritative (spec §5): a render that allows none
     of a deployment's hosts withdraws the file it wrote before, rather than leaving a
-    lent host live — revocation. Only the source's own router file is touched; a foreign
-    file is never deleted.
+    lent host live — revocation. The withdrawal is keyed by the deployment's NAME (the
+    router file name), not by source: a fleet-wide deployment-name collision would
+    therefore touch a file another source wrote. The surrounding system discourages
+    cross-source name collisions, but this path does not itself detect them.
 
     Args:
         tree: Root of the manifest tree the loop pulled.
@@ -3234,7 +3325,9 @@ def _render_routers(
             if not allowed:
                 # Revocation (spec §5): the owner's router set is authoritative, so a
                 # render that allows none of the deployment's hosts withdraws the file
-                # it wrote before. It never touches another owner's routers.
+                # it wrote before. The withdrawal is keyed by the deployment's name, so a
+                # fleet-wide name collision would touch another source's router — the
+                # system discourages that, but this path does not detect it.
                 write_ingress(manifest.metadata.name, [], vocab)
                 continue
             ingress = allowed

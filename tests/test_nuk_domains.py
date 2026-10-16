@@ -59,8 +59,9 @@ DELEG = {"astrojones": [nuk.Delegation(host="kolbe.astrojones.guru", to="kolbeap
 
 
 def test_zone_owner_is_the_most_specific_pattern():
-    assert nuk.zone_owner("kolbe.astrojones.guru", REG) == "astrojones"
-    assert nuk.zone_owner("other.de", REG) is None
+    # With no loans, the authorized tenant IS the zone owner (spec §3.1).
+    assert nuk.resolve_host_owner("kolbe.astrojones.guru", REG, {}) == "astrojones"
+    assert nuk.resolve_host_owner("other.de", REG, {}) is None
 
 
 def test_delegation_transfers_and_the_owner_loses_it():
@@ -69,7 +70,28 @@ def test_delegation_transfers_and_the_owner_loses_it():
 
 
 def test_zone_owner_is_none_when_nobody_owns_the_host():
-    assert nuk.zone_owner("nobody.example.com", REG) is None
+    assert nuk.resolve_host_owner("nobody.example.com", REG, {}) is None
+
+
+def test_the_most_specific_loan_wins_regardless_of_file_order():
+    """Spec §3.2: a broader loan must not shadow a more specific one (YAML order is ignored)."""
+    reg = nuk.TenantRegistry(
+        tenants=[
+            {"name": "astrojones", "domains": ["example.com", "*.example.com"]},
+            {"name": "a", "domains": []},
+            {"name": "b", "domains": []},
+        ]
+    )
+    broader_first = {
+        "astrojones": [
+            nuk.Delegation(host="*.example.com", to="a"),
+            nuk.Delegation(host="special.example.com", to="b"),
+        ]
+    }
+    specific_first = {"astrojones": list(reversed(broader_first["astrojones"]))}
+    assert nuk.resolve_host_owner("special.example.com", reg, broader_first) == "b"
+    assert nuk.resolve_host_owner("special.example.com", reg, specific_first) == "b"
+    assert nuk.resolve_host_owner("x.example.com", reg, broader_first) == "a"
 
 
 def test_foreign_pattern_without_delegation_is_an_error():
@@ -80,9 +102,11 @@ def test_foreign_pattern_without_delegation_is_an_error():
         ]
     )
     with pytest.raises(SystemExit):
-        nuk.check_cross_zone_patterns(reg, {})  # kolbe.* ohne Delegation = Fehler
+        nuk.check_cross_zone_patterns("kolbeapp-de", reg, {})  # kolbe.* ohne Delegation
     nuk.check_cross_zone_patterns(
-        reg, {"astrojones": [nuk.Delegation(host="kolbe.astrojones.guru", to="kolbeapp-de")]}
+        "kolbeapp-de",
+        reg,
+        {"astrojones": [nuk.Delegation(host="kolbe.astrojones.guru", to="kolbeapp-de")]},
     )  # ok
 
 
@@ -156,6 +180,50 @@ def test_validate_delegation_accepts_owner_zones_and_empty_target_domains():
     )
     nuk.validate_delegations(
         "astrojones", [nuk.Delegation(host="kolbe.astrojones.guru", to="kolbeapp-de")], reg
+    )  # no raise
+
+
+def test_validate_delegation_of_the_same_host_twice_refuses():
+    """Two loans of one host are a specificity tie the resolver must not have to break (spec §2)."""
+    reg = nuk.TenantRegistry(
+        tenants=[
+            {"name": "astrojones", "domains": ["astrojones.guru", "*.astrojones.guru"]},
+            {"name": "kolbeapp-de", "domains": []},
+            {"name": "jonesh", "domains": []},
+        ]
+    )
+    with pytest.raises(SystemExit):
+        nuk.validate_delegations(
+            "astrojones",
+            [
+                nuk.Delegation(host="kolbe.astrojones.guru", to="kolbeapp-de"),
+                nuk.Delegation(host="kolbe.astrojones.guru", to="jonesh"),
+            ],
+            reg,
+        )
+
+
+def test_validate_delegation_from_a_broader_than_the_zone_owner_refuses():
+    """A tenant that only lists a broader wildcard cannot lend from another's zone (spec §2).
+
+    ``broad`` lists ``*.example.com``; ``owner`` owns the more specific ``special.example.com``.
+    A loan of ``special.example.com`` by ``broad`` would be silently ineffective — the resolver
+    only consults the real zone owner — so it must be refused at validation time.
+    """
+    reg = nuk.TenantRegistry(
+        tenants=[
+            {"name": "broad", "domains": ["*.example.com"]},
+            {"name": "owner", "domains": ["special.example.com"]},
+            {"name": "target", "domains": []},
+        ]
+    )
+    with pytest.raises(SystemExit):
+        nuk.validate_delegations(
+            "broad", [nuk.Delegation(host="special.example.com", to="target")], reg
+        )
+    # The real zone owner may lend it.
+    nuk.validate_delegations(
+        "owner", [nuk.Delegation(host="special.example.com", to="target")], reg
     )  # no raise
 
 

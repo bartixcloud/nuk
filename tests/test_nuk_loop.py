@@ -562,7 +562,7 @@ def test_delegation_from_a_later_source_is_effective_in_the_same_cycle(
     f.use(
         ("bartixcloud", ["facilities"]),
         ("kolbeapp-de", ["deployments", "routes"]),
-        ("astrojones", ["deployments"]),
+        ("astrojones", ["deployments", "routes"]),
     )
     assert f.converge() == 0
     block = f.status()["sources"]["kolbeapp-de"]
@@ -591,7 +591,7 @@ def test_failed_owner_fetch_falls_back_to_the_last_verified_delegations(
     f.use(
         ("bartixcloud", ["facilities"]),
         ("kolbeapp-de", ["deployments", "routes"]),
-        ("astrojones", ["deployments"]),
+        ("astrojones", ["deployments", "routes"]),
     )
     assert f.converge() == 0
     assert f.status()["sources"]["kolbeapp-de"]["rendered"] == ["kolbe"]
@@ -626,6 +626,69 @@ def test_a_platform_outage_does_not_turn_a_cached_loan_into_a_cycle_crash(fleet)
     assert sources["bartixcloud"]["result"] == "refused"
     assert sources["astrojones"]["result"] == "refused"
     assert "did not verify this cycle" in sources["astrojones"]["error"]
+
+
+def test_a_bad_delegation_refuses_only_the_offending_source(
+    tmp_path, monkeypatch, signing_keys
+):
+    """A delegation-validation violation refuses its source, not the whole fleet (spec §2).
+
+    astrojones lends a host it does not own. The loan must NOT be honoured, the platform
+    and the other tenant must still converge, and the cycle must end not clean — a failed
+    run must never be recorded as a successful one.
+    """
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
+    platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
+    f = Fleet(tmp_path, platform, signing_keys)
+    bad = DELEGATING.replace("kolbe.astrojones.guru", "x.other.de")
+    f.origins["kolbeapp-de"].release("v1.0.0", {"deployments/kolbe.yml": KOLBE})
+    f.origins["astrojones"].release("v1.1.0", {nuk.DELEGATIONS_FILE: bad})
+    f.use(
+        ("bartixcloud", ["facilities"]),
+        ("kolbeapp-de", ["deployments", "routes"]),
+        ("astrojones", ["deployments", "routes"]),
+    )
+    assert f.converge() == 1
+    sources = f.status()["sources"]
+    assert sources["astrojones"]["result"] == "refused"
+    assert "cannot delegate" in sources["astrojones"]["error"]
+    # The rest of the fleet is not dragged down with the offender.
+    assert sources["bartixcloud"]["result"] == "ok"
+    assert sources["kolbeapp-de"]["result"] == "ok"
+
+
+def test_a_corrupt_delegation_cache_refuses_the_cycle(tmp_path, monkeypatch, signing_keys):
+    """A corrupt last-verified cache is a cycle refusal (spec §4).
+
+    Lent names must never silently vanish: when the cached state cannot be read, the loop
+    fails loudly instead of rendering as if the owner had lent nothing.
+    """
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
+    platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
+    f = Fleet(tmp_path, platform, signing_keys)
+    f.origins["kolbeapp-de"].release("v1.0.0", {"deployments/kolbe.yml": KOLBE})
+    f.origins["astrojones"].release("v1.1.0", {nuk.DELEGATIONS_FILE: DELEGATING})
+    f.use(
+        ("bartixcloud", ["facilities"]),
+        ("kolbeapp-de", ["deployments", "routes"]),
+        ("astrojones", ["deployments", "routes"]),
+    )
+    assert f.converge() == 0  # first cycle caches astrojones's verified loans
+
+    shutil.rmtree(f.origins["astrojones"].bare)  # the owner is unreachable now
+    cache = nuk.source_state_dir(f.state, "astrojones") / nuk.DELEGATIONS_CACHE_FILE
+    cache.write_text("{ not json", encoding="utf-8")
+
+    with pytest.raises(SystemExit, match="invalid cached delegations"):
+        f.converge()
 
 
 # --- reap -------------------------------------------------------------------------------
