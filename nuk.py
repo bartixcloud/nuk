@@ -324,6 +324,21 @@ class Strategy(_NullTolerant):
     keep_previous: bool = Field(default=True, alias="keepPrevious")
 
 
+class Migrate(_NullTolerant):
+    """`spec.migrate` — a one-shot schema migration run before the rollout.
+
+    nuk owns *when* (before the idle colour comes up, gated to a new rollout);
+    the app declares *how*: a compose service whose image/env nuk reuses, and
+    the command to run in it.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    service: str
+    command: str
+    timeout: int = 300
+
+
 class Spec(_NullTolerant):
     """The manifest `spec` block."""
 
@@ -336,6 +351,7 @@ class Spec(_NullTolerant):
     databases: Databases = Databases()
     placement: Placement | None = None
     strategy: Strategy | None = None
+    migrate: Migrate | None = None
 
 
 class Metadata(BaseModel):
