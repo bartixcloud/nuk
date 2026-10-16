@@ -90,6 +90,38 @@ spec:
   health: {containers: [nuk-postgres, nuk-redis]}
 """
 
+KOLBE = """\
+apiVersion: nuk/v1
+kind: Deployment
+metadata: {name: kolbe}
+spec:
+  placement: {role: app}
+  ingress:
+    - {host: kolbe.astrojones.guru, service: web, port: 8080}
+"""
+
+# Two tenants that own separate zones; kolbeapp-de is the target of astrojones's loan.
+ZONE_TENANTS = """\
+tenants:
+  - name: astrojones
+    edge: shared
+    domains: [astrojones.guru, "*.astrojones.guru"]
+    signer_principal: astrojones
+  - name: kolbeapp-de
+    edge: shared
+    domains: [kolbeapp.de, "*.kolbeapp.de"]
+    signer_principal: kolbeapp-de
+"""
+
+DELEGATING = """\
+apiVersion: nuk/v1
+kind: Delegations
+metadata: {name: astrojones}
+spec:
+  delegations:
+    - {host: kolbe.astrojones.guru, to: kolbeapp-de}
+"""
+
 
 @pytest.fixture
 def platform_files() -> dict[str, str]:
@@ -483,7 +515,9 @@ def test_a_tenant_route_for_a_foreign_host_is_refused(fleet, monkeypatch):
     assert fleet.converge() == 0
     block = fleet.status()["sources"]["astrojones"]
     assert block["rendered"] == ["hello"]  # only the in-domain route
-    assert block["refusedRoutes"] == ["REFUSED route kolbeapp.de: not in tenant astrojones domains"]
+    assert block["refusedRoutes"] == [
+        "REFUSED route kolbeapp.de: owned/delegated by the platform"
+    ]
     assert not (nuk.DYNAMIC / "steal.yml").exists()
     assert (nuk.DYNAMIC / "hello.yml").is_file()
 
@@ -502,8 +536,38 @@ def test_a_tenant_missing_from_the_registry_routes_nothing(
     block = f.status()["sources"]["astrojones"]
     assert block["rendered"] == []
     assert block["refusedRoutes"] == [
-        "REFUSED route hello.bitcoinalchemist.com: not in tenant astrojones domains"
+        "REFUSED route hello.bitcoinalchemist.com: owned/delegated by the platform"
     ]
+
+
+def test_delegation_from_a_later_source_is_effective_in_the_same_cycle(
+    tmp_path, monkeypatch, signing_keys
+):
+    """A delegation from a later source is effective in the same cycle (spec §3.5).
+
+    The owner astrojones (source 2) lends kolbe.astrojones.guru to kolbeapp-de (source 1),
+    which is processed FIRST; the loan — verified later in the same cycle — must already
+    authorize the render.
+    """
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
+    platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
+    f = Fleet(tmp_path, platform, signing_keys)
+    f.origins["kolbeapp-de"].release("v1.0.0", {"deployments/kolbe.yml": KOLBE})
+    f.origins["astrojones"].release("v1.1.0", {nuk.DELEGATIONS_FILE: DELEGATING})
+    f.use(
+        ("bartixcloud", ["facilities"]),
+        ("kolbeapp-de", ["deployments", "routes"]),
+        ("astrojones", ["deployments"]),
+    )
+    assert f.converge() == 0
+    block = f.status()["sources"]["kolbeapp-de"]
+    assert block["refusedRoutes"] == []
+    assert block["rendered"] == ["kolbe"]
+    assert (nuk.DYNAMIC / "kolbe.yml").is_file()
 
 
 # --- reap -------------------------------------------------------------------------------

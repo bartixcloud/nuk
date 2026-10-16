@@ -1042,6 +1042,25 @@ def validate_delegations(owner: str, dels: list[Delegation], registry: TenantReg
             )
 
 
+@dataclass(frozen=True)
+class HostAuth:
+    """Who may render which host: the delegation-aware resolution (spec §3).
+
+    Built once per cycle from the platform registry plus every owner's loans, so a
+    delegation committed by another source is already honoured in the same run (spec
+    §3.5). A tenant source renders a host only when `resolve` names it; the platform
+    source is ungated and never consults this. Both fields are inputs to
+    `resolve_host_owner` — the resolution itself lives there, not here.
+    """
+
+    registry: TenantRegistry
+    delegations: dict[str, list[Delegation]]
+
+    def resolve(self, host: str) -> str | None:
+        """The tenant allowed to render `host`, or None (nobody / the platform)."""
+        return resolve_host_owner(host, self.registry, self.delegations)
+
+
 def org_get(org: Org, dotted: str) -> object:
     """Return a value from an Org by dotted alias path (e.g. `facilities.auth`).
 
@@ -2462,11 +2481,13 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
     )
 
 
-def _apply_source(src: SourceEntry, ctx: TreeContext, block: dict, state_dir: Path) -> None:
+def _apply_source(
+    src: SourceEntry, ctx: TreeContext, block: dict, state_dir: Path, auth: HostAuth
+) -> None:
     """Apply a prepared source: manifests, then routes; record it applied only if all went well."""
     block["manifests"] = apply_tree(ctx)
     if "routes" in src.apply and ctx.role in _ENTRY_ROLES:
-        routes = render_routes(ctx)
+        routes = render_routes(ctx, auth)
         block["rendered"] = routes.rendered
         block["refusedRoutes"] = routes.refused
     record_applied(
@@ -2490,15 +2511,15 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
     scratch: Path,
     platform: Path | None,
 ) -> tuple[dict, TreeContext | None]:
-    """Converge ONE source; never raises for a source-level failure.
+    """PREPARE one source (sync/verify/archive); never raises for a source-level failure.
+
+    The apply step moved to `_run_cycle`'s second pass so every source's tree is known
+    before any renders (a delegation must be honoured in the cycle it lands, spec §3.5).
 
     Returns:
         The source's status block, and its TreeContext once the tree is verified and archived
         (None when that failed, or when the platform tree is incomplete) — the platform's
-        context is what tenant sources build on. `result` is "refused" on any failure here;
-        manifests that fail individually inside `apply_tree` are recorded in `manifests` and do
-        not refuse the source (spec §7.5). `last-applied-tag` moves only when the whole source
-        succeeded.
+        context is what tenant sources build on. `result` is "refused" on any failure here.
     """
     block: dict = {
         "result": "ok",
@@ -2530,11 +2551,33 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
     except _SOURCE_FAILURES as e:
         _refuse(src, block, e)
         return block, None
-    try:
-        _apply_source(src, ctx, block, state_dir)
-    except _SOURCE_FAILURES as e:
-        _refuse(src, block, e)
     return block, ctx
+
+
+def _host_auth(
+    platform_ctx: TreeContext | None,
+    prepared: list[tuple[SourceEntry, TreeContext]],
+) -> HostAuth:
+    """Build the cycle's host authorization from the registry and every owner's loans.
+
+    The registry is the platform tree's `tenants.yml`; without one no tenant owns
+    anything and every tenant render is refused (fail-closed, spec §3.4). Each prepared
+    tenant source lends from its own `delegations.yml`; `validate_delegations` and
+    `check_cross_zone_patterns` guard those loans before they are honoured (spec §2/§3.3).
+    """
+    registry = platform_ctx.tenants if platform_ctx is not None else None
+    if registry is None:
+        registry = TenantRegistry(tenants=[])
+    delegations: dict[str, list[Delegation]] = {
+        ctx.tenant: load_delegations(ctx.tree)
+        for _src, ctx in prepared
+        if ctx.tenant is not None
+    }
+    for owner, dels in delegations.items():
+        if dels:
+            validate_delegations(owner, dels, registry)
+    check_cross_zone_patterns(registry, delegations)
+    return HostAuth(registry, delegations)
 
 
 def _logging_status(role: str, platform_ctx: TreeContext | None) -> dict | None:
@@ -2559,12 +2602,18 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
 ) -> tuple[list[str], dict | None, bool]:
     """Converge every source, platform first; fill `blocks`.
 
+    Two passes: first PREPARE every source (fetch/verify/archive) and keep its context, so
+    all of a cycle's trees — and thus every owner's delegations.yml — are known before any
+    render; then build the host authorization (spec §3) and APPLY each prepared source
+    against it. A delegation declared by a later source is therefore effective in the same
+    cycle (spec §3.5).
+
     Returns:
         (orphan warnings, logging status, whether every source converged).
     """
     with tempfile.TemporaryDirectory(dir=state_dir, prefix="run.") as scratch:
+        prepared: list[tuple[SourceEntry, TreeContext]] = []
         platform_ctx: TreeContext | None = None
-        trees: list[Path] = []
         for src in sources:
             blocks[src.name], ctx = _converge_source(
                 src,
@@ -2576,8 +2625,15 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
                 platform=platform_ctx.tree if platform_ctx else None,
             )
             if ctx is not None:
-                trees.append(ctx.tree)
+                prepared.append((src, ctx))
                 platform_ctx = ctx if src.is_platform else platform_ctx
+        auth = _host_auth(platform_ctx, prepared)
+        for src, ctx in prepared:
+            try:
+                _apply_source(src, ctx, blocks[src.name], state_dir, auth)
+            except _SOURCE_FAILURES as e:
+                _refuse(src, blocks[src.name], e)
+        trees = [ctx.tree for _src, ctx in prepared]
         clean = all(b["result"] == "ok" for b in blocks.values())
         # A refused source has no tree this cycle, so its apps would all read as orphans;
         # only a clean cycle can tell what is really undeclared.
@@ -3038,7 +3094,7 @@ def _render_routers(
     org: Org,
     *,
     tenant: str | None,
-    domains: list[str] | None,
+    auth: HostAuth | None,
     platform_facilities: list[Facility] | None = None,
 ) -> RouteResult:
     """On the edge: render a router for EVERY Deployment with ingress (spec §6).
@@ -3055,9 +3111,10 @@ def _render_routers(
         tree: Root of the manifest tree the loop pulled.
         org: The validated org manifest, source of every backend private IP.
         tenant: The source's tenant name, or None for the platform source.
-        domains: The tenant allowlist (spec §4 anti-hijack). When set, an ingress
-            whose host is in no allowed domain is REFUSED — recorded, never written.
-            None (the platform source) writes every host.
+        auth: The cycle's host authorization (spec §3), consulted only for a tenant
+            source: an ingress whose host resolves to anyone but `tenant` is REFUSED —
+            recorded, never written. None with a tenant present refuses every host
+            (fail-closed); None with tenant None is the ungated platform render.
         platform_facilities: The PLATFORM tree's facilities, when the caller has
             them (a tenant source ships none). The fleet-wide `router` lives in
             the platform source, so `router_present` must be read from here — not
@@ -3089,14 +3146,15 @@ def _render_routers(
         placement = manifest.spec.placement
         if placement is not None and placement.role in _ENTRY_ROLES:
             continue
-        if domains is not None:
+        if tenant is not None:
             allowed = []
             for ing in ingress:
                 host = str(ing.get("host", ""))
-                if host_in_domains(host, domains):
+                owner = auth.resolve(host) if auth is not None else None
+                if owner == tenant:
                     allowed.append(ing)
                 else:
-                    line = f"REFUSED route {host}: not in tenant {tenant} domains"
+                    line = f"REFUSED route {host}: owned/delegated by {owner or 'the platform'}"
                     refused.append(line)
                     print(line, file=sys.stderr)
             if not allowed:
@@ -3114,27 +3172,25 @@ def _render_routers(
 
 
 def render_edge_routers(tree: Path, org: Org) -> list[str]:
-    """The platform edge render: every host, no tenant allowlist. Returns the names written."""
-    return _render_routers(tree, org, tenant=None, domains=None).rendered
+    """The platform edge render: every host, no tenant gate. Returns the names written."""
+    return _render_routers(tree, org, tenant=None, auth=None).rendered
 
 
-def render_routes(ctx: TreeContext) -> RouteResult:
-    """On the edge: render ONE source's routers, applying the tenant domain allowlist.
+def render_routes(ctx: TreeContext, auth: HostAuth | None = None) -> RouteResult:
+    """On the edge: render ONE source's routers through the host authorization (spec §3).
 
     The platform source (ctx.tenant is None) is unconstrained — it owns the platform
-    domains. A tenant source may only route hosts in its own `domains` from the
-    platform tenants.yml (spec §4 anti-hijack); a tenant missing from the registry, or
-    a platform tree with no tenants.yml, gets an empty allowlist and routes nothing
-    (fail-closed).
+    domains. A tenant source renders only the hosts `auth` names as its own; without an
+    authorization it renders nothing (fail-closed).
     """
     if ctx.org is None:
         return RouteResult([], [])
-    domains: list[str] | None = None
-    if ctx.tenant is not None:
-        row = ctx.tenants.get(ctx.tenant) if ctx.tenants is not None else None
-        domains = row.domains if row is not None else []
     return _render_routers(
-        ctx.tree, ctx.org, tenant=ctx.tenant, domains=domains, platform_facilities=ctx.facilities
+        ctx.tree,
+        ctx.org,
+        tenant=ctx.tenant,
+        auth=auth,
+        platform_facilities=ctx.facilities,
     )
 
 
