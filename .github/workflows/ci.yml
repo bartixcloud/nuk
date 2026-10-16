@@ -27,6 +27,7 @@ jobs:
         uses: astral-sh/setup-uv@v9.0.0
         with:
           python-version: "3.13"   # matches requires-python>=3.13
+          version: "0.13.1"        # pinned: uv.lock's revision field is version-sensitive
 
       - name: Ruff lint
         run: uvx ruff@0.15.15 check .

@@ -11,6 +11,8 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from conftest import stub_apply as _stub_apply
+
 if TYPE_CHECKING:
     from pathlib import Path
 
@@ -186,30 +188,6 @@ def _blue_green_yml(
             health: {health}
             keepPrevious: {keep}
     """).lstrip()
-
-
-def _stub_apply(
-    tmp_path: Path,
-    monkeypatch,
-    lines: list[tuple[str, ...]],
-    *,
-    real_override: bool = False,
-) -> None:
-    """Stub everything cmd_apply touches outside the tree; record `sh` calls."""
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
-    monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
-    monkeypatch.setattr(nuk, "_is_privileged", lambda: True)
-    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
-    monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
-    monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
-    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
-    if not real_override:
-        monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
-    monkeypatch.setattr(nuk, "persist_manifest", lambda *_a: None)
-    monkeypatch.setattr(nuk, "write_provenance", lambda *_a, **_k: None)
-    monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["compose", "-p", "kolbe"])
-    monkeypatch.setattr(nuk, "sh", lambda *cmd, **_k: lines.append(cmd))
 
 
 def _profile_up(lines: list[tuple[str, ...]]) -> list[tuple[str, ...]]:

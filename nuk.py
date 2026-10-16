@@ -41,6 +41,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    StringConstraints,
     TypeAdapter,
     ValidationError,
     model_validator,
@@ -343,14 +344,16 @@ class Migrate(_NullTolerant):
 
     nuk owns *when* (before the idle colour comes up, gated to a new rollout);
     the app declares *how*: a compose service whose image/env nuk reuses, and
-    the command to run in it.
+    the command to run in it. `command` is split with `shlex.split` and passed
+    as argv — shell syntax (`&&`, pipes, globs, quotes beyond grouping) does not
+    apply, so wrap a compound command as `sh -c '…'`.
     """
 
     model_config = ConfigDict(populate_by_name=True)
 
-    service: str
-    command: str
-    timeout: int = 300
+    service: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    command: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    timeout: int = Field(default=300, gt=0)
 
 
 class Spec(_NullTolerant):
@@ -4157,7 +4160,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         colours=router_colours,
     )
     migrate = manifest.spec.migrate
-    if migrate is not None and pin_digest is None:
+    if manifest.kind == "Deployment" and migrate is not None and pin_digest is None:
         # Before the rollout. A digest-path rollback (`pin_digest`, set only by
         # `cmd_rollback`) never migrates — forward-only, and the recorded
         # revision it restores may predate the current migration head. A
@@ -4210,17 +4213,23 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         print(f"{name}: provenance not recorded ({e})")
 
 
-def _migrate_service(name: str, migrate: Migrate, strategy: Strategy | None) -> str:
-    """The compose service the migration runs in.
+def _migrate_colour(name: str, strategy: Strategy | None) -> str | None:
+    """The idle colour a migration targets, or None for a colourless app.
 
-    A blue-green deployment's services are colour-suffixed (`backend-blue`), and
-    the migration must run the rollout's target image — so, like the health probe
-    (`strategy.health.service`), the name is suffixed with the idle colour. A
-    deployment with no strategy uses the name verbatim.
+    A blue-green deployment's compose services are colour-suffixed
+    (`backend-blue`), and the migration must run the image the rollout is about
+    to bring up — so, like the health probe (`strategy.health.service`), the
+    service is suffixed with the idle colour and its compose profile enabled.
     """
     if strategy is not None and strategy.type == "blue-green":
-        return f"{migrate.service}-{idle_colour(active_colour(name))}"
-    return migrate.service
+        return idle_colour(active_colour(name))
+    return None
+
+
+def _migrate_service(name: str, migrate: Migrate, strategy: Strategy | None) -> str:
+    """The compose service the migration runs in (colour-suffixed when blue-green)."""
+    colour = _migrate_colour(name, strategy)
+    return f"{migrate.service}-{colour}" if colour else migrate.service
 
 
 def _run_migrations(
@@ -4234,8 +4243,11 @@ def _run_migrations(
     The digest is recorded only after success, so a crash mid-migration re-runs.
     """
     service = _migrate_service(name, migrate, strategy)
+    colour = _migrate_colour(name, strategy)
+    profile = ["--profile", colour] if colour else []
     argv = [
         *compose_args(name, raw),
+        *profile,
         "run",
         "--rm",
         "--no-deps",

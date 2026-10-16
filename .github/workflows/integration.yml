@@ -43,6 +43,7 @@ jobs:
         uses: astral-sh/setup-uv@v7
         with:
           python-version: "3.13"
+          version: "0.13.1"        # pinned: uv.lock's revision field is version-sensitive
 
       - name: DB integration tier (real postgres + redis)
         env:

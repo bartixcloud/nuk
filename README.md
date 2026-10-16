@@ -173,11 +173,18 @@ spec:
   migrate: {service: backend, command: "alembic upgrade head", timeout: 300}
 ```
 
-nuk runs `docker compose … run --rm --no-deps <service> <command>` in the app's env
-and network. It fails the deploy on a non-zero exit or timeout (the previous colour
-keeps serving), runs only when the app image digest changes (repeat converge cycles
-skip it), and never runs on a rollback. **Migrations must be expand/contract** — the
-old colour serves while the migration runs.
+`service` names a compose service (nuk reuses its image, env and network); on a
+blue-green app give the colour-agnostic name — nuk appends the idle colour and
+enables that profile, exactly as `spec.strategy.health.service` is suffixed for the
+probe. `command` is split with `shlex` and passed as argv, so shell syntax does not
+apply (wrap a compound command as `sh -c '…'`).
+
+nuk runs `docker compose … run --rm --no-deps <service> <command>`. It fails the
+deploy on a non-zero exit or timeout (the previous colour keeps serving), runs only
+when the **configured** image digest changes (the converge loop re-applies every
+cycle, and a plain `docker compose images` reports the previous release), and never
+runs on a rollback. **Migrations must be expand/contract** — the old colour serves
+while the migration runs.
 
 ## Development
 
