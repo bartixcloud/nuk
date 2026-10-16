@@ -328,31 +328,6 @@ def test_org_private_ip_must_match_subnet():
         nuk.Org.model_validate(_hosts(wrong))
 
 
-# --- ingress-host coverage ---------------------------------------------------
-
-
-def _manifest(host: str) -> nuk.Deployment:
-    return nuk.Deployment.model_validate(
-        {
-            "apiVersion": "nuk/v1",
-            "kind": "Deployment",
-            "metadata": {"name": "app"},
-            "spec": {"ingress": [{"host": host, "service": "web", "port": 80}]},
-        }
-    )
-
-
-def test_validate_ingress_hosts_accepts_managed_domain():
-    org = nuk.Org.model_validate(ORG_DOC)
-    nuk.validate_ingress_hosts(org, _manifest("cognee.bitcoinalchemist.com"))  # no raise
-
-
-def test_validate_ingress_hosts_rejects_foreign_domain():
-    org = nuk.Org.model_validate(ORG_DOC)
-    with pytest.raises(SystemExit):
-        nuk.validate_ingress_hosts(org, _manifest("cognee.example.org"))
-
-
 # --- loader / accessor -------------------------------------------------------
 
 

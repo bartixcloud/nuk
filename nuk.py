@@ -681,21 +681,6 @@ class Org(BaseModel):
         return None
 
 
-def validate_ingress_hosts(org: Org, manifest: Deployment | Facility) -> None:
-    """Assert every ingress host in `manifest` ends on one of the org's domains.
-
-    Args:
-        org: The validated Org (its `domains` are the managed set).
-        manifest: A deployment manifest whose ingress hosts must be covered.
-
-    Raises:
-        NukError: If any ingress host is not under a managed domain.
-    """
-    for ing in manifest.spec.ingress:
-        if not any(ing.host == d or ing.host.endswith(f".{d}") for d in org.domains):
-            die(f"nuk: ingress host {ing.host!r} is not under a managed domain {org.domains}")
-
-
 def sh(
     *cmd: str,
     cwd: Path | None = None,
@@ -3089,6 +3074,41 @@ class RouteResult:
     refused: list[str]
 
 
+def _refuse_route(host: str, owner: str | None, refused: list[str]) -> None:
+    """Record and announce a host this source is not authorized to render (spec §3/§6)."""
+    line = f"REFUSED route {host}: owned/delegated by {owner or 'the platform'}"
+    refused.append(line)
+    print(line, file=sys.stderr)
+
+
+def _authorized_ingress(
+    ingress: list[dict], tenant: str, auth: HostAuth | None, refused: list[str]
+) -> list[dict]:
+    """The ingress entries a tenant source may render, `www.` included (spec §3/§6).
+
+    A host resolving to anyone but `tenant` is refused. `www.<host>` is a second,
+    independently-resolved host: the same loan that authorizes `<host>` must cover it
+    too, or the redirect router is an unauthenticated hijack vector. Without that
+    coverage the variant is dropped — the apex router still renders.
+    """
+    allowed: list[dict] = []
+    for ing in ingress:
+        host = str(ing.get("host", ""))
+        owner = auth.resolve(host) if auth is not None else None
+        if owner != tenant:
+            _refuse_route(host, owner, refused)
+            continue
+        entry = ing
+        if ing.get("www"):
+            www_host = f"www.{host}"
+            www_owner = auth.resolve(www_host) if auth is not None else None
+            if www_owner != tenant:
+                _refuse_route(www_host, www_owner, refused)
+                entry = {k: v for k, v in ing.items() if k != "www"}
+        allowed.append(entry)
+    return allowed
+
+
 def _render_routers(
     tree: Path,
     org: Org,
@@ -3107,14 +3127,21 @@ def _render_routers(
     from git is destructive, and the loop reports rather than deletes (spec §7.4).
     The one bounded exception is the legacy `worker-` prefix (reap_legacy_worker_routers).
 
+    A tenant source's router set is authoritative (spec §5): a render that allows none
+    of a deployment's hosts withdraws the file it wrote before, rather than leaving a
+    lent host live — revocation. Only the source's own router file is touched; a foreign
+    file is never deleted.
+
     Args:
         tree: Root of the manifest tree the loop pulled.
         org: The validated org manifest, source of every backend private IP.
         tenant: The source's tenant name, or None for the platform source.
         auth: The cycle's host authorization (spec §3), consulted only for a tenant
             source: an ingress whose host resolves to anyone but `tenant` is REFUSED —
-            recorded, never written. None with a tenant present refuses every host
-            (fail-closed); None with tenant None is the ungated platform render.
+            recorded, never written. The `www.<host>` variant (spec §6) is resolved the
+            same way and is omitted when it is not covered, leaving the apex router. None
+            with a tenant present refuses every host (fail-closed); None with tenant None
+            is the ungated platform render.
         platform_facilities: The PLATFORM tree's facilities, when the caller has
             them (a tenant source ships none). The fleet-wide `router` lives in
             the platform source, so `router_present` must be read from here — not
@@ -3147,17 +3174,12 @@ def _render_routers(
         if placement is not None and placement.role in _ENTRY_ROLES:
             continue
         if tenant is not None:
-            allowed = []
-            for ing in ingress:
-                host = str(ing.get("host", ""))
-                owner = auth.resolve(host) if auth is not None else None
-                if owner == tenant:
-                    allowed.append(ing)
-                else:
-                    line = f"REFUSED route {host}: owned/delegated by {owner or 'the platform'}"
-                    refused.append(line)
-                    print(line, file=sys.stderr)
+            allowed = _authorized_ingress(ingress, tenant, auth, refused)
             if not allowed:
+                # Revocation (spec §5): the owner's router set is authoritative, so a
+                # render that allows none of the deployment's hosts withdraws the file
+                # it wrote before. It never touches another owner's routers.
+                write_ingress(manifest.metadata.name, [], vocab)
                 continue
             ingress = allowed
         resolved = [
