@@ -859,7 +859,7 @@ def test_data_stack_compose_is_vendored_and_well_formed():
     """
     from pathlib import Path
 
-    path = Path(nuk.__file__).parent / "files" / "docker-compose.data.yml"
+    path = Path(nuk.__file__).parent.parent / "files" / "docker-compose.data.yml"
     doc = yaml.safe_load(path.read_text())
     svcs = doc["services"]
     cnames = {s.get("container_name") for s in svcs.values()}

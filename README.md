@@ -223,7 +223,7 @@ manifest `load()` boundary and in the command layer.
 ## Releasing
 
 On push to `main`, `.github/workflows/release.yml` derives the next version from
-conventional commits, stamps it into `nuk.py` + `pyproject.toml`, and creates the tag +
+conventional commits, stamps it into `nuk/__init__.py` + `pyproject.toml`, and creates the tag +
 GitHub release — no PR, no build/deploy step. Nothing is built or attached to the
 release: `nuk update` (and `uv tool install --from git+...`) install straight from the
 tagged source, so the tag existing is the whole deliverable.

@@ -25,7 +25,7 @@ import pytest
 
 pytestmark = pytest.mark.integration
 
-COMPOSE = Path(nuk.__file__).parent / "files" / "docker-compose.data.yml"
+COMPOSE = Path(nuk.__file__).parent.parent / "files" / "docker-compose.data.yml"
 APP = "itest_app"
 
 
