@@ -760,6 +760,7 @@ def load_org(path: Path) -> Org:
 
 TENANTS_FILE = "tenants.yml"
 DELEGATIONS_FILE = "delegations.yml"
+DELEGATIONS_CACHE_FILE = "delegations.json"
 
 
 class TenantRow(BaseModel):
@@ -870,6 +871,45 @@ def load_delegations(tree: Path) -> list[Delegation]:
         return Delegations.model_validate(raw).spec.delegations
     except ValidationError as e:
         die(f"{path}: invalid delegations manifest\n{e}")
+
+
+def store_delegations(state_dir: Path, owner: str, dels: list[Delegation]) -> None:
+    """Persist `owner`'s last verified loans under its source state (spec §4).
+
+    Overwritten on every successful fetch, so the cache always holds the newest
+    VERIFIED state and never a merely fetched one.
+    """
+    path = source_state_dir(state_dir, owner) / DELEGATIONS_CACHE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = Delegations(
+        apiVersion="nuk/v1",
+        kind="Delegations",
+        metadata=Metadata(name=owner),
+        spec=DelegationsSpec(delegations=dels),
+    )
+    path.write_text(doc.model_dump_json(by_alias=True) + "\n", encoding="utf-8")
+
+
+def load_cached_delegations(state_dir: Path, owner: str) -> list[Delegation]:
+    """The last verified loans of `owner`, or `[]` when none are cached (spec §4).
+
+    A missing cache lends nothing (fail-closed: the first run has no loans yet); a
+    corrupt one is a refusal, like a malformed `delegations.yml`.
+
+    Raises:
+        NukError: If the cache exists but is unreadable or invalid.
+    """
+    path = source_state_dir(state_dir, owner) / DELEGATIONS_CACHE_FILE
+    if not path.is_file():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as e:
+        die(f"{path}: {e}")
+    try:
+        return Delegations.model_validate_json(raw).spec.delegations
+    except ValidationError as e:
+        die(f"{path}: invalid cached delegations\n{e}")
 
 
 def load_tenants(tree: Path) -> TenantRegistry:
@@ -2542,26 +2582,39 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
 def _host_auth(
     platform_ctx: TreeContext | None,
     prepared: list[tuple[SourceEntry, TreeContext]],
+    *,
+    state_dir: Path,
+    refused: list[SourceEntry],
 ) -> HostAuth:
     """Build the cycle's host authorization from the registry and every owner's loans.
 
     The registry is the platform tree's `tenants.yml`; without one no tenant owns
     anything and every tenant render is refused (fail-closed, spec §3.4). Each prepared
-    tenant source lends from its own `delegations.yml`; `validate_delegations` and
-    `check_cross_zone_patterns` guard those loans before they are honoured (spec §2/§3.3).
+    tenant source lends from its own `delegations.yml`; a REFUSED one instead lends its
+    last VERIFIED loans from the cache, so a foreign fetch failure cannot pull a lent
+    name away (spec §4). `validate_delegations` and `check_cross_zone_patterns` guard
+    those loans — cached ones included — before they are honoured (spec §2/§3.3), and
+    only then is the verified state written back to each prepared owner's cache.
     """
     registry = platform_ctx.tenants if platform_ctx is not None else None
     if registry is None:
         registry = TenantRegistry(tenants=[])
-    delegations: dict[str, list[Delegation]] = {
-        ctx.tenant: load_delegations(ctx.tree)
-        for _src, ctx in prepared
-        if ctx.tenant is not None
-    }
+    delegations: dict[str, list[Delegation]] = {}
+    for _src, ctx in prepared:
+        if ctx.tenant is not None:
+            delegations[ctx.tenant] = load_delegations(ctx.tree)
+    for src in refused:
+        # Without a verified platform tree there is no registry to authorize against, so
+        # the cache would add nothing but a spurious "not in the registry" refusal.
+        if not src.is_platform and platform_ctx is not None:
+            delegations[src.name] = load_cached_delegations(state_dir, src.name)
     for owner, dels in delegations.items():
         if dels:
             validate_delegations(owner, dels, registry)
     check_cross_zone_patterns(registry, delegations)
+    for _src, ctx in prepared:
+        if ctx.tenant is not None:
+            store_delegations(state_dir, ctx.tenant, delegations[ctx.tenant])
     return HostAuth(registry, delegations)
 
 
@@ -2598,6 +2651,7 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
     """
     with tempfile.TemporaryDirectory(dir=state_dir, prefix="run.") as scratch:
         prepared: list[tuple[SourceEntry, TreeContext]] = []
+        refused: list[SourceEntry] = []
         platform_ctx: TreeContext | None = None
         for src in sources:
             blocks[src.name], ctx = _converge_source(
@@ -2612,7 +2666,9 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
             if ctx is not None:
                 prepared.append((src, ctx))
                 platform_ctx = ctx if src.is_platform else platform_ctx
-        auth = _host_auth(platform_ctx, prepared)
+            else:
+                refused.append(src)
+        auth = _host_auth(platform_ctx, prepared, state_dir=state_dir, refused=refused)
         for src, ctx in prepared:
             try:
                 _apply_source(src, ctx, blocks[src.name], state_dir, auth)

@@ -10,6 +10,7 @@ HERMETICITY: git runs with GIT_CONFIG_GLOBAL/SYSTEM pointed nowhere, so a develo
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import textwrap
 
@@ -568,6 +569,63 @@ def test_delegation_from_a_later_source_is_effective_in_the_same_cycle(
     assert block["refusedRoutes"] == []
     assert block["rendered"] == ["kolbe"]
     assert (nuk.DYNAMIC / "kolbe.yml").is_file()
+
+
+def test_failed_owner_fetch_falls_back_to_the_last_verified_delegations(
+    tmp_path, monkeypatch, signing_keys
+):
+    """A foreign fetch failure must not pull the lent names away (spec §4).
+
+    First cycle: astrojones verifies and its loans are cached. Second cycle: its fetch
+    fails, so the cached loans stand and kolbeapp-de keeps rendering kolbe.
+    """
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
+    platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
+    f = Fleet(tmp_path, platform, signing_keys)
+    f.origins["kolbeapp-de"].release("v1.0.0", {"deployments/kolbe.yml": KOLBE})
+    f.origins["astrojones"].release("v1.1.0", {nuk.DELEGATIONS_FILE: DELEGATING})
+    f.use(
+        ("bartixcloud", ["facilities"]),
+        ("kolbeapp-de", ["deployments", "routes"]),
+        ("astrojones", ["deployments"]),
+    )
+    assert f.converge() == 0
+    assert f.status()["sources"]["kolbeapp-de"]["rendered"] == ["kolbe"]
+    (nuk.DYNAMIC / "kolbe.yml").unlink()
+
+    shutil.rmtree(f.origins["astrojones"].bare)  # the owner's repo is unreachable now
+
+    assert f.converge() == 1  # astrojones is refused this cycle…
+    sources = f.status()["sources"]
+    assert sources["astrojones"]["result"] == "refused"
+    assert "git fetch failed" in sources["astrojones"]["error"]
+    # …but the last verified loans still authorize the render.
+    assert f.status()["sources"]["kolbeapp-de"]["rendered"] == ["kolbe"]
+    assert (nuk.DYNAMIC / "kolbe.yml").is_file()
+
+
+def test_a_platform_outage_does_not_turn_a_cached_loan_into_a_cycle_crash(fleet):
+    """No platform tree, no registry to authorize against — so refuse, never die (spec §3.4).
+
+    Cached loans must not be validated against the absent registry: that would abort the
+    whole cycle instead of the fail-closed refusal every tenant source already gets.
+    """
+    nuk.store_delegations(
+        fleet.state, "astrojones", [nuk.Delegation(host="x.de", to="y")]
+    )
+    origin = fleet.origins["bartixcloud"]
+    origin.delete_tag("v1.0.0")
+    origin.release("v1.1.0", {"x": "1\n"}, sign=False)
+
+    assert fleet.converge() == 1
+    sources = fleet.status()["sources"]
+    assert sources["bartixcloud"]["result"] == "refused"
+    assert sources["astrojones"]["result"] == "refused"
+    assert "did not verify this cycle" in sources["astrojones"]["error"]
 
 
 # --- reap -------------------------------------------------------------------------------

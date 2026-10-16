@@ -157,3 +157,15 @@ def test_validate_delegation_accepts_owner_zones_and_empty_target_domains():
     nuk.validate_delegations(
         "astrojones", [nuk.Delegation(host="kolbe.astrojones.guru", to="kolbeapp-de")], reg
     )  # no raise
+
+
+def test_store_and_load_roundtrip(tmp_path):
+    nuk.store_delegations(
+        tmp_path, "astrojones", [nuk.Delegation(host="k.astrojones.guru", to="kolbeapp-de")]
+    )
+    cached = nuk.load_cached_delegations(tmp_path, "astrojones")
+    assert [(d.host, d.to) for d in cached] == [("k.astrojones.guru", "kolbeapp-de")]
+
+
+def test_first_run_without_cache_yields_no_delegations(tmp_path):
+    assert nuk.load_cached_delegations(tmp_path, "astrojones") == []
