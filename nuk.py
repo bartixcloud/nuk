@@ -31,7 +31,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
 from urllib.parse import urlparse
 
 import typer
@@ -48,7 +48,11 @@ from pydantic import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator
+    from collections.abc import Callable, Generator, Iterable
+
+# A parsed YAML/JSON mapping: wire-contract keys are strings, values stay untyped because
+# the manifests are validated at the edges, not here.
+type Raw = dict[str, Any]
 
 __version__ = "2.6.0"  # bumped on release by .github/workflows/release.yml
 
@@ -401,10 +405,10 @@ class Manifest(_NullTolerant):
     api_version: Literal["nuk/v1"] = Field(alias="apiVersion")
     metadata: Metadata
 
-    _raw: dict = PrivateAttr(default_factory=dict)
+    _raw: Raw = PrivateAttr(default_factory=dict)
 
     @property
-    def raw(self) -> dict:
+    def raw(self) -> Raw:
         """The original parsed manifest dict (wire-contract input)."""
         return self._raw
 
@@ -1305,7 +1309,7 @@ def origin_org(repo_path: str = ".") -> str | None:
     return m.group(1) if m else None
 
 
-def persist_manifest(spec: dict, src_path: Path, dest: Path, repo_path: str | None) -> None:
+def persist_manifest(spec: Raw, src_path: Path, dest: Path, repo_path: str | None) -> None:
     """Write the deployment manifest to the controller for nukview to read.
 
     Copied verbatim, except: when applied with --repo-path and the manifest did
@@ -1330,7 +1334,7 @@ def persist_manifest(spec: dict, src_path: Path, dest: Path, repo_path: str | No
         shutil.copy(src_path, dest)
 
 
-def _compose_file(spec: dict) -> str:
+def _compose_file(spec: Raw) -> str:
     """Read `compose.file` from a raw `spec` dict.
 
     Accepts the bare-string form (`compose: foo.yml`), the mapping form
@@ -1345,7 +1349,7 @@ def _compose_file(spec: dict) -> str:
     return "docker-compose.yml"
 
 
-def compose_args(name: str, spec: dict) -> list[str]:
+def compose_args(name: str, spec: Raw) -> list[str]:
     """Build the `docker compose` base argv for an app from its raw spec."""
     repo = _repo_dir(name)
     spec_body = spec.get("spec") or {}
@@ -1359,7 +1363,7 @@ def compose_args(name: str, spec: dict) -> list[str]:
     return args
 
 
-def resolve_env_from(spec: dict) -> list[str]:
+def resolve_env_from(spec: Raw) -> list[str]:
     """Resolve `spec.envFrom[].secretRef` entries to existing file paths.
 
     Uses the same resolution `compose_args` applies for `--env-file`: an entry
@@ -1382,7 +1386,7 @@ def resolve_env_from(spec: dict) -> list[str]:
 
 def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-contract API; one render pass
     name: str,  # noqa: ARG001  # kept for signature stability (frozen wire-contract API / tests)
-    ingress: list[dict],
+    ingress: list[Raw],
     db_env: str | None = None,
     env_from: list[str] | None = None,
     db_services: list[str] | None = None,
@@ -1390,7 +1394,7 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
     local_data: bool = True,
     *,
     colours: list[str] | None = None,
-) -> dict | None:
+) -> Raw | None:
     """Compose override wiring services to the shared edge/data networks + secrets.
 
     Each service gets an `env_file` list so its container actually receives the
@@ -1456,7 +1460,7 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
                 publish_ports.setdefault(svc, [])
                 if mapping not in publish_ports[svc]:
                     publish_ports[svc].append(mapping)
-    services: dict = {}
+    services: dict[str, dict[str, list[str]]] = {}
     uses_edge = False
     uses_data = False
     for svc_name in ordered:
@@ -1468,12 +1472,12 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
         )
         uses_edge = uses_edge or "edge" in nets
         uses_data = uses_data or "data" in nets
-        env_files = [*env_from, *([db_env] if is_db else [])]
+        env_files = [*env_from, *([db_env] if is_db and db_env else [])]
         # Router mode expands each base service onto its colour profile keys, so
         # the same wiring (networks, creds, no published port) lands on the
         # containers the router actually resolves.
         for key in [f"{svc_name}-{c}" for c in colours] if colours else [svc_name]:
-            svc: dict = {"networks": list(nets)}
+            svc: dict[str, list[str]] = {"networks": list(nets)}
             if publish_ip and svc_name in publish_ports:
                 svc["ports"] = list(publish_ports[svc_name])
             if env_files:
@@ -1481,7 +1485,7 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
             services[key] = svc
     if not services:
         return None
-    networks: dict = {}
+    networks: dict[str, dict[str, bool]] = {}
     if uses_edge:
         networks["edge"] = {"external": True}
     if uses_data:
@@ -1489,7 +1493,7 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
     return {"services": services, "networks": networks}
 
 
-def _published_port(ing: dict) -> int:
+def _published_port(ing: Raw) -> int:
     """The host port a non-entry host publishes an ingress on: `hostPort`, else `port`.
 
     The publish (build_override) and the edge's backend (backend_address) must agree.
@@ -1499,7 +1503,7 @@ def _published_port(ing: dict) -> int:
 
 def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override's frozen API
     name: str,
-    ingress: list[dict],
+    ingress: list[Raw],
     db_env: str | None = None,
     env_from: list[str] | None = None,
     db_services: list[str] | None = None,
@@ -1517,7 +1521,7 @@ def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override
     (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc))
 
 
-def compose_service_names(name: str, raw: dict) -> list[str]:
+def compose_service_names(name: str, raw: Raw) -> list[str]:
     """Return the service names declared in an app's checked-out compose file.
 
     Used by `attachAll` to enumerate every service that should receive the DB
@@ -1539,7 +1543,7 @@ def compose_service_names(name: str, raw: dict) -> list[str]:
     return list((doc.get("services") or {}).keys())
 
 
-def resolve_db_services(name: str, raw: dict, db_env: str | None) -> list[str]:
+def resolve_db_services(name: str, raw: Raw, db_env: str | None) -> list[str]:
     """Resolve which compose services the provisioned DB creds attach to.
 
     Precedence: `attachAll` (every compose service) > `attachTo` (explicit list)
@@ -1565,7 +1569,7 @@ def resolve_db_services(name: str, raw: dict, db_env: str | None) -> list[str]:
     return [ing["service"] for ing in raw["spec"].get("ingress", []) or []]
 
 
-def _rule(ing: dict) -> str:
+def _rule(ing: Raw) -> str:
     """Build the Traefik router rule for one ingress entry."""
     rule = f"Host(`{ing['host']}`)"
     if ing.get("path"):
@@ -1597,12 +1601,12 @@ def _container_name(name: str, service: str, colour: str | None = None) -> str:
 
 def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; clean extraction would obscure the per-field ordering
     name: str,
-    ingress: list[dict],
+    ingress: list[Raw],
     vocab: dict[str, list[str]],
     *,
     colour: str | None = None,
     dialect: str = "edge",
-) -> dict | None:
+) -> Raw | None:
     """Render the Traefik file-provider doc, or None to remove the dynamic file.
 
     Each entry needs host + (service/port, a local docker "edge"-network
@@ -1724,7 +1728,7 @@ def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; cle
 
 def write_ingress(
     name: str,
-    ingress: list[dict],
+    ingress: list[Raw],
     vocab: dict[str, list[str]],
     *,
     colour: str | None = None,
@@ -2157,7 +2161,7 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
 
 
 @contextmanager
-def converge_lock(state_dir: Path) -> Iterator[bool]:
+def converge_lock(state_dir: Path) -> Generator[bool]:
     """Hold the whole-cycle lock, yielding False if another run already holds it.
 
     Non-blocking, and contention is exit 0: a skipped cycle is harmless because
@@ -2217,7 +2221,7 @@ def provision_remote_databases(
     *,
     self_ip: str | None = None,
     org: Org | None = None,
-) -> list[dict]:
+) -> list[dict[str, str | None]]:
     """Provision every deployment's databases on this host IF it owns the capability.
 
     The placement-gate exception (spec §3.1): a deployment placed `app` is a
@@ -2231,7 +2235,7 @@ def provision_remote_databases(
     provider = env_facility(facilities, _DATABASES_CAPABILITY)
     if provider is None or not placement_matches(provider, role, self_ip=self_ip, org=org):
         return []
-    out: list[dict] = []
+    out: list[dict[str, str | None]] = []
     for path in sorted((tree / DEPLOYMENT_DIR).glob("*.yml")):
         try:
             manifest = load(path)
@@ -2262,7 +2266,7 @@ def provision_remote_databases(
     return out
 
 
-def _result(name: str, kind: str, result: str = "ok", error: str | None = None) -> dict:
+def _result(name: str, kind: str, result: str = "ok", error: str | None = None) -> dict[str, str | None]:
     """One converge-status manifest entry (spec §7.6)."""
     return {"name": name, "kind": kind, "result": result, "error": error}
 
@@ -2288,7 +2292,7 @@ def _deployment_tree(ctx: TreeContext, manifest: Deployment, path: Path) -> Path
     return branch / path.relative_to(ctx.tree)
 
 
-def apply_tree(ctx: TreeContext) -> list[dict]:  # noqa: C901  # placement ambiguity is recorded per manifest, not raised out of the loop
+def apply_tree(ctx: TreeContext) -> list[dict[str, str | None]]:  # noqa: C901  # placement ambiguity is recorded per manifest, not raised out of the loop
     """Apply this host's Facilities, then its Deployments (spec §7 steps 6-7).
 
     Facilities first within a cycle (§7.1): effect VOCABULARY is git-derived and
@@ -2319,7 +2323,7 @@ def apply_tree(ctx: TreeContext) -> list[dict]:  # noqa: C901  # placement ambig
         "ok", "failed", or "refused".
     """
     tree, role = ctx.tree, ctx.role
-    results: list[dict] = []
+    results: list[dict[str, str | None]] = []
     failed_caps: set[str] = set()
     for kind, directory in (("Facility", FACILITY_DIR), ("Deployment", DEPLOYMENT_DIR)):
         if directory not in ctx.apply:
@@ -2437,9 +2441,9 @@ def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a d
     *,
     role: str,
     tenant: str | None,
-    sources: dict[str, dict],
+    sources: dict[str, Raw],
     warnings: list[str],
-    logging: dict | None = None,
+    logging: dict[str, bool | str] | None = None,
     error: str | None = None,
 ) -> None:
     """Record the cycle's outcome (spec §7.6, contracts C3).
@@ -2452,7 +2456,7 @@ def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a d
 
     Consumed by `drift.sh` and by `nuk status`.
     """
-    payload: dict = {
+    payload: Raw = {
         "role": role,
         "tenant": tenant,
         "appliedAt": _iso_utc_now(),
@@ -2466,7 +2470,7 @@ def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a d
     _atomic_write(path, json.dumps(payload, indent=2) + "\n")
 
 
-def read_converge_status(path: Path = CONVERGE_STATUS) -> dict | None:
+def read_converge_status(path: Path = CONVERGE_STATUS) -> Raw | None:
     """The last recorded cycle, or None if absent/unreadable/malformed."""
     data = _read_json_safe(path)
     return data if isinstance(data, dict) else None
@@ -2477,7 +2481,7 @@ _SOURCE_FAILURES = (ValueError, SystemExit, subprocess.CalledProcessError, OSErr
 
 def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are all read, none derived
     src: SourceEntry,
-    block: dict,
+    block: Raw,
     *,
     role: str,
     self_ip: str | None,
@@ -2525,7 +2529,7 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
 
 
 def _apply_source(
-    src: SourceEntry, ctx: TreeContext, block: dict, state_dir: Path, auth: HostAuth
+    src: SourceEntry, ctx: TreeContext, block: Raw, state_dir: Path, auth: HostAuth
 ) -> None:
     """Apply a prepared source: manifests, then routes; record it applied only if all went well."""
     block["manifests"] = apply_tree(ctx)
@@ -2538,7 +2542,7 @@ def _apply_source(
     )
 
 
-def _refuse(src: SourceEntry, block: dict, e: BaseException) -> None:
+def _refuse(src: SourceEntry, block: Raw, e: BaseException) -> None:
     block["result"] = "refused"
     block["error"] = _exit_reason(e, "converge refused") if isinstance(e, SystemExit) else str(e)
     print(f"REFUSING source {src.name}: {block['error']}", file=sys.stderr)
@@ -2553,7 +2557,7 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
     state_dir: Path,
     scratch: Path,
     platform: Path | None,
-) -> tuple[dict, TreeContext | None]:
+) -> tuple[Raw, TreeContext | None]:
     """PREPARE one source (sync/verify/archive); never raises for a source-level failure.
 
     The apply step moved to `_run_cycle`'s second pass so every source's tree is known
@@ -2564,7 +2568,7 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
         (None when that failed, or when the platform tree is incomplete) — the platform's
         context is what tenant sources build on. `result` is "refused" on any failure here.
     """
-    block: dict = {
+    block: Raw = {
         "result": "ok",
         "error": None,
         "tag": None,
@@ -2609,7 +2613,7 @@ class _UnknownAuthorizationError(NukError):
 def _load_prepared_delegations(
     prepared: list[tuple[SourceEntry, TreeContext]],
     *,
-    blocks: dict[str, dict],
+    blocks: dict[str, Raw],
 ) -> tuple[dict[str, list[Delegation]], list[tuple[SourceEntry, TreeContext]]]:
     """Load each routable prepared owner's `delegations.yml`, refusing a malformed one (spec §2).
 
@@ -2655,7 +2659,7 @@ def _refuse_bad_declarations(
     registry: TenantRegistry,
     delegations: dict[str, list[Delegation]],
     *,
-    blocks: dict[str, dict],
+    blocks: dict[str, Raw],
 ) -> list[tuple[SourceEntry, TreeContext]]:
     """Refuse each source whose declarations do not validate; return the survivors.
 
@@ -2700,7 +2704,7 @@ def _host_auth(
     *,
     state_dir: Path,
     refused: list[SourceEntry],
-    blocks: dict[str, dict],
+    blocks: dict[str, Raw],
 ) -> tuple[HostAuth, list[tuple[SourceEntry, TreeContext]]]:
     """Build the cycle's host authorization from the registry and every owner's loans.
 
@@ -2742,7 +2746,7 @@ def _host_auth(
     return HostAuth(registry, delegations), surviving
 
 
-def _logging_status(role: str, platform_ctx: TreeContext | None) -> dict | None:
+def _logging_status(role: str, platform_ctx: TreeContext | None) -> dict[str, bool | str] | None:
     """The LOGGING pipeline's own health (spec §14.3): info-only, edge cycles only."""
     if role != "edge" or platform_ctx is None:
         return None
@@ -2755,13 +2759,13 @@ def _logging_status(role: str, platform_ctx: TreeContext | None) -> dict | None:
 
 def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
     sources: list[SourceEntry],
-    blocks: dict[str, dict],
+    blocks: dict[str, Raw],
     *,
     role: str,
     self_ip: str | None,
     signers_dir: Path,
     state_dir: Path,
-) -> tuple[list[str], dict | None, bool, str | None]:
+) -> tuple[list[str], dict[str, bool | str] | None, bool, str | None]:
     """Converge every source, platform first; fill `blocks`.
 
     Two passes: first PREPARE every source (fetch/verify/archive) and keep its context, so
@@ -2839,9 +2843,9 @@ def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> i
             print("another converge run holds the lock; skipping this cycle")
             return 0
         role, self_ip = read_self()
-        blocks: dict[str, dict] = {}
+        blocks: dict[str, Raw] = {}
         warnings: list[str] = []
-        logging_status: dict | None = None
+        logging_status: dict[str, bool | str] | None = None
         error: str | None = None
         code = 1
         sources: list[SourceEntry] = []
@@ -3161,7 +3165,7 @@ def _router_present(facilities: list[Facility]) -> bool:
 
 
 def backend_address(
-    org: Org, manifest: Deployment, ing: dict, *, router_present: bool = False
+    org: Org, manifest: Deployment, ing: Raw, *, router_present: bool = False
 ) -> str:
     """Where the edge should send traffic for one ingress entry.
 
@@ -3284,8 +3288,8 @@ def _refuse_route(host: str, owner: str | None, refused: list[str]) -> None:
 
 
 def _authorized_ingress(
-    ingress: list[dict], tenant: str, auth: HostAuth | None, refused: list[str]
-) -> list[dict]:
+    ingress: list[Raw], tenant: str, auth: HostAuth | None, refused: list[str]
+) -> list[Raw]:
     """The ingress entries a tenant source may render, `www.` included (spec §3/§6).
 
     A host resolving to anyone but `tenant` is refused. `www.<host>` is a second,
@@ -3293,7 +3297,7 @@ def _authorized_ingress(
     too, or the redirect router is an unauthenticated hijack vector. Without that
     coverage the variant is dropped — the apex router still renders.
     """
-    allowed: list[dict] = []
+    allowed: list[Raw] = []
     for ing in ingress:
         host = str(ing.get("host", ""))
         owner = auth.resolve(host) if auth is not None else None
@@ -3841,7 +3845,7 @@ def data_host_ip(org: Org) -> str | None:
 
 
 def provision_databases(
-    app: str, databases: dict, facilities: list[Facility], *, remote_ip: str | None = None
+    app: str, databases: Raw, facilities: list[Facility], *, remote_ip: str | None = None
 ) -> str | None:
     """Provision the databases a manifest requested.
 
@@ -3968,7 +3972,7 @@ def _releases_path(name: str) -> Path:
     return RELEASES / f"{name}.jsonl"
 
 
-def read_provenance_history(name: str) -> list[dict]:
+def read_provenance_history(name: str) -> list[Raw]:
     """Every recorded release for `name`, oldest first; `[]` if none.
 
     Reads /var/lib/nuk/releases/<name>.jsonl, skipping unparseable lines — a
@@ -3986,7 +3990,7 @@ def read_provenance_history(name: str) -> list[dict]:
         if isinstance(data, list):
             return [e for e in data if isinstance(e, dict)]
         return []
-    entries: list[dict] = []
+    entries: list[Raw] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -3999,7 +4003,7 @@ def read_provenance_history(name: str) -> list[dict]:
     return entries
 
 
-def read_provenance(name: str) -> dict | None:
+def read_provenance(name: str) -> Raw | None:
     """The CURRENT release for `name`, or None if nothing is recorded.
 
     Signature and contract unchanged across the history migration: `cmd_status`
@@ -4056,7 +4060,7 @@ def _full_commit_sha(repo_dir: Path) -> str | None:
     return _git_try(repo_dir, "rev-parse", "HEAD")
 
 
-def _parse_compose_images_json(text: str) -> list[dict]:
+def _parse_compose_images_json(text: str) -> list[Raw]:
     """Parse `docker compose images --format json` output (one array or JSON-lines)."""
     text = text.strip()
     if not text:
@@ -4072,7 +4076,7 @@ def _parse_compose_images_json(text: str) -> list[dict]:
     return [row for row in rows if isinstance(row, dict)]
 
 
-def _resolve_image_digest(name: str, raw: dict) -> str | None:
+def _resolve_image_digest(name: str, raw: Raw) -> str | None:
     """Best-effort digest of the app's first compose image, or None if unresolvable."""
     try:
         proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
@@ -4112,7 +4116,7 @@ def _resolve_image_digest(name: str, raw: dict) -> str | None:
 # source — this never throws out of build_overview().
 
 
-def _read_yaml_safe(path: Path) -> dict | list | None:
+def _read_yaml_safe(path: Path) -> Raw | list[Any] | None:
     """Best-effort YAML read: None on any I/O or parse error, never raises."""
     try:
         return yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -4128,7 +4132,7 @@ def _read_json_safe(path: Path) -> object:
         return None
 
 
-def _git_provenance(repo_dir: Path) -> dict:
+def _git_provenance(repo_dir: Path) -> dict[str, str | None]:
     """Full commit sha + committer date + github web URL for `repo_dir`'s HEAD.
 
     Returns {} when there is no checkout / no commit — the caller degrades that
@@ -4166,7 +4170,7 @@ def _read_version(repo_dir: Path) -> str | None:
     return _git_try(repo_dir, "describe", "--tags", "--always", "--abbrev=7")
 
 
-def _list_workflows(repo_dir: Path) -> list[dict]:
+def _list_workflows(repo_dir: Path) -> list[dict[str, str | list[Any]]]:
     """GitHub Actions workflows in `repo_dir`, with normalised trigger events."""
     wf_dir = repo_dir / ".github" / "workflows"
     if not wf_dir.is_dir():
@@ -4195,7 +4199,7 @@ def _list_workflows(repo_dir: Path) -> list[dict]:
     return out
 
 
-def _dynamic_routers(name: str) -> list[dict] | None:
+def _dynamic_routers(name: str) -> list[Raw] | None:
     """Router id/rule pairs nuk rendered into the Traefik file provider for `name`."""
     doc = _read_yaml_safe(_router_file(name))
     http = doc.get("http") if isinstance(doc, dict) else None
@@ -4226,7 +4230,7 @@ def _probe(host: str, timeout: float = 2.5) -> str | None:
     return "missing" if status >= 500 else "enabled"  # noqa: PLR2004  # HTTP status code, not a magic number
 
 
-def _annotate_routers(routers: list[dict] | None, hosts: list[str]) -> list[dict]:
+def _annotate_routers(routers: list[Raw] | None, hosts: list[str]) -> list[Raw]:
     """Attach a best-effort live probe to each router, matched by its rule's host."""
     with ThreadPoolExecutor(max_workers=8) as pool:
         live_by_host = dict(zip(hosts, pool.map(_probe, hosts), strict=True))
@@ -4237,7 +4241,7 @@ def _annotate_routers(routers: list[dict] | None, hosts: list[str]) -> list[dict
     return out
 
 
-def _drift_for(hosts: list[str], routers: list[dict] | None) -> str:
+def _drift_for(hosts: list[str], routers: list[Raw] | None) -> str:
     """Two-file consistency check between the manifest's hosts and Traefik's routers.
 
     Does every manifest ingress host appear in a router nuk actually rendered?
@@ -4253,7 +4257,7 @@ def _drift_for(hosts: list[str], routers: list[dict] | None) -> str:
     return "in-sync" if all(f"`{h}`" in blob for h in hosts) else "drift"
 
 
-def _overview_ingress_fields(spec: dict) -> tuple[list[str], list[dict]]:
+def _overview_ingress_fields(spec: Raw) -> tuple[list[str], list[Raw]]:
     """Deduped host list + full ingress view list from a manifest's `spec.ingress`."""
     entries = [i for i in (spec.get("ingress") or []) if isinstance(i, dict) and i.get("host")]
     hosts = list(dict.fromkeys(i["host"] for i in entries))
@@ -4270,7 +4274,7 @@ def _overview_ingress_fields(spec: dict) -> tuple[list[str], list[dict]]:
     return hosts, ingress
 
 
-def _overview_features(spec: dict) -> dict:
+def _overview_features(spec: Raw) -> dict[str, bool | str | None]:
     """`spec.databases` -> the declared-backing-services view."""
     databases = spec.get("databases")
     databases = databases if isinstance(databases, dict) else {}
@@ -4283,7 +4287,7 @@ def _overview_features(spec: dict) -> dict:
 
 
 def _overview_provenance(
-    name: str, source_raw: dict | None
+    name: str, source_raw: Raw | None
 ) -> tuple[str | None, str | None, str | None, str | None, str | None]:
     """commit/commitUrl/repoUrl/lastCommit/imageDigest, provenance.json-first.
 
@@ -4312,7 +4316,7 @@ def _overview_provenance(
     )
 
 
-def _read_app_overview(name: str, *, probe_enabled: bool = False) -> dict:
+def _read_app_overview(name: str, *, probe_enabled: bool = False) -> Raw:
     """Build one app's Overview entry from on-disk state. Degrades; never raises."""
     notes: list[str] = []
     manifest_raw = _read_yaml_safe(_manifest_file(name))
@@ -4354,7 +4358,7 @@ def _read_app_overview(name: str, *, probe_enabled: bool = False) -> dict:
     }
 
 
-def build_overview(*, probe_enabled: bool = False) -> dict:
+def build_overview(*, probe_enabled: bool = False) -> Raw:
     """Walk DEPLOYS/*/ and build the org-wide status Overview. Degrades; never raises."""
     errors: list[str] = []
     names: list[str] = []
@@ -4371,7 +4375,7 @@ def build_overview(*, probe_enabled: bool = False) -> dict:
     }
 
 
-def _soll_vs_ist(overview: dict, org_file: Path | None) -> dict:
+def _soll_vs_ist(overview: Raw, org_file: Path | None) -> Raw:
     """`--all`: declared org hosts (soll) vs this command's local observation (ist).
 
     Args:
@@ -4724,7 +4728,7 @@ def _migrate_service(name: str, migrate: Migrate, strategy: Strategy | None) -> 
 
 
 def _run_migrations(
-    name: str, raw: dict, migrate: Migrate, strategy: Strategy | None, digest: str | None
+    name: str, raw: Raw, migrate: Migrate, strategy: Strategy | None, digest: str | None
 ) -> None:
     """Run the deployment's one-shot migration, failing the deploy on any error.
 
@@ -4763,8 +4767,8 @@ def _run_migrations(
 
 def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/dialect, one per concern
     name: str,
-    raw: dict,
-    ingress: list[dict],
+    raw: Raw,
+    ingress: list[Raw],
     vocab: dict[str, list[str]],
     strategy: Strategy,
     *,
@@ -4823,8 +4827,8 @@ def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/diale
 
 def _rollback_blue_green(
     name: str,
-    raw: dict,
-    ingress: list[dict],
+    raw: Raw,
+    ingress: list[Raw],
     vocab: dict[str, list[str]],
     strategy: Strategy,
 ) -> None:
@@ -4874,7 +4878,7 @@ def cmd_get() -> None:
         print(f"{name:24} {ps:32} {hosts}")
 
 
-def _configured_image_digest(name: str, raw: dict) -> str | None:
+def _configured_image_digest(name: str, raw: Raw) -> str | None:
     """Digest of the image the compose file CONFIGURES, or None if unresolvable.
 
     `docker compose images` reports the RUNNING containers — the previous release
@@ -4897,7 +4901,7 @@ def _configured_image_digest(name: str, raw: dict) -> str | None:
     return digest or None
 
 
-def _rollout_key(name: str, raw: dict) -> str | None:
+def _rollout_key(name: str, raw: Raw) -> str | None:
     """The key a rollout is compared by: the configured image digest, else the revision.
 
     The converge loop re-applies every cycle, so `spec.migrate` must key off what
@@ -5008,7 +5012,7 @@ def cmd_rollout(name: str) -> None:
     sh(*compose_args(name, manifest.raw), "up", "-d")
 
 
-def _compose_images(name: str, raw: dict) -> list[str]:
+def _compose_images(name: str, raw: Raw) -> list[str]:
     """The image references the compose project resolves to, in service order."""
     try:
         proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
@@ -5023,7 +5027,7 @@ def _compose_images(name: str, raw: dict) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
-def _pin_image(name: str, raw: dict, pin_digest: str) -> None:
+def _pin_image(name: str, raw: Raw, pin_digest: str) -> None:
     """Point the app's compose image reference at the pinned digest (spec §8).
 
     The digest is the identity of the re-applied release. Order matters:
