@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 # The return type of every record's `to_wire()`: exactly what json.dumps / yaml.safe_dump take.
 type Json = dict[str, Json] | list[Json] | str | int | float | bool | None
 
-__version__ = "2.6.1"  # bumped on release by .github/workflows/release.yml
+__version__ = "2.7.0"  # bumped on release by .github/workflows/release.yml
 
 ROOT = Path("/opt/nuklaut")
 DEPLOYS = ROOT / "deployments"
