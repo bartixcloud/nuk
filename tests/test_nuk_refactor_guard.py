@@ -333,11 +333,11 @@ def test_annotate_routers_probes_hosts_concurrently(monkeypatch):
         return "enabled"
 
     monkeypatch.setattr(nuk, "_probe", probe)
-    routers = [{"rule": f"Host(`{h}`)"} for h in hosts]
+    routers = [nuk.RouterStatus(f"r{i}", f"Host(`{h}`)") for i, h in enumerate(hosts)]
     out = nuk._annotate_routers(routers, hosts)
 
     assert peak >= 2, f"probes never overlapped (peak={peak}) — the pool is not in use"
-    assert [r["live"] for r in out] == ["enabled"] * len(hosts)
+    assert [r.live for r in out] == ["enabled"] * len(hosts)
 
 
 def test_annotate_routers_keeps_the_host_matching_and_the_none_case(monkeypatch):
@@ -345,15 +345,15 @@ def test_annotate_routers_keeps_the_host_matching_and_the_none_case(monkeypatch)
     monkeypatch.setattr(nuk, "_probe", lambda h, timeout=2.5: f"live:{h}")
     out = nuk._annotate_routers(
         [
-            {"rule": "Host(`a.example.com`)"},
-            {"rule": "Host(`b.example.com`) && PathPrefix(`/x`)"},
+            nuk.RouterStatus("a", "Host(`a.example.com`)"),
+            nuk.RouterStatus("b", "Host(`b.example.com`) && PathPrefix(`/x`)"),
         ],
         hosts,
     )
-    assert [r["live"] for r in out] == ["live:a.example.com", "live:b.example.com"]
+    assert [r.live for r in out] == ["live:a.example.com", "live:b.example.com"]
 
-    out = nuk._annotate_routers([{"rule": "Host(`zzz.example.com`)"}], hosts)
-    assert out[0]["live"] is None
+    out = nuk._annotate_routers([nuk.RouterStatus("z", "Host(`zzz.example.com`)")], hosts)
+    assert out[0].live is None
 
     assert nuk._annotate_routers(None, hosts) == []
 

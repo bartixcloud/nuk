@@ -28,7 +28,7 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, Self, cast
@@ -4717,7 +4717,7 @@ def _resolve_image_digest(name: str, raw: Raw) -> str | None:
 # source — this never throws out of build_overview().
 
 
-def _read_yaml_safe(path: Path) -> Raw | list[Any] | None:
+def _read_yaml_safe(path: Path) -> object:
     """Best-effort YAML read: None on any I/O or parse error, never raises."""
     try:
         return yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -4733,21 +4733,21 @@ def _read_json_safe(path: Path) -> object:
         return None
 
 
-def _git_provenance(repo_dir: Path) -> dict[str, str | None]:
+def _git_provenance(repo_dir: Path) -> GitProvenance:
     """Full commit sha + committer date + github web URL for `repo_dir`'s HEAD.
 
-    Returns {} when there is no checkout / no commit — the caller degrades that
-    field rather than failing.
+    Returns the empty GitProvenance when there is no checkout / no commit — the
+    caller degrades that field rather than failing.
     """
     out = _git_try(repo_dir, "log", "-1", "--format=%H%x09%cI")
     if not out:
-        return {}
+        return GitProvenance()
     full_commit, _, date = out.partition("\t")
-    return {
-        "full_commit": full_commit,
-        "last_commit": date or None,
-        "repo_url": git_origin(str(repo_dir)),
-    }
+    return GitProvenance(
+        full_commit=full_commit,
+        last_commit=date or None,
+        repo_url=git_origin(str(repo_dir)),
+    )
 
 
 _VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
@@ -4771,12 +4771,12 @@ def _read_version(repo_dir: Path) -> str | None:
     return _git_try(repo_dir, "describe", "--tags", "--always", "--abbrev=7")
 
 
-def _list_workflows(repo_dir: Path) -> list[dict[str, str | list[Any]]]:
+def _list_workflows(repo_dir: Path) -> list[Workflow]:
     """GitHub Actions workflows in `repo_dir`, with normalised trigger events."""
     wf_dir = repo_dir / ".github" / "workflows"
     if not wf_dir.is_dir():
         return []
-    out = []
+    out: list[Workflow] = []
     for f in sorted(wf_dir.iterdir()):
         if f.suffix not in {".yml", ".yaml"}:
             continue
@@ -4789,27 +4789,29 @@ def _list_workflows(repo_dir: Path) -> list[dict[str, str | list[Any]]]:
         if isinstance(on, str):
             triggers = [on]
         elif isinstance(on, list):
-            triggers = on
+            triggers = [str(t) for t in on]
         elif isinstance(on, dict):
-            triggers = list(on.keys())
+            triggers = [str(k) for k in on]
         else:
             triggers = []
         name = doc.get("name")
         wf_name = name if isinstance(name, str) else f.name
-        out.append({"file": f.name, "name": wf_name, "triggers": triggers})
+        out.append(Workflow(f.name, wf_name, triggers))
     return out
 
 
-def _dynamic_routers(name: str) -> list[Raw] | None:
+def _dynamic_routers(name: str) -> list[RouterStatus] | None:
     """Router id/rule pairs nuk rendered into the Traefik file provider for `name`."""
     doc = _read_yaml_safe(_router_file(name))
     http = doc.get("http") if isinstance(doc, dict) else None
     routers = http.get("routers") if isinstance(http, dict) else None
-    if not routers:
+    if not isinstance(routers, dict) or not routers:
         return None
-    return [
-        {"id": rid, "rule": (r or {}).get("rule", ""), "live": None} for rid, r in routers.items()
-    ]
+    out: list[RouterStatus] = []
+    for rid, r in routers.items():
+        rule = r.get("rule") if isinstance(r, dict) else None
+        out.append(RouterStatus(rid, rule if isinstance(rule, str) else "", None))
+    return out
 
 
 def _probe(host: str, timeout: float = 2.5) -> str | None:
@@ -4831,18 +4833,20 @@ def _probe(host: str, timeout: float = 2.5) -> str | None:
     return "missing" if status >= 500 else "enabled"  # noqa: PLR2004  # HTTP status code, not a magic number
 
 
-def _annotate_routers(routers: list[Raw] | None, hosts: list[str]) -> list[Raw]:
+def _annotate_routers(routers: list[RouterStatus] | None, hosts: list[str]) -> list[RouterStatus]:
     """Attach a best-effort live probe to each router, matched by its rule's host."""
     with ThreadPoolExecutor(max_workers=8) as pool:
         live_by_host = dict(zip(hosts, pool.map(_probe, hosts), strict=True))
-    out = []
+    out: list[RouterStatus] = []
     for r in routers or []:
-        host = next((h for h in hosts if f"`{h}`" in r.get("rule", "")), None)
-        out.append({**r, "live": live_by_host.get(host) if host else None})
+        host = next((h for h in hosts if f"`{h}`" in r.rule), None)
+        out.append(replace(r, live=live_by_host.get(host) if host else None))
     return out
 
 
-def _drift_for(hosts: list[str], routers: list[Raw] | None) -> str:
+def _drift_for(
+    hosts: list[str], routers: list[RouterStatus] | None
+) -> Literal["in-sync", "drift", "unknown"]:
     """Two-file consistency check between the manifest's hosts and Traefik's routers.
 
     Does every manifest ingress host appear in a router nuk actually rendered?
@@ -4854,41 +4858,27 @@ def _drift_for(hosts: list[str], routers: list[Raw] | None) -> str:
         return "unknown"
     if routers is None:
         return "drift"
-    blob = " ".join(r.get("rule", "") for r in routers)
+    blob = " ".join(r.rule for r in routers)
     return "in-sync" if all(f"`{h}`" in blob for h in hosts) else "drift"
 
 
-def _overview_ingress_fields(spec: Raw) -> tuple[list[str], list[Raw]]:
+def _overview_ingress_fields(spec: object) -> tuple[list[str], list[AppIngress]]:
     """Deduped host list + full ingress view list from a manifest's `spec.ingress`."""
-    entries = [i for i in (spec.get("ingress") or []) if isinstance(i, dict) and i.get("host")]
-    hosts = list(dict.fromkeys(i["host"] for i in entries))
-    ingress = [
-        {
-            "host": i["host"],
-            "service": i.get("service"),
-            "port": i.get("port"),
-            "path": i.get("path"),
-            "auth": i.get("auth"),
-        }
-        for i in entries
-    ]
+    raw = spec.get("ingress") if isinstance(spec, dict) else None
+    entries = raw if isinstance(raw, list) else []
+    ingress = [a for a in map(AppIngress.from_wire, entries) if a is not None]
+    hosts = list(dict.fromkeys(a.host for a in ingress))
     return hosts, ingress
 
 
-def _overview_features(spec: Raw) -> dict[str, bool | str | None]:
+def _overview_features(spec: object) -> AppFeatures:
     """`spec.databases` -> the declared-backing-services view."""
-    databases = spec.get("databases")
-    databases = databases if isinstance(databases, dict) else {}
-    pg = databases.get("postgres")
-    return {
-        "postgres": bool(pg),
-        "redis": bool(databases.get("redis")),
-        "postgresDriver": _pg_driver(pg),
-    }
+    data = spec if isinstance(spec, dict) else {}
+    return AppFeatures.from_databases(data.get("databases"))
 
 
 def _overview_provenance(
-    name: str, source_raw: Raw | None
+    name: str, source: AppSource | None
 ) -> tuple[str | None, str | None, str | None, str | None, str | None]:
     """commit/commitUrl/repoUrl/lastCommit/imageDigest, provenance.json-first.
 
@@ -4900,24 +4890,22 @@ def _overview_provenance(
     provenance = read_provenance(name)
     git_prov = _git_provenance(repo_dir)
 
-    full_commit = (provenance or {}).get("commit") or git_prov.get("full_commit")
+    full_commit = (provenance.commit if provenance else None) or git_prov.full_commit
     commit = full_commit[:12] if full_commit else None
 
-    web = git_prov.get("repo_url")
+    web = git_prov.repo_url
     commit_url = f"{web}/commit/{full_commit}" if web and full_commit else None
-    declared_repo_url = (
-        github_url(source_raw["repo"]) if source_raw and source_raw.get("repo") else None
-    )
+    declared_repo_url = github_url(source.repo) if source and source.repo else None
     return (
         commit,
         commit_url,
         declared_repo_url or web,
-        git_prov.get("last_commit"),
-        (provenance or {}).get("imageDigest"),
+        git_prov.last_commit,
+        provenance.image_digest if provenance else None,
     )
 
 
-def _read_app_overview(name: str, *, probe_enabled: bool = False) -> Raw:
+def _read_app_overview(name: str, *, probe_enabled: bool = False) -> AppOverview:
     """Build one app's Overview entry from on-disk state. Degrades; never raises."""
     notes: list[str] = []
     manifest_raw = _read_yaml_safe(_manifest_file(name))
@@ -4927,12 +4915,12 @@ def _read_app_overview(name: str, *, probe_enabled: bool = False) -> Raw:
     spec = spec if isinstance(spec, dict) else {}
 
     hosts, ingress = _overview_ingress_fields(spec)
-    source_raw = spec.get("source") if isinstance(spec.get("source"), dict) else None
+    source_raw = spec.get("source")
     source = (
-        {"repo": source_raw.get("repo"), "branch": source_raw.get("branch")} if source_raw else None
+        AppSource.from_wire(source_raw) if isinstance(source_raw, dict) and source_raw else None
     )
 
-    commit, commit_url, repo_url, last_commit, image_digest = _overview_provenance(name, source_raw)
+    commit, commit_url, repo_url, last_commit, image_digest = _overview_provenance(name, source)
     if not commit:
         notes.append("no git checkout / commit unavailable")
 
@@ -4940,26 +4928,26 @@ def _read_app_overview(name: str, *, probe_enabled: bool = False) -> Raw:
     routers = _dynamic_routers(name)
     routers_out = _annotate_routers(routers, hosts) if probe_enabled else (routers or [])
 
-    return {
-        "name": name,
-        "hosts": hosts,
-        "source": source,
-        "repoUrl": repo_url,
-        "commit": commit,
-        "commitUrl": commit_url,
-        "lastCommit": last_commit,
-        "version": _read_version(repo_dir),
-        "routers": routers_out,
-        "drift": _drift_for(hosts, routers),
-        "features": _overview_features(spec),
-        "workflows": _list_workflows(repo_dir),
-        "ingress": ingress,
-        "notes": notes,
-        "imageDigest": image_digest,
-    }
+    return AppOverview(
+        name=name,
+        hosts=hosts,
+        source=source,
+        repo_url=repo_url,
+        commit=commit,
+        commit_url=commit_url,
+        last_commit=last_commit,
+        version=_read_version(repo_dir),
+        routers=routers_out,
+        drift=_drift_for(hosts, routers),
+        features=_overview_features(spec),
+        workflows=_list_workflows(repo_dir),
+        ingress=ingress,
+        notes=notes,
+        image_digest=image_digest,
+    )
 
 
-def build_overview(*, probe_enabled: bool = False) -> Raw:
+def build_overview(*, probe_enabled: bool = False) -> Overview:
     """Walk DEPLOYS/*/ and build the org-wide status Overview. Degrades; never raises."""
     errors: list[str] = []
     names: list[str] = []
@@ -4967,24 +4955,24 @@ def build_overview(*, probe_enabled: bool = False) -> Raw:
         names = sorted(p.name for p in DEPLOYS.iterdir() if p.is_dir())
     else:
         errors.append(f"cannot read {DEPLOYS} — is /opt/nuklaut mounted?")
-    return {
-        "apps": [_read_app_overview(n, probe_enabled=probe_enabled) for n in names],
-        "liveRoutingAvailable": False,  # Traefik api@internal integration is a later chapter
-        "nukRoot": str(ROOT),
-        "generatedAt": _iso_utc_now(),
-        "errors": errors,
-    }
+    return Overview(
+        apps=[_read_app_overview(n, probe_enabled=probe_enabled) for n in names],
+        live_routing_available=False,  # Traefik api@internal integration is a later chapter
+        nuk_root=str(ROOT),
+        generated_at=_iso_utc_now(),
+        errors=errors,
+    )
 
 
-def _soll_vs_ist(overview: Raw, org_file: Path | None) -> Raw:
+def _soll_vs_ist(overview: Overview, org_file: Path | None) -> Overview:
     """`--all`: declared org hosts (soll) vs this command's local observation (ist).
 
     Args:
-        overview: The already-built Overview dict (read for its observed app count).
+        overview: The already-built Overview (read for its observed app count).
         org_file: Path to the org manifest (`nuklaut.org.yml`); required.
 
     Returns:
-        The extra top-level keys `status --all` adds to the Overview.
+        The overview with the `--all` blocks (`hosts`, `sollVsIst`) set.
 
     Raises:
         NukError: When `org_file` is not given, or is not a valid Org manifest.
@@ -4992,18 +4980,19 @@ def _soll_vs_ist(overview: Raw, org_file: Path | None) -> Raw:
     if org_file is None:
         die("nuk status --all: --org-file PATH is required (path to nuklaut.org.yml)")
     org = load_org(org_file)
-    return {
-        "hosts": [h.model_dump(by_alias=True) for h in org.hosts],
-        "sollVsIst": {
-            "declaredHosts": len(org.hosts),
+    return replace(
+        overview,
+        hosts=org.hosts,
+        soll_vs_ist=SollVsIst(
+            declared_hosts=len(org.hosts),
             # TODO(K2.5): per-host observed via DOCKER_HOST fan-out (ssh per host,  # noqa: FIX002
             # one nuk status per host, merge). Kapitel 1 is single-host, so
             # "observed" is just this controller — the one this command runs on.
-            "observedHosts": 1,
-            "declaredApps": None,  # nukorg/v1 does not declare apps (yet)
-            "observedApps": len(overview["apps"]),
-        },
-    }
+            observed_hosts=1,
+            declared_apps=None,  # nukorg/v1 does not declare apps (yet)
+            observed_apps=len(overview.apps),
+        ),
+    )
 
 
 # --- command layer ------------------------------------------------------------
