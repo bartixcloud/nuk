@@ -4,6 +4,15 @@
 #
 # nuk is a uv project: the `uv` ecosystem reads pyproject.toml AND uv.lock, which
 # the `pip` ecosystem it replaces never saw.
+#
+# Commit type = what the bump does to the artifact the fleet installs. The shared
+# release workflow reads conventional commits, and `nuk update` only re-installs
+# when a NEWER release exists:
+#   * a uv bump changes the dependency set a host gets on its next install (a host
+#     install resolves the newest satisfying versions, it does not read this repo's
+#     uv.lock) -> `fix`, so it cuts a patch release and `nuk update` can pull it.
+#   * a github-actions bump only changes CI, never an installed nuk -> `chore`, no
+#     release.
 version: 2
 updates:
   - package-ecosystem: uv
@@ -12,7 +21,7 @@ updates:
       interval: weekly
     open-pull-requests-limit: 5
     commit-message:
-      prefix: chore
+      prefix: fix
       include: scope
     groups:
       python-packages:
