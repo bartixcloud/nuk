@@ -111,6 +111,9 @@ def test_await_healthy_returns_once_the_container_answers(monkeypatch):
     probe = calls[0][-1]
     assert "/health" in probe
     assert "8000" in probe
+    # `python -c` gets no implicit imports: the probe must import urllib itself,
+    # or every blue-green rollout fails its health gate with a NameError.
+    assert probe.startswith("import urllib.request;")
 
 
 def test_await_healthy_raises_when_the_container_never_answers(monkeypatch):
