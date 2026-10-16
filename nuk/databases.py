@@ -13,7 +13,6 @@ import nuk
 from nuk.util import (
     _chown_deploy,
     _read_env_file,
-    _safe_ident,
     die,
 )
 
@@ -397,7 +396,9 @@ def provision_databases(
             pw = nuk.derive_db_password(seed, "pg", app)
             env["DATABASE_URL"] = nuk._pg_url(app, pw, remote_ip, databases.postgres_driver)
         if want_redis:
-            env["REDIS_URL"] = nuk._redis_url(app, nuk.derive_db_password(seed, "redis", app), remote_ip)
+            env["REDIS_URL"] = nuk._redis_url(
+                app, nuk.derive_db_password(seed, "redis", app), remote_ip
+            )
         return nuk.write_db_env(app, env)
     nuk.preflight_data_stack(want_pg, want_redis)
     prev = nuk.read_db_env(app)
