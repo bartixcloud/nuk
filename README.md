@@ -51,6 +51,7 @@ This shape maps 1:1 to Kubernetes (the intended migration path):
 | `spec.ingress`                 | `kind: Ingress` (one rule per entry, TLS preset)  |
 | `spec.envFrom[].secretRef`     | `envFrom: [{ secretRef: { name: ... } }]`         |
 | `spec.databases`               | per-app DB/role + Secret on a shared instance     |
+| `spec.migrate`                 | one-shot schema migration run before the rollout  |
 
 ## Install / run
 
@@ -161,6 +162,22 @@ container's own env), so DB superuser secrets never reach a host process-arg lin
 `nuk delete <app>` keeps the database (the creds file is the ownership marker, so nuk
 still tracks it via `nuk db ls`); `--purge` / `nuk db purge` is the only path that
 destroys data.
+
+## Migrations (`spec.migrate`)
+
+A Deployment may declare a one-shot migration nuk runs **before** a rollout's idle
+colour comes up:
+
+```yaml
+spec:
+  migrate: {service: backend, command: "alembic upgrade head", timeout: 300}
+```
+
+nuk runs `docker compose … run --rm --no-deps <service> <command>` in the app's env
+and network. It fails the deploy on a non-zero exit or timeout (the previous colour
+keeps serving), runs only when the app image digest changes (repeat converge cycles
+skip it), and never runs on a rollback. **Migrations must be expand/contract** — the
+old colour serves while the migration runs.
 
 ## Development
 
