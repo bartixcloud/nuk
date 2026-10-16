@@ -4142,6 +4142,13 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         local_data=remote_ip is None,
         colours=router_colours,
     )
+    migrate = manifest.spec.migrate
+    if migrate is not None and pin_commit is None:
+        # Before the rollout, and never on a rollback (`pin_commit` marks the
+        # rollback path): a forward-only migration the old colour must survive.
+        key = _rollout_key(name, raw)
+        if key != migrated_digest(name):
+            _run_migrations(name, raw, migrate, key)
     if strategy is not None and strategy.type == "blue-green":
         # Blue-green replaces "ingress -> up -d" with a colour rollout: bring the
         # idle colour up (its compose profile), gate on its health, flip the
@@ -4195,7 +4202,8 @@ def _run_migrations(name: str, raw: dict, migrate: Migrate, digest: str | None) 
     records the manifest `failed`), a timeout becomes a fail-closed `SystemExit`.
     The digest is recorded only after success, so a crash mid-migration re-runs.
     """
-    argv = compose_args(name, raw) + [
+    argv = [
+        *compose_args(name, raw),
         "run",
         "--rm",
         "--no-deps",
@@ -4322,6 +4330,17 @@ def cmd_get() -> None:
         hosts = ",".join(i.host for i in manifest.spec.ingress)
         ps = ",".join(_compose_ps(name, "{{.State}}")) or "-"
         print(f"{name:24} {ps:32} {hosts}")
+
+
+def _rollout_key(name: str, raw: dict) -> str:
+    """The key a rollout is compared by: the app image digest, else the revision.
+
+    The converge loop re-applies every cycle, so `spec.migrate` must key off what
+    actually changes on a new rollout. The resolved image digest is the precise
+    signal; when it is unresolvable (workflow-managed, `.git`-less tree) the
+    applied revision stands in.
+    """
+    return _resolve_image_digest(name, raw) or _applied_revision(name)
 
 
 def _applied_revision(name: str) -> str:
