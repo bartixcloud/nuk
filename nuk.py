@@ -4143,12 +4143,14 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         colours=router_colours,
     )
     migrate = manifest.spec.migrate
-    if migrate is not None and pin_commit is None:
-        # Before the rollout, and never on a rollback (`pin_commit` marks the
-        # rollback path): a forward-only migration the old colour must survive.
+    if migrate is not None and pin_digest is None:
+        # Before the rollout. A digest-path rollback (`pin_digest`, set only by
+        # `cmd_rollback`) never migrates — forward-only, and the recorded
+        # revision it restores may predate the current migration head. A
+        # blue-green colour flip never reaches here at all.
         key = _rollout_key(name, raw)
         if key != migrated_digest(name):
-            _run_migrations(name, raw, migrate, key)
+            _run_migrations(name, raw, migrate, strategy, key)
     if strategy is not None and strategy.type == "blue-green":
         # Blue-green replaces "ingress -> up -d" with a colour rollout: bring the
         # idle colour up (its compose profile), gate on its health, flip the
@@ -4194,7 +4196,22 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         print(f"{name}: provenance not recorded ({e})")
 
 
-def _run_migrations(name: str, raw: dict, migrate: Migrate, digest: str | None) -> None:
+def _migrate_service(name: str, migrate: Migrate, strategy: Strategy | None) -> str:
+    """The compose service the migration runs in.
+
+    A blue-green deployment's services are colour-suffixed (`backend-blue`), and
+    the migration must run the rollout's target image — so, like the health probe
+    (`strategy.health.service`), the name is suffixed with the idle colour. A
+    deployment with no strategy uses the name verbatim.
+    """
+    if strategy is not None and strategy.type == "blue-green":
+        return f"{migrate.service}-{idle_colour(active_colour(name))}"
+    return migrate.service
+
+
+def _run_migrations(
+    name: str, raw: dict, migrate: Migrate, strategy: Strategy | None, digest: str | None
+) -> None:
     """Run the deployment's one-shot migration, failing the deploy on any error.
 
     The compose service supplies the image, env and network; nuk supplies the
@@ -4202,15 +4219,16 @@ def _run_migrations(name: str, raw: dict, migrate: Migrate, digest: str | None) 
     records the manifest `failed`), a timeout becomes a fail-closed `SystemExit`.
     The digest is recorded only after success, so a crash mid-migration re-runs.
     """
+    service = _migrate_service(name, migrate, strategy)
     argv = [
         *compose_args(name, raw),
         "run",
         "--rm",
         "--no-deps",
-        migrate.service,
+        service,
         *shlex.split(migrate.command),
     ]
-    print(f"{name}: migrating ({migrate.service}: {migrate.command})")
+    print(f"{name}: migrating ({service}: {migrate.command})")
     try:
         sh(*argv, timeout=migrate.timeout)
     except subprocess.TimeoutExpired:

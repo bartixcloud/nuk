@@ -79,7 +79,7 @@ def _migrate(tmp_path, monkeypatch, sh):
 def test_run_migrations_runs_compose_run_and_records(tmp_path, monkeypatch):
     calls: list = []
     m = _migrate(tmp_path, monkeypatch, lambda *cmd, **kw: calls.append((cmd, kw)))
-    nuk._run_migrations("kolbe", _MIGRATE_DEP, m, "sha256:cafe")
+    nuk._run_migrations("kolbe", _MIGRATE_DEP, m, None, "sha256:cafe")
     assert calls[0][0] == (
         "docker",
         "compose",
@@ -97,13 +97,28 @@ def test_run_migrations_runs_compose_run_and_records(tmp_path, monkeypatch):
     assert nuk.migrated_digest("kolbe") == "sha256:cafe"
 
 
+def test_run_migrations_suffixes_the_idle_colour_for_blue_green(tmp_path, monkeypatch):
+    """A blue-green compose's services are colour-suffixed (`backend-blue`).
+
+    The migration targets the idle colour — the one the rollout is about to bring
+    up — exactly as `strategy.health.service` is colour-suffixed by the probe.
+    """
+    calls: list = []
+    m = _migrate(tmp_path, monkeypatch, lambda *cmd, **kw: calls.append((cmd, kw)))
+    strategy = nuk.Strategy.model_validate(
+        {"type": "blue-green", "health": {"service": "backend", "path": "/health"}}
+    )
+    nuk._run_migrations("kolbe", _MIGRATE_DEP, m, strategy, "sha256:cafe")
+    assert calls[0][0][6:8] == ("--no-deps", "backend-green")
+
+
 def test_run_migrations_failure_is_fail_closed(tmp_path, monkeypatch):
     def boom(*cmd, **_kw):
         raise subprocess.CalledProcessError(1, cmd)
 
     m = _migrate(tmp_path, monkeypatch, boom)
     with pytest.raises(subprocess.CalledProcessError):
-        nuk._run_migrations("kolbe", _MIGRATE_DEP, m, "sha256:cafe")
+        nuk._run_migrations("kolbe", _MIGRATE_DEP, m, None, "sha256:cafe")
 
 
 def test_run_migrations_timeout_becomes_systemexit(tmp_path, monkeypatch):
@@ -112,7 +127,7 @@ def test_run_migrations_timeout_becomes_systemexit(tmp_path, monkeypatch):
 
     m = _migrate(tmp_path, monkeypatch, slow)
     with pytest.raises(SystemExit):
-        nuk._run_migrations("kolbe", _MIGRATE_DEP, m, "sha256:cafe")
+        nuk._run_migrations("kolbe", _MIGRATE_DEP, m, None, "sha256:cafe")
 
 
 # --- cmd_apply wiring (Tasks 4) ---------------------------------------------
@@ -184,12 +199,31 @@ def test_cmd_apply_skips_migration_when_digest_unchanged(tmp_path, monkeypatch):
     assert _migrate_calls(lines) == []
 
 
-def test_cmd_apply_skips_migration_on_rollback(tmp_path, monkeypatch):
+def test_cmd_apply_skips_migration_on_a_digest_rollback(tmp_path, monkeypatch):
+    """Only the digest-path rollback skips — it is the caller that passes `pin_digest`.
+
+    A blue-green colour flip never reaches `cmd_apply` at all; the loop's ordinary
+    signed apply passes `pin_commit`, which must NOT skip (see the next test).
+    """
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    monkeypatch.setattr(nuk, "_resolve_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_pin_image", lambda *_a, **_k: None)
+    nuk.cmd_apply(
+        _write(tmp_path, _bg_yml(migrate=True)),
+        None,
+        pin_digest="ghcr.io/kolbeapp-de/lernstanderfassung/backend@sha256:cafe",
+    )
+    assert _migrate_calls(lines) == []
+
+
+def test_cmd_apply_runs_migration_on_a_signed_apply(tmp_path, monkeypatch):
+    """A signed deployment is applied with `pin_commit` set and STILL migrates."""
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
     monkeypatch.setattr(nuk, "_resolve_image_digest", lambda name, raw: "sha256:cafe")
     nuk.cmd_apply(_write(tmp_path, _bg_yml(migrate=True)), None, pin_commit="0" * 40)
-    assert _migrate_calls(lines) == []
+    assert len(_migrate_calls(lines)) == 1
 
 
 def test_cmd_apply_without_migrate_never_runs(tmp_path, monkeypatch):
