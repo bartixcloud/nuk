@@ -332,7 +332,7 @@ def test_rollback_refuses_when_the_manifest_no_longer_validates(state, monkeypat
             title = "Manifest"
             raise pydantic.ValidationError.from_exception_data(title, [])
 
-    monkeypatch.setattr(nuk, "_MANIFEST_ADAPTER", OldSchema())
+    monkeypatch.setattr(nuk.models, "_MANIFEST_ADAPTER", OldSchema())
     monkeypatch.setattr(nuk, "cmd_apply", lambda *a, **k: pytest.fail("must not apply"))
     with pytest.raises(SystemExit, match="no longer validates"):
         nuk.cmd_rollback("hello", to=None, show=False)
