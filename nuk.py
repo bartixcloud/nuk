@@ -4539,7 +4539,7 @@ def _releases_path(name: str) -> Path:
     return RELEASES / f"{name}.jsonl"
 
 
-def read_provenance_history(name: str) -> list[Raw]:
+def read_provenance_history(name: str) -> list[ReleaseEntry]:
     """Every recorded release for `name`, oldest first; `[]` if none.
 
     Reads /var/lib/nuk/releases/<name>.jsonl, skipping unparseable lines — a
@@ -4553,11 +4553,11 @@ def read_provenance_history(name: str) -> list[Raw]:
     if not path.exists():
         data = _read_json_safe(_provenance_path(name))
         if isinstance(data, dict):
-            return [data]
+            return [ReleaseEntry.from_wire(data)]
         if isinstance(data, list):
-            return [e for e in data if isinstance(e, dict)]
+            return [ReleaseEntry.from_wire(e) for e in data if isinstance(e, dict)]
         return []
-    entries: list[Raw] = []
+    entries: list[ReleaseEntry] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -4566,11 +4566,11 @@ def read_provenance_history(name: str) -> list[Raw]:
         except ValueError:
             continue
         if isinstance(entry, dict):
-            entries.append(entry)
+            entries.append(ReleaseEntry.from_wire(entry))
     return entries
 
 
-def read_provenance(name: str) -> Raw | None:
+def read_provenance(name: str) -> ReleaseEntry | None:
     """The CURRENT release for `name`, or None if nothing is recorded.
 
     Signature and contract unchanged across the history migration: `cmd_status`
@@ -4602,22 +4602,21 @@ def write_provenance(
         commit: The full deployed commit sha, if resolvable.
         image_digest: The deployed image's digest, if resolvable.
     """
-    entry = {
-        "repo": repo,
-        "branch": branch,
-        "commit": commit,
-        "imageDigest": image_digest,
-        "appliedAt": _iso_utc_now(),
-    }
+    entry = ReleaseEntry(
+        repo=repo,
+        branch=branch,
+        commit=commit,
+        image_digest=image_digest,
+        applied_at=_iso_utc_now(),
+    )
     history = read_provenance_history(name)
-    identity = ("repo", "branch", "commit", "imageDigest")
-    if history and all(history[-1].get(k) == entry[k] for k in identity):
+    if history and history[-1].same_release(entry):
         history[-1] = entry
     else:
         history.append(entry)
     RELEASES.mkdir(parents=True, exist_ok=True)
     _releases_path(name).write_text(
-        "".join(json.dumps(e) + "\n" for e in history[-RELEASE_LIMIT:]),
+        "".join(json.dumps(e.to_wire()) + "\n" for e in history[-RELEASE_LIMIT:]),
         encoding="utf-8",
     )
 
@@ -4627,7 +4626,7 @@ def _full_commit_sha(repo_dir: Path) -> str | None:
     return _git_try(repo_dir, "rev-parse", "HEAD")
 
 
-def _parse_compose_images_json(text: str) -> list[Raw]:
+def _parse_compose_images_json(text: str) -> list[ComposeImage]:
     """Parse `docker compose images --format json` output (one array or JSON-lines)."""
     text = text.strip()
     if not text:
@@ -4640,14 +4639,14 @@ def _parse_compose_images_json(text: str) -> list[Raw]:
             rows = [json.loads(line) for line in text.splitlines() if line.strip()]
     except (ValueError, json.JSONDecodeError):
         return []
-    return [row for row in rows if isinstance(row, dict)]
+    return [ComposeImage.from_wire(row) for row in rows if isinstance(row, dict)]
 
 
-def _resolve_image_digest(name: str, raw: Raw) -> str | None:
+def _resolve_image_digest(name: str, spec: Spec) -> str | None:
     """Best-effort digest of the app's first compose image, or None if unresolvable."""
     try:
         proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
-            [*compose_args(name, raw), "images", "--format", "json"],
+            [*compose_args(name, spec), "images", "--format", "json"],
             capture_output=True,
             text=True,
             check=True,
@@ -4656,15 +4655,13 @@ def _resolve_image_digest(name: str, raw: Raw) -> str | None:
     except (subprocess.SubprocessError, OSError):
         return None
     rows = _parse_compose_images_json(proc.stdout)
-    if not rows:
+    if not rows or not rows[0].repository:
         return None
-    repository = rows[0].get("Repository")
-    if not repository:
-        return None
-    tag = rows[0].get("Tag") or "latest"
+    image = rows[0]
+    ref = f"{image.repository}:{image.tag or 'latest'}"
     try:
         digest = subprocess.run(  # noqa: S603  # fixed argv, no shell
-            ["docker", "inspect", "--format", "{{index .RepoDigests 0}}", f"{repository}:{tag}"],  # noqa: S607  # docker on PATH
+            ["docker", "inspect", "--format", "{{index .RepoDigests 0}}", ref],  # noqa: S607  # docker on PATH
             capture_output=True,
             text=True,
             check=True,

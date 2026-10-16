@@ -272,11 +272,13 @@ def test_write_provenance_then_read_provenance_roundtrips(tmp_path, monkeypatch)
         image_digest=None,
     )
     data = nuk.read_provenance("app")
-    assert data["repo"] == "https://github.com/astrojones/app"
-    assert data["branch"] == "main"
-    assert data["commit"] == "a" * 40
-    assert data["imageDigest"] is None
-    datetime.fromisoformat(data["appliedAt"])
+    assert data is not None
+    assert data.repo == "https://github.com/astrojones/app"
+    assert data.branch == "main"
+    assert data.commit == "a" * 40
+    assert data.image_digest is None
+    assert data.applied_at is not None
+    datetime.fromisoformat(data.applied_at)
 
 
 def test_read_provenance_absent_returns_none(tmp_path, monkeypatch):
@@ -508,7 +510,7 @@ def test_resolve_image_digest_happy_path(monkeypatch):
         raise AssertionError(cmd)
 
     monkeypatch.setattr(nuk.subprocess, "run", fake_run)
-    digest = nuk._resolve_image_digest("app", {"spec": {}})
+    digest = nuk._resolve_image_digest("app", nuk.Spec.model_validate({}))
     assert digest == "ghcr.io/astrojones/app@sha256:abc123"
 
 
@@ -517,7 +519,7 @@ def test_resolve_image_digest_degrades_when_docker_unavailable(monkeypatch):
         raise FileNotFoundError
 
     monkeypatch.setattr(nuk.subprocess, "run", fake_run)
-    assert nuk._resolve_image_digest("app", {"spec": {}}) is None
+    assert nuk._resolve_image_digest("app", nuk.Spec.model_validate({})) is None
 
 
 def test_resolve_image_digest_degrades_on_empty_images_output(monkeypatch):
@@ -526,7 +528,7 @@ def test_resolve_image_digest_degrades_on_empty_images_output(monkeypatch):
         "run",
         lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout=""),  # noqa: ARG005
     )
-    assert nuk._resolve_image_digest("app", {"spec": {}}) is None
+    assert nuk._resolve_image_digest("app", nuk.Spec.model_validate({})) is None
 
 
 # --- _parse_compose_images_json: tolerate null rows and malformed input --------
@@ -544,14 +546,16 @@ def test_parse_compose_images_json_single_null_array_is_empty():
 
 
 def test_parse_compose_images_json_drops_null_rows_keeps_dicts():
-    assert nuk._parse_compose_images_json('[{"Repository":"x"},null]') == [{"Repository": "x"}]
+    assert nuk._parse_compose_images_json('[{"Repository":"x"},null]') == [
+        nuk.ComposeImage("x", None)
+    ]
 
 
 def test_parse_compose_images_json_parses_json_lines_skipping_blanks():
     text = '{"Repository":"x"}\n\n{"Repository":"y"}\n'
     assert nuk._parse_compose_images_json(text) == [
-        {"Repository": "x"},
-        {"Repository": "y"},
+        nuk.ComposeImage("x", None),
+        nuk.ComposeImage("y", None),
     ]
 
 
