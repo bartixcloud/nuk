@@ -426,4 +426,5 @@ def test_rollout_key_resolves_a_tag_ref_through_the_daemon(tmp_path, monkeypatch
         {"type": "blue-green", "health": {"service": "backend", "path": "/health"}}
     )
     monkeypatch.setattr(nuk, "active_colour", lambda _n: "blue")
-    assert nuk._rollout_key("kolbe", nuk.Spec(), migrate, strategy) == "ghcr.io/x/backend@sha256:cafe"
+    key = nuk._rollout_key("kolbe", nuk.Spec(), migrate, strategy)
+    assert key == "ghcr.io/x/backend@sha256:cafe"

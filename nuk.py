@@ -5454,7 +5454,9 @@ def cmd_get() -> None:
         print(f"{name:24} {ps:32} {hosts}")
 
 
-def _configured_service_image(name: str, spec: Spec, service: str, colour: str | None) -> str | None:
+def _configured_service_image(
+    name: str, spec: Spec, service: str, colour: str | None
+) -> str | None:
     """The image reference compose CONFIGURES for `service`, or None if unresolvable.
 
     Resolved per service, with the colour's profile enabled: a blue-green
