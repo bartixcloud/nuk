@@ -696,9 +696,17 @@ def validate_ingress_hosts(org: Org, manifest: Deployment | Facility) -> None:
             die(f"nuk: ingress host {ing.host!r} is not under a managed domain {org.domains}")
 
 
-def sh(*cmd: str, cwd: Path | None = None, timeout: float | None = None) -> None:
-    """Run a command, raising on non-zero exit (or on `timeout`)."""
-    subprocess.run(cmd, cwd=cwd, check=True, timeout=timeout)  # noqa: S603  # fixed argv, no shell
+def sh(
+    *cmd: str,
+    cwd: Path | None = None,
+    timeout: float | None = None,
+    env: dict[str, str] | None = None,
+) -> None:
+    """Run a command, raising on non-zero exit (or on `timeout`).
+
+    `env` replaces the child's environment entirely; `None` inherits ours.
+    """
+    subprocess.run(cmd, cwd=cwd, check=True, timeout=timeout, env=env)  # noqa: S603  # fixed argv
 
 
 def load(path: Path) -> Deployment | Facility:
@@ -5030,6 +5038,25 @@ def latest_release_tag(repo: str = NUK_REPO) -> str | None:
     return tag if isinstance(tag, str) else None
 
 
+def _uv_bin_dir() -> str | None:
+    """The directory the running `nuk` shim lives in, or None if unresolvable.
+
+    `uv tool install` writes its entry point into `UV_TOOL_BIN_DIR` (default
+    `~/.local/bin`), which on a fleet host is not on PATH while the converge unit
+    runs `/usr/local/bin/nuk converge` — so a bare `nuk update` moves the shim and
+    breaks the timer. Pinning the install to the shim's own directory keeps the
+    command that invoked us working.
+    """
+    exe = shutil.which("nuk") or sys.argv[0]
+    if not exe:
+        return None
+    path = Path(exe)
+    # Deliberately not `.resolve()`: the shim is a symlink INTO the tool venv, and
+    # it is the shim's own directory (e.g. `/usr/local/bin`) that must receive the
+    # new one.
+    return str((path if path.is_absolute() else Path.cwd() / path).parent)
+
+
 def cmd_update(to: str | None, check: bool) -> None:
     """Install the latest nuk release (or an explicit ref) via `uv tool install`.
 
@@ -5052,12 +5079,15 @@ def cmd_update(to: str | None, check: bool) -> None:
         print(f"nuk {current} is already up to date ({target})")
         return
     print(f"updating nuk {current} -> {target} via uv tool install...")
+    bin_dir = _uv_bin_dir()
+    env = {**os.environ, "UV_TOOL_BIN_DIR": bin_dir} if bin_dir else None
     try:
-        sh("uv", "tool", "install", "--force", "--from", f"{NUK_GIT}@{target}", "nuk")
+        sh("uv", "tool", "install", "--force", "--from", f"{NUK_GIT}@{target}", "nuk", env=env)
     except (subprocess.SubprocessError, OSError) as e:
+        hint = f"UV_TOOL_BIN_DIR={bin_dir} " if bin_dir else ""
         die(
             f"nuk update: uv install failed ({e}). Is uv installed? "
-            f"Manual: uv tool install --from {NUK_GIT}@{target} nuk"
+            f"Manual: {hint}uv tool install --from {NUK_GIT}@{target} nuk"
         )
     print(f"nuk updated to {target} - run `nuk --version` to confirm")
 
