@@ -1910,7 +1910,7 @@ def origin_org(repo_path: str = ".") -> str | None:
     return m.group(1) if m else None
 
 
-def persist_manifest(spec: Raw, src_path: Path, dest: Path, repo_path: str | None) -> None:
+def persist_manifest(spec: Spec, src_path: Path, dest: Path, repo_path: str | None) -> None:
     """Write the deployment manifest to the controller for nukview to read.
 
     Copied verbatim, except: when applied with --repo-path and the manifest did
@@ -1919,70 +1919,53 @@ def persist_manifest(spec: Raw, src_path: Path, dest: Path, repo_path: str | Non
     --repo-path and whose manifests usually omit source.repo.
 
     Args:
-        spec: The raw parsed manifest dict.
+        spec: The manifest's typed spec; only decides whether to stamp.
         src_path: Path the manifest was read from.
         dest: Destination path on the controller.
         repo_path: The --repo-path checkout, if any.
     """
-    spec_body = spec.get("spec") or {}
-    src = spec_body.get("source") or {}
     origin = git_origin(repo_path) if repo_path else None
-    if origin and not src.get("repo"):
-        spec_body["source"] = {**src, "repo": origin}
-        spec["spec"] = spec_body
-        dest.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
-    else:
+    if not (origin and not spec.source.repo):
         shutil.copy(src_path, dest)
+        return
+    # Re-read the file: the typed spec drops unknown fields and key order, and the
+    # stamped copy must keep what the operator wrote.
+    doc: object = yaml.safe_load(src_path.read_text(encoding="utf-8"))
+    if not isinstance(doc, dict):
+        msg = f"{src_path}: manifest is not a mapping"
+        raise TypeError(msg)
+    body = doc.get("spec") or {}
+    source = body.get("source") or {}
+    body["source"] = {**source, "repo": origin}
+    doc["spec"] = body
+    dest.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
 
 
-def _compose_file(spec: Raw) -> str:
-    """Read `compose.file` from a raw `spec` dict.
-
-    Accepts the bare-string form (`compose: foo.yml`), the mapping form
-    (`compose: {file: foo.yml}`), and a bare null key (`compose:`), which YAML
-    parses to None and which `_NullTolerant` treats as absent elsewhere.
-    """
-    compose = spec.get("compose")
-    if isinstance(compose, str):
-        return compose
-    if isinstance(compose, dict):
-        return compose.get("file", "docker-compose.yml")
-    return "docker-compose.yml"
-
-
-def compose_args(name: str, spec: Raw) -> list[str]:
-    """Build the `docker compose` base argv for an app from its raw spec."""
+def compose_args(name: str, spec: Spec) -> list[str]:
+    """Build the `docker compose` base argv for an app from its spec."""
     repo = _repo_dir(name)
-    spec_body = spec.get("spec") or {}
-    cf = _compose_file(spec_body)
     override = project_dir(name) / "compose.override.yml"
-    args = ["docker", "compose", "-p", name, "-f", str(repo / cf)]
+    args = ["docker", "compose", "-p", name, "-f", str(repo / spec.compose.file)]
     if override.exists():
         args += ["-f", str(override)]
-    for ref in resolve_env_from(spec_body):
+    for ref in resolve_env_from(spec):
         args += ["--env-file", ref]
     return args
 
 
-def resolve_env_from(spec: Raw) -> list[str]:
+def resolve_env_from(spec: Spec) -> list[str]:
     """Resolve `spec.envFrom[].secretRef` entries to existing file paths.
 
-    Uses the same resolution `compose_args` applies for `--env-file`: an entry
-    may be a dict with key `secretRef` or a bare string; only existing paths are
-    kept.
+    Uses the same resolution `compose_args` applies for `--env-file`; only
+    existing paths are kept.
 
     Args:
-        spec: The raw `spec` dict.
+        spec: The typed manifest `spec`.
 
     Returns:
         The existing secret-file paths, in manifest order.
     """
-    refs = []
-    for envfile in spec.get("envFrom") or []:
-        ref = envfile.get("secretRef") if isinstance(envfile, dict) else envfile
-        if ref and Path(ref).exists():
-            refs.append(ref)
-    return refs
+    return [e.secret_ref for e in spec.env_from if e.secret_ref and Path(e.secret_ref).exists()]
 
 
 def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-contract API; one render pass
@@ -2122,7 +2105,7 @@ def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override
     (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc))
 
 
-def compose_service_names(name: str, raw: Raw) -> list[str]:
+def compose_service_names(name: str, spec: Spec) -> list[str]:
     """Return the service names declared in an app's checked-out compose file.
 
     Used by `attachAll` to enumerate every service that should receive the DB
@@ -2131,20 +2114,21 @@ def compose_service_names(name: str, raw: Raw) -> list[str]:
 
     Args:
         name: The deployment name (locates `<project_dir>/repo`).
-        raw: The raw manifest dict (for `spec.compose.file`).
+        spec: The typed manifest `spec` (for `compose.file`).
 
     Returns:
         The compose `services` keys, in file order.
     """
-    cf = _compose_file(raw["spec"])
-    path = _repo_dir(name) / cf
+    path = _repo_dir(name) / spec.compose.file
     if not path.exists():
         return []
-    doc = yaml.safe_load(path.read_text()) or {}
-    return list((doc.get("services") or {}).keys())
+    # The compose file is the app's own, not validated here: only `services` is read.
+    doc: object = yaml.safe_load(path.read_text()) or {}
+    services = doc.get("services") if isinstance(doc, dict) else None
+    return list(services.keys()) if isinstance(services, dict) else []
 
 
-def resolve_db_services(name: str, raw: Raw, db_env: str | None) -> list[str]:
+def resolve_db_services(name: str, spec: Spec, db_env: str | None) -> list[str]:
     """Resolve which compose services the provisioned DB creds attach to.
 
     Precedence: `attachAll` (every compose service) > `attachTo` (explicit list)
@@ -2153,7 +2137,7 @@ def resolve_db_services(name: str, raw: Raw, db_env: str | None) -> list[str]:
 
     Args:
         name: The deployment name.
-        raw: The raw manifest dict.
+        spec: The typed manifest `spec`.
         db_env: The provisioned creds path, or None when no DB was requested.
 
     Returns:
@@ -2161,13 +2145,11 @@ def resolve_db_services(name: str, raw: Raw, db_env: str | None) -> list[str]:
     """
     if not db_env:
         return []
-    databases = raw["spec"].get("databases") or {}
-    if databases.get("attachAll"):
-        return compose_service_names(name, raw)
-    attach_to = databases.get("attachTo")
-    if attach_to:
-        return list(attach_to)
-    return [ing["service"] for ing in raw["spec"].get("ingress", []) or []]
+    if spec.databases.attach_all:
+        return compose_service_names(name, spec)
+    if spec.databases.attach_to:
+        return list(spec.databases.attach_to)
+    return [i.service for i in spec.ingress if i.service]
 
 
 def _rule(ing: Raw) -> str:

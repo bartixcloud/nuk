@@ -302,13 +302,15 @@ def test_override_with_db_joins_data_and_env_file():
 def test_resolve_env_from_filters_to_existing_paths(tmp_path):
     present = tmp_path / "present.env"
     present.write_text("FOO=bar\n")
-    spec = {
-        "envFrom": [
-            {"secretRef": str(present)},
-            {"secretRef": str(tmp_path / "missing.env")},
-            str(tmp_path / "also-missing.env"),
-        ]
-    }
+    spec = nuk.Spec.model_validate(
+        {
+            "envFrom": [
+                {"secretRef": str(present)},
+                {"secretRef": str(tmp_path / "missing.env")},
+                {"secretRef": str(tmp_path / "also-missing.env")},
+            ]
+        }
+    )
     assert nuk.resolve_env_from(spec) == [str(present)]
 
 
@@ -495,8 +497,7 @@ def test_compose_service_names_reads_repo_compose(tmp_path, monkeypatch):
     (repo / "docker-compose.yml").write_text(
         yaml.safe_dump({"services": {"web": {"image": "x"}, "worker": {"image": "y"}}})
     )
-    raw = {"spec": {}}
-    assert sorted(nuk.compose_service_names("app", raw)) == ["web", "worker"]
+    assert sorted(nuk.compose_service_names("app", nuk.Spec())) == ["web", "worker"]
 
 
 def test_compose_service_names_with_bare_string_compose(tmp_path, monkeypatch):
@@ -509,8 +510,8 @@ def test_compose_service_names_with_bare_string_compose(tmp_path, monkeypatch):
     (repo / "docker-compose.data.yml").write_text(
         yaml.safe_dump({"services": {"db": {"image": "x"}}})
     )
-    raw = {"spec": {"compose": "docker-compose.data.yml"}}
-    assert nuk.compose_service_names("app", raw) == ["db"]
+    spec = nuk.Spec.model_validate({"compose": "docker-compose.data.yml"})
+    assert nuk.compose_service_names("app", spec) == ["db"]
 
 
 def test_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
@@ -518,7 +519,7 @@ def test_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
     project_dir = tmp_path / "app" / "repo"
     project_dir.mkdir(parents=True)
-    spec = {"spec": {"compose": "docker-compose.data.yml"}}
+    spec = nuk.Spec.model_validate({"compose": "docker-compose.data.yml"})
     args = nuk.compose_args("app", spec)
     assert str(project_dir / "docker-compose.data.yml") in args
 
@@ -528,14 +529,14 @@ def test_compose_args_with_dict_compose_still_works(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
     project_dir = tmp_path / "app" / "repo"
     project_dir.mkdir(parents=True)
-    spec = {"spec": {"compose": {"file": "docker-compose.data.yml"}}}
+    spec = nuk.Spec.model_validate({"compose": {"file": "docker-compose.data.yml"}})
     args = nuk.compose_args("app", spec)
     assert str(project_dir / "docker-compose.data.yml") in args
 
 
 def test_load_then_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
     """End-to-end: nuk.load() on a manifest with compose as a bare string
-    feeds compose_args via manifest.raw without crashing.
+    feeds compose_args via manifest.spec without crashing.
     """
     monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
     project_dir = tmp_path / "app" / "repo"
@@ -555,29 +556,29 @@ def test_load_then_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
         )
     )
     manifest = nuk.load(manifest_path)
-    args = nuk.compose_args("app", manifest.raw)
+    args = nuk.compose_args("app", manifest.spec)
     assert str(project_dir / "docker-compose.data.yml") in args
     assert manifest.spec.compose.file == "docker-compose.data.yml"
 
 
 def test_resolve_db_services_empty_without_db_env():
-    raw = {"spec": {"ingress": [{"host": "a", "service": "web", "port": 80}]}}
-    assert nuk.resolve_db_services("app", raw, None) == []
+    spec = nuk.Spec.model_validate({"ingress": [{"host": "a", "service": "web", "port": 80}]})
+    assert nuk.resolve_db_services("app", spec, None) == []
 
 
 def test_resolve_db_services_defaults_to_ingress():
-    raw = {"spec": {"ingress": [{"host": "a", "service": "web", "port": 80}]}}
-    assert nuk.resolve_db_services("app", raw, "/x/app-db.env") == ["web"]
+    spec = nuk.Spec.model_validate({"ingress": [{"host": "a", "service": "web", "port": 80}]})
+    assert nuk.resolve_db_services("app", spec, "/x/app-db.env") == ["web"]
 
 
 def test_resolve_db_services_attach_to_wins():
-    raw = {
-        "spec": {
+    spec = nuk.Spec.model_validate(
+        {
             "ingress": [{"host": "a", "service": "web", "port": 80}],
             "databases": {"postgres": True, "attachTo": ["web", "worker"]},
         }
-    }
-    assert nuk.resolve_db_services("app", raw, "/x/app-db.env") == ["web", "worker"]
+    )
+    assert nuk.resolve_db_services("app", spec, "/x/app-db.env") == ["web", "worker"]
 
 
 def test_resolve_db_services_attach_all_enumerates_compose(tmp_path, monkeypatch):
@@ -587,8 +588,8 @@ def test_resolve_db_services_attach_all_enumerates_compose(tmp_path, monkeypatch
     (repo / "docker-compose.yml").write_text(
         yaml.safe_dump({"services": {"worker": {"image": "x"}, "beat": {"image": "y"}}})
     )
-    raw = {"spec": {"databases": {"postgres": True, "attachAll": True}}}
-    assert sorted(nuk.resolve_db_services("batch", raw, "/x/batch-db.env")) == ["beat", "worker"]
+    spec = nuk.Spec.model_validate({"databases": {"postgres": True, "attachAll": True}})
+    assert sorted(nuk.resolve_db_services("batch", spec, "/x/batch-db.env")) == ["beat", "worker"]
 
 
 # --- database identifier / literal guards -------------------------------------
@@ -863,16 +864,16 @@ def test_persist_manifest_stamps_source_repo_from_origin(tmp_path, monkeypatch):
     from the checkout's git origin, so nukview can link the app to its repo.
     """
     monkeypatch.setattr(nuk, "git_origin", lambda p: "https://github.com/astrojones/kolbe")
-    spec = {
+    doc = {
         "apiVersion": "nuk/v1",
         "kind": "Deployment",
         "metadata": {"name": "kolbe"},
         "spec": {"ingress": []},
     }
     src = tmp_path / "deployment.yml"
-    src.write_text("placeholder")
+    src.write_text(yaml.safe_dump(doc), encoding="utf-8")
     dest = tmp_path / "manifest.yml"
-    nuk.persist_manifest(spec, src, dest, "/ws")
+    nuk.persist_manifest(nuk.load(src).spec, src, dest, "/ws")
     out = yaml.safe_load(dest.read_text())
     assert out["spec"]["source"]["repo"] == "https://github.com/astrojones/kolbe"
 
@@ -882,12 +883,7 @@ def test_persist_manifest_preserves_declared_source_repo(tmp_path, monkeypatch):
     declared source wins over the git origin and the file is left untouched.
     """
     monkeypatch.setattr(nuk, "git_origin", lambda p: "https://github.com/astrojones/OTHER")
-    spec = {
-        "apiVersion": "nuk/v1",
-        "kind": "Deployment",
-        "metadata": {"name": "x"},
-        "spec": {"source": {"repo": "https://github.com/astrojones/declared"}},
-    }
+    spec = nuk.Spec.model_validate({"source": {"repo": "https://github.com/astrojones/declared"}})
     src = tmp_path / "deployment.yml"
     src.write_text("verbatim-content")
     dest = tmp_path / "manifest.yml"
@@ -898,11 +894,10 @@ def test_persist_manifest_preserves_declared_source_repo(tmp_path, monkeypatch):
 def test_persist_manifest_verbatim_when_origin_unavailable(tmp_path, monkeypatch):
     """No git origin (e.g. not a github checkout) => plain verbatim copy, no stamp."""
     monkeypatch.setattr(nuk, "git_origin", lambda p: None)
-    spec = {"apiVersion": "nuk/v1", "kind": "Deployment", "metadata": {"name": "x"}, "spec": {}}
     src = tmp_path / "deployment.yml"
     src.write_text("verbatim")
     dest = tmp_path / "manifest.yml"
-    nuk.persist_manifest(spec, src, dest, None)
+    nuk.persist_manifest(nuk.Spec(), src, dest, None)
     assert dest.read_text() == "verbatim"
 
 
@@ -919,16 +914,16 @@ def test_persist_manifest_stamps_bare_spec_from_real_git_origin(tmp_path):
 
     run("git", "init", "-q")
     run("git", "remote", "add", "origin", "https://github.com/astrojones/kolbe.git")
-    spec = {
+    doc = {
         "apiVersion": "nuk/v1",
         "kind": "Deployment",
         "metadata": {"name": "kolbe"},
         "spec": None,
     }
     src = tmp_path / "deployment.yml"
-    src.write_text("spec:\n", encoding="utf-8")
+    src.write_text(yaml.safe_dump(doc), encoding="utf-8")
     dest = tmp_path / "manifest.yml"
-    nuk.persist_manifest(spec, src, dest, str(checkout))
+    nuk.persist_manifest(nuk.load(src).spec, src, dest, str(checkout))
     out = yaml.safe_load(dest.read_text())
     assert out["spec"]["source"]["repo"] == "https://github.com/astrojones/kolbe"
 
@@ -1202,10 +1197,10 @@ def test_host_port_field_parses_via_alias():
 
 def test_compose_args_tolerates_null_compose(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "project_dir", lambda _n: tmp_path)
-    args = nuk.compose_args("app", {"spec": {"compose": None}})
+    args = nuk.compose_args("app", nuk.Spec.model_validate({"compose": None}))
     assert args[0:2] == ["docker", "compose"]
 
 
 def test_compose_service_names_tolerates_null_compose(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "project_dir", lambda _n: tmp_path)
-    assert nuk.compose_service_names("app", {"spec": {"compose": None}}) == []
+    assert nuk.compose_service_names("app", nuk.Spec.model_validate({"compose": None})) == []
