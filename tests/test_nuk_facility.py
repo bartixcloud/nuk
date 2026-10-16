@@ -338,7 +338,7 @@ def test_is_privileged_true_for_root(monkeypatch):
 def test_is_privileged_false_without_group(monkeypatch):
     monkeypatch.setattr(nuk.os, "geteuid", lambda: 1000)
     monkeypatch.setattr(nuk.os, "getgroups", lambda: [1000])
-    monkeypatch.setattr(nuk.grp, "getgrnam", _raise_keyerror)
+    monkeypatch.setattr(nuk.rollout.grp, "getgrnam", _raise_keyerror)
     assert nuk._is_privileged() is False
 
 
@@ -346,9 +346,9 @@ def test_is_privileged_true_via_group(monkeypatch):
     class _Grp:
         gr_gid = 4242
 
-    monkeypatch.setattr(nuk.os, "geteuid", lambda: 1000)
-    monkeypatch.setattr(nuk.os, "getgroups", lambda: [1000, 4242])
-    monkeypatch.setattr(nuk.grp, "getgrnam", lambda _name: _Grp())
+    monkeypatch.setattr(nuk.rollout.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(nuk.rollout.os, "getgroups", lambda: [1000, 4242])
+    monkeypatch.setattr(nuk.rollout.grp, "getgrnam", lambda _name: _Grp())
     assert nuk._is_privileged() is True
 
 
@@ -439,11 +439,11 @@ def test_declaration_only_facility_without_spec_applies(tmp_path, monkeypatch):
 
 
 def test_is_privileged_false_when_nss_is_broken(monkeypatch):
-    monkeypatch.setattr(nuk.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(nuk.rollout.os, "geteuid", lambda: 1000)
 
     def boom(_name):
         msg = "NSS unavailable"
         raise OSError(msg)
 
-    monkeypatch.setattr(nuk.grp, "getgrnam", boom)
+    monkeypatch.setattr(nuk.rollout.grp, "getgrnam", boom)
     assert nuk._is_privileged() is False
