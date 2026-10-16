@@ -168,13 +168,13 @@ def test_git_try_returns_stripped_stdout_in_a_real_repo(tmp_path):
 
 
 def test_result_builds_one_converge_status_entry():
-    assert nuk._result("x", "Deployment") == {
+    assert nuk.ManifestResult("x", "Deployment").to_wire() == {
         "name": "x",
         "kind": "Deployment",
         "result": "ok",
         "error": None,
     }
-    assert nuk._result("x", "Facility", "refused", "why") == {
+    assert nuk.ManifestResult("x", "Facility", "refused", "why").to_wire() == {
         "name": "x",
         "kind": "Facility",
         "result": "refused",
@@ -253,23 +253,32 @@ def test_host_port_is_the_same_number_on_the_publish_and_the_backend(tmp_path):
         }
     )
 
-    for ing in (
+    for raw_ing in (
         {"host": "app.example.com", "service": "web", "port": 8080},
         {"host": "app.example.com", "service": "web", "port": 8080, "hostPort": 18080},
     ):
-        expected = ing.get("hostPort") or ing["port"]
+        ing = nuk.Ingress.model_validate(raw_ing)
+        expected = raw_ing.get("hostPort") or raw_ing["port"]
         assert nuk.backend_address(org, manifest, ing) == f"10.0.10.107:{expected}"
         ov = nuk.build_override("app", [ing], publish_ip="10.0.10.107")
-        assert f"10.0.10.107:{expected}:{ing['port']}" in ov["services"]["web"]["ports"]
+        assert ov is not None
+        ports = ov.to_wire()["services"]["web"]["ports"]
+        assert f"10.0.10.107:{expected}:{raw_ing['port']}" in ports
 
 
 def test_published_port_is_host_port_or_port():
-    assert nuk._published_port({"port": 8080}) == 8080
-    assert nuk._published_port({"port": 8080, "hostPort": 18080}) == 18080
-    assert nuk._published_port({"port": 8080, "hostPort": 0}) == 8080
+    assert nuk._published_port(nuk.Ingress(host="h", service="s", port=8080)) == 8080
+    assert nuk._published_port(nuk.Ingress(host="h", service="s", port=8080, hostPort=18080)) == (
+        18080
+    )
+    assert nuk._published_port(nuk.Ingress(host="h", service="s", port=8080, hostPort=0)) == 8080
 
 
 # --- the idempotent Traefik write ---------------------------------------------
+
+
+def _web(host: str) -> nuk.Ingress:
+    return nuk.Ingress.model_validate({"host": host, "service": "web", "port": 8080})
 
 
 def test_write_ingress_skips_a_byte_identical_rewrite(tmp_path, monkeypatch):
@@ -279,7 +288,7 @@ def test_write_ingress_skips_a_byte_identical_rewrite(tmp_path, monkeypatch):
     must not attempt a write at all.
     """
     monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
-    ingress = [{"host": "a.example.com", "service": "web", "port": 8080}]
+    ingress = [_web("a.example.com")]
     nuk.write_ingress("app", ingress, {})
     target = tmp_path / "app.yml"
     assert target.exists()
@@ -291,16 +300,16 @@ def test_write_ingress_skips_a_byte_identical_rewrite(tmp_path, monkeypatch):
 def test_write_ingress_still_writes_changed_content(tmp_path, monkeypatch):
     """The other half of the guard: it is content-compared, not write-once."""
     monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
-    nuk.write_ingress("app", [{"host": "a.example.com", "service": "web", "port": 8080}], {})
+    nuk.write_ingress("app", [_web("a.example.com")], {})
     target = tmp_path / "app.yml"
     first = target.read_text(encoding="utf-8")
-    nuk.write_ingress("app", [{"host": "b.example.com", "service": "web", "port": 8080}], {})
+    nuk.write_ingress("app", [_web("b.example.com")], {})
     assert target.read_text(encoding="utf-8") != first
 
 
 def test_write_ingress_removes_the_file_when_the_render_is_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
-    nuk.write_ingress("app", [{"host": "a.example.com", "service": "web", "port": 8080}], {})
+    nuk.write_ingress("app", [_web("a.example.com")], {})
     target = tmp_path / "app.yml"
     assert target.exists()
     nuk.write_ingress("app", [], {})
@@ -333,11 +342,11 @@ def test_annotate_routers_probes_hosts_concurrently(monkeypatch):
         return "enabled"
 
     monkeypatch.setattr(nuk, "_probe", probe)
-    routers = [{"rule": f"Host(`{h}`)"} for h in hosts]
+    routers = [nuk.RouterStatus(f"r{i}", f"Host(`{h}`)") for i, h in enumerate(hosts)]
     out = nuk._annotate_routers(routers, hosts)
 
     assert peak >= 2, f"probes never overlapped (peak={peak}) — the pool is not in use"
-    assert [r["live"] for r in out] == ["enabled"] * len(hosts)
+    assert [r.live for r in out] == ["enabled"] * len(hosts)
 
 
 def test_annotate_routers_keeps_the_host_matching_and_the_none_case(monkeypatch):
@@ -345,15 +354,15 @@ def test_annotate_routers_keeps_the_host_matching_and_the_none_case(monkeypatch)
     monkeypatch.setattr(nuk, "_probe", lambda h, timeout=2.5: f"live:{h}")
     out = nuk._annotate_routers(
         [
-            {"rule": "Host(`a.example.com`)"},
-            {"rule": "Host(`b.example.com`) && PathPrefix(`/x`)"},
+            nuk.RouterStatus("a", "Host(`a.example.com`)"),
+            nuk.RouterStatus("b", "Host(`b.example.com`) && PathPrefix(`/x`)"),
         ],
         hosts,
     )
-    assert [r["live"] for r in out] == ["live:a.example.com", "live:b.example.com"]
+    assert [r.live for r in out] == ["live:a.example.com", "live:b.example.com"]
 
-    out = nuk._annotate_routers([{"rule": "Host(`zzz.example.com`)"}], hosts)
-    assert out[0]["live"] is None
+    out = nuk._annotate_routers([nuk.RouterStatus("z", "Host(`zzz.example.com`)")], hosts)
+    assert out[0].live is None
 
     assert nuk._annotate_routers(None, hosts) == []
 

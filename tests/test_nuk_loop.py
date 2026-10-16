@@ -238,7 +238,8 @@ class Fleet:
         )
 
     def status(self):
-        return nuk.read_converge_status(self.state / "converge-status.json")
+        status = nuk.read_converge_status(self.state / "converge-status.json")
+        return None if status is None else status.to_wire()
 
     def last_applied(self, name):
         path = nuk.source_state_dir(self.state, name) / "last-applied-tag"
@@ -762,3 +763,57 @@ def test_no_orphan_report_when_a_source_was_refused(fleet, tmp_path):
 def test_status_json_is_plain_json(fleet):
     fleet.converge()
     json.loads((fleet.state / "converge-status.json").read_text(encoding="utf-8"))
+
+
+def test_converge_status_file_is_byte_identical_to_golden(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "_iso_utc_now", lambda: "2026-01-01T00:00:00Z")
+    block = nuk.SourceBlock(
+        tag="v1.0.0",
+        commit="abc",
+        apply=["deployments"],
+        manifests=[nuk.ManifestResult("hello", "Deployment")],
+    )
+    path = tmp_path / "converge-status.json"
+    nuk.write_converge_status(
+        path,
+        role="app",
+        tenant="astrojones",
+        sources={"astrojones": block},
+        warnings=["legacy"],
+        logging=nuk.LoggingStatus(True, "ok"),
+    )
+    assert path.read_text(encoding="utf-8") == (
+        "{\n"
+        '  "role": "app",\n'
+        '  "tenant": "astrojones",\n'
+        '  "appliedAt": "2026-01-01T00:00:00Z",\n'
+        '  "reapWarnings": [\n'
+        '    "legacy"\n'
+        "  ],\n"
+        '  "sources": {\n'
+        '    "astrojones": {\n'
+        '      "result": "ok",\n'
+        '      "error": null,\n'
+        '      "tag": "v1.0.0",\n'
+        '      "commit": "abc",\n'
+        '      "apply": [\n'
+        '        "deployments"\n'
+        "      ],\n"
+        '      "manifests": [\n'
+        "        {\n"
+        '          "name": "hello",\n'
+        '          "kind": "Deployment",\n'
+        '          "result": "ok",\n'
+        '          "error": null\n'
+        "        }\n"
+        "      ],\n"
+        '      "rendered": [],\n'
+        '      "refusedRoutes": []\n'
+        "    }\n"
+        "  },\n"
+        '  "logging": {\n'
+        '    "healthy": true,\n'
+        '    "detail": "ok"\n'
+        "  }\n"
+        "}\n"
+    )

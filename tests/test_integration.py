@@ -55,7 +55,8 @@ def secrets_dir(tmp_path, monkeypatch):
 @pytest.fixture
 def provisioned(data_stack, secrets_dir):
     """Provision postgres+redis for APP, yield its creds, and purge after."""
-    nuk.provision_databases(APP, {"postgres": {"driver": "asyncpg"}, "redis": True}, [])
+    dbs = nuk.Databases.model_validate({"postgres": {"driver": "asyncpg"}, "redis": True})
+    nuk.provision_databases(APP, dbs, [])
     try:
         yield nuk.read_db_env(APP)
     finally:
@@ -93,7 +94,8 @@ def test_provision_scopes_redis_acl_to_app_prefix(provisioned):
 def test_reapply_is_idempotent_and_reuses_password(provisioned):
     """#9: re-applying reuses the stored password rather than churning creds."""
     before = provisioned["DATABASE_URL"], provisioned["REDIS_URL"]
-    nuk.provision_databases(APP, {"postgres": {"driver": "asyncpg"}, "redis": True}, [])
+    dbs = nuk.Databases.model_validate({"postgres": {"driver": "asyncpg"}, "redis": True})
+    nuk.provision_databases(APP, dbs, [])
     after = nuk.read_db_env(APP)
     assert (after["DATABASE_URL"], after["REDIS_URL"]) == before
 
@@ -104,16 +106,17 @@ def test_injection_attaches_real_creds_to_a_worker(provisioned, secrets_dir):
     data network.
     """
     db_env = str(secrets_dir / f"{APP}-db.env")
-    raw = {
-        "spec": {
+    spec = nuk.Spec.model_validate(
+        {
             "ingress": [{"host": "app.de", "service": "web", "port": 8080}],
             "databases": {"postgres": True, "attachTo": ["web", "worker"]},
         }
-    }
-    db_services = nuk.resolve_db_services(APP, raw, db_env)
+    )
+    db_services = nuk.resolve_db_services(APP, spec, db_env)
     assert db_services == ["web", "worker"]
-    ov = nuk.build_override(APP, raw["spec"]["ingress"], db_env=db_env, db_services=db_services)
-    assert ov["services"]["worker"] == {"networks": ["data"], "env_file": [db_env]}
+    ov = nuk.build_override(APP, spec.ingress, db_env=db_env, db_services=db_services)
+    assert ov is not None
+    assert ov.to_wire()["services"]["worker"] == {"networks": ["data"], "env_file": [db_env]}
     assert "DATABASE_URL" in nuk.read_db_env(APP)
 
 
@@ -121,7 +124,8 @@ def test_purge_drops_db_role_acl_user_and_creds(data_stack, secrets_dir):
     """#9: purge_databases drops the db + role, deletes the redis ACL user, and
     removes the creds file.
     """
-    nuk.provision_databases(APP, {"postgres": True, "redis": True}, [])
+    dbs = nuk.Databases.model_validate({"postgres": True, "redis": True})
+    nuk.provision_databases(APP, dbs, [])
     assert (secrets_dir / f"{APP}-db.env").exists()
 
     nuk.purge_databases(APP)

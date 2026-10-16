@@ -28,10 +28,10 @@ import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Annotated, Literal, NoReturn, Self, cast
 from urllib.parse import urlparse
 
 import typer
@@ -40,7 +40,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    PrivateAttr,
     StringConstraints,
     TypeAdapter,
     ValidationError,
@@ -48,7 +47,10 @@ from pydantic import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Iterator
+    from collections.abc import Callable, Generator, Iterable, Mapping
+
+# The return type of every record's `to_wire()`: exactly what json.dumps / yaml.safe_dump take.
+type Json = dict[str, Json] | list[Json] | str | int | float | bool | None
 
 __version__ = "2.6.1"  # bumped on release by .github/workflows/release.yml
 
@@ -240,6 +242,23 @@ class Databases(_NullTolerant):
     attach_to: list[str] = Field(default=[], alias="attachTo")
     attach_all: bool = Field(default=False, alias="attachAll")
 
+    @property
+    def wants_postgres(self) -> bool:
+        """Whether postgres is requested; the object form `{}` is not (a raw `{}` was falsy)."""
+        if isinstance(self.postgres, Postgres):
+            return bool(self.postgres.model_fields_set)
+        return self.postgres
+
+    @property
+    def wants_redis(self) -> bool:
+        """Whether redis is requested."""
+        return self.redis
+
+    @property
+    def postgres_driver(self) -> str | None:
+        """The URL-scheme driver of the object form; bare `true` has none."""
+        return self.postgres.driver if isinstance(self.postgres, Postgres) else None
+
 
 # The host roles a placement can target and an org host can carry (spec §3.1).
 Role = Literal["edge", "data", "app", "hypervisor", "all-in-one"]
@@ -389,24 +408,12 @@ class FacilitySpec(Spec):
 
 
 class Manifest(_NullTolerant):
-    """The fields every nuk/v1 document shares, whatever its kind.
-
-    Carries the typed view used by the command layer plus the raw parsed dict
-    (`raw`) handed unchanged to the wire-contract render functions, so their
-    YAML output never shifts shape.
-    """
+    """The fields every nuk/v1 document shares, whatever its kind."""
 
     model_config = ConfigDict(populate_by_name=True)
 
     api_version: Literal["nuk/v1"] = Field(alias="apiVersion")
     metadata: Metadata
-
-    _raw: dict = PrivateAttr(default_factory=dict)
-
-    @property
-    def raw(self) -> dict:
-        """The original parsed manifest dict (wire-contract input)."""
-        return self._raw
 
 
 class Deployment(Manifest):
@@ -427,6 +434,595 @@ class Facility(Manifest):
 # typo in `kind` is a validation error rather than a silently-skipped document.
 AnyManifest = Annotated[Deployment | Facility, Field(discriminator="kind")]
 _MANIFEST_ADAPTER = TypeAdapter(AnyManifest)
+
+
+# --- wire records -------------------------------------------------------------
+# Everything nuk writes to disk or prints is a closed schema. These records own the exact
+# key set, key order and present-vs-absent rules, so no call site re-spells them. yaml.safe_dump
+# sorts keys, so for the two YAML outputs only the key set and presence matter; the JSON ones
+# (converge status, provenance, overview) keep insertion order, which is the documented order.
+# `from_wire` is tolerant wherever the source can be stale or half-written (overview,
+# provenance): a value of the wrong type degrades to None/default instead of raising.
+
+
+def _str_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _str_list(value: object) -> list[str]:
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def _int_or_none(value: object) -> int | None:
+    # bool is an int subclass; `port: true` is not a port.
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+# Compose override (write-only)
+
+
+@dataclass(frozen=True)
+class ServiceWiring:
+    """One service's entry in `compose.override.yml`."""
+
+    networks: list[str]
+    ports: list[str] = field(default_factory=list)
+    env_file: list[str] = field(default_factory=list)
+
+    def to_wire(self) -> dict[str, Json]:
+        """`networks` is always present (even empty); `ports`/`env_file` only when non-empty."""
+        out: dict[str, Json] = {"networks": [*self.networks]}
+        if self.ports:
+            out["ports"] = [*self.ports]
+        if self.env_file:
+            out["env_file"] = [*self.env_file]
+        return out
+
+
+@dataclass(frozen=True)
+class ComposeOverride:
+    """The whole `compose.override.yml` document."""
+
+    services: dict[str, ServiceWiring]
+    external_networks: list[str]
+
+    def to_wire(self) -> dict[str, Json]:
+        """`networks` is always present, even as `{}`."""
+        return {
+            "services": {k: v.to_wire() for k, v in self.services.items()},
+            "networks": {n: {"external": True} for n in self.external_networks},
+        }
+
+
+# Traefik dynamic config (write-only)
+
+
+@dataclass(frozen=True)
+class TraefikRouter:
+    """One file-provider router."""
+
+    rule: str
+    entry_points: list[str]
+    service: str
+    tls_cert_resolver: str | None = None
+    middlewares: list[str] = field(default_factory=list)
+    priority: int | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """`tls`, `middlewares` and `priority` are omitted unless set / non-empty."""
+        out: dict[str, Json] = {
+            "rule": self.rule,
+            "entryPoints": [*self.entry_points],
+            "service": self.service,
+        }
+        if self.tls_cert_resolver is not None:
+            out["tls"] = {"certResolver": self.tls_cert_resolver}
+        if self.middlewares:
+            out["middlewares"] = [*self.middlewares]
+        if self.priority is not None:
+            out["priority"] = self.priority
+        return out
+
+
+@dataclass(frozen=True)
+class TraefikService:
+    """A single-backend load balancer."""
+
+    url: str
+
+    def to_wire(self) -> dict[str, Json]:
+        """The `loadBalancer.servers[]` shape Traefik expects."""
+        return {"loadBalancer": {"servers": [{"url": self.url}]}}
+
+
+@dataclass(frozen=True)
+class StripPrefix:
+    """The `stripPrefix` middleware."""
+
+    prefixes: list[str]
+
+    def to_wire(self) -> dict[str, Json]:
+        """Wrap the prefixes under the middleware's type key."""
+        return {"stripPrefix": {"prefixes": [*self.prefixes]}}
+
+
+@dataclass(frozen=True)
+class RedirectRegex:
+    """The `redirectRegex` middleware (the www -> apex 301)."""
+
+    regex: str
+    replacement: str
+    permanent: bool
+
+    def to_wire(self) -> dict[str, Json]:
+        """Wrap the three fields under the middleware's type key."""
+        return {
+            "redirectRegex": {
+                "regex": self.regex,
+                "replacement": self.replacement,
+                "permanent": self.permanent,
+            }
+        }
+
+
+type TraefikMiddleware = StripPrefix | RedirectRegex
+
+
+@dataclass(frozen=True)
+class TraefikConfig:
+    """The whole Traefik dynamic file (`http:` only)."""
+
+    routers: dict[str, TraefikRouter]
+    services: dict[str, TraefikService]
+    middlewares: dict[str, TraefikMiddleware] = field(default_factory=dict)
+
+    def to_wire(self) -> dict[str, Json]:
+        """`middlewares` is omitted when there are none."""
+        http: dict[str, Json] = {
+            "routers": {k: v.to_wire() for k, v in self.routers.items()},
+            "services": {k: v.to_wire() for k, v in self.services.items()},
+        }
+        if self.middlewares:
+            http["middlewares"] = {k: v.to_wire() for k, v in self.middlewares.items()}
+        return {"http": http}
+
+
+# Converge status (JSON; written each cycle and read back by `nuk status` / drift.sh)
+
+type ManifestKind = Literal["Facility", "Deployment", "Database"]
+type ManifestOutcome = Literal["ok", "failed", "refused"]
+
+
+@dataclass(frozen=True)
+class ManifestResult:
+    """One applied manifest's outcome (spec §7.6)."""
+
+    name: str
+    kind: ManifestKind
+    result: ManifestOutcome = "ok"
+    error: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """All four keys, always; `error` is an explicit null on success."""
+        return {"name": self.name, "kind": self.kind, "result": self.result, "error": self.error}
+
+    @classmethod
+    def from_wire(cls, obj: object) -> Self | None:
+        """None for anything that is not a well-formed entry."""
+        if not isinstance(obj, dict):
+            return None
+        name, error = obj.get("name"), obj.get("error")
+        if not isinstance(name, str) or not (error is None or isinstance(error, str)):
+            return None
+        match obj.get("kind"), obj.get("result"):
+            case ("Facility" | "Deployment" | "Database") as kind, (
+                "ok" | "failed" | "refused"
+            ) as result:
+                return cls(name, kind, result, error)
+        return None
+
+
+@dataclass(frozen=True)
+class LoggingStatus:
+    """The logging pipeline's own health; info-only (spec §14.3)."""
+
+    healthy: bool
+    detail: str
+
+    def to_wire(self) -> dict[str, Json]:
+        """Both keys, always."""
+        return {"healthy": self.healthy, "detail": self.detail}
+
+    @classmethod
+    def from_wire(cls, obj: object) -> Self | None:
+        """None for anything that is not a well-formed block."""
+        if not isinstance(obj, dict):
+            return None
+        healthy, detail = obj.get("healthy"), obj.get("detail")
+        if isinstance(healthy, bool) and isinstance(detail, str):
+            return cls(healthy, detail)
+        return None
+
+
+# Not frozen: _prepare_source/_apply_source/_refuse fill the block in place, and the cycle
+# holds the same object in `blocks` while they do.
+@dataclass
+class SourceBlock:
+    """One source's block in the converge status."""
+
+    result: Literal["ok", "refused"] = "ok"
+    error: str | None = None
+    tag: str | None = None
+    commit: str | None = None
+    apply: list[str] = field(default_factory=list)
+    manifests: list[ManifestResult] = field(default_factory=list)
+    rendered: list[str] = field(default_factory=list)
+    refused_routes: list[str] = field(default_factory=list)
+
+    def to_wire(self) -> dict[str, Json]:
+        """All eight keys, always, in this order."""
+        return {
+            "result": self.result,
+            "error": self.error,
+            "tag": self.tag,
+            "commit": self.commit,
+            "apply": [*self.apply],
+            "manifests": [m.to_wire() for m in self.manifests],
+            "rendered": [*self.rendered],
+            "refusedRoutes": [*self.refused_routes],
+        }
+
+    @classmethod
+    def from_wire(cls, obj: object) -> Self | None:
+        """None for a non-conforming block; a missing list reads as empty."""
+        if not isinstance(obj, dict):
+            return None
+        raw_manifests = obj.get("manifests")
+        manifests = [
+            ManifestResult.from_wire(m)
+            for m in (raw_manifests if isinstance(raw_manifests, list) else [])
+        ]
+        error = obj.get("error")
+        if None in manifests or not (error is None or isinstance(error, str)):
+            return None
+        match obj.get("result"):
+            case "ok" | "refused" as result:
+                return cls(
+                    result,
+                    error,
+                    _str_or_none(obj.get("tag")),
+                    _str_or_none(obj.get("commit")),
+                    _str_list(obj.get("apply")),
+                    [m for m in manifests if m is not None],
+                    _str_list(obj.get("rendered")),
+                    _str_list(obj.get("refusedRoutes")),
+                )
+        return None
+
+
+@dataclass(frozen=True)
+class ConvergeStatus:
+    """`converge-status.json`: the last cycle's outcome."""
+
+    role: str
+    tenant: str | None
+    applied_at: str
+    reap_warnings: list[str]
+    sources: dict[str, SourceBlock]
+    logging: LoggingStatus | None = None
+    error: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """`logging` and `error` are absent (never null) unless set."""
+        out: dict[str, Json] = {
+            "role": self.role,
+            "tenant": self.tenant,
+            "appliedAt": self.applied_at,
+            "reapWarnings": [*self.reap_warnings],
+            "sources": {k: v.to_wire() for k, v in self.sources.items()},
+        }
+        if self.logging is not None:
+            out["logging"] = self.logging.to_wire()
+        if self.error is not None:
+            out["error"] = self.error
+        return out
+
+    @classmethod
+    def from_wire(cls, obj: object) -> Self | None:
+        """None when the document is not a converge status (the reader treats it as absent)."""
+        if not isinstance(obj, dict):
+            return None
+        role, raw_sources = obj.get("role"), obj.get("sources")
+        if not isinstance(role, str) or not isinstance(raw_sources, dict):
+            return None
+        sources = {str(k): SourceBlock.from_wire(v) for k, v in raw_sources.items()}
+        parsed = {k: b for k, b in sources.items() if b is not None}
+        if len(parsed) != len(sources):
+            return None
+        return cls(
+            role,
+            _str_or_none(obj.get("tenant")),
+            _str_or_none(obj.get("appliedAt")) or "",
+            _str_list(obj.get("reapWarnings")),
+            parsed,
+            LoggingStatus.from_wire(obj.get("logging")),
+            _str_or_none(obj.get("error")),
+        )
+
+
+# Provenance / docker
+
+
+@dataclass(frozen=True)
+class ReleaseEntry:
+    """One line of `releases/<name>.jsonl`."""
+
+    repo: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+    image_digest: str | None = None
+    applied_at: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """All five keys, always, in this order."""
+        return {
+            "repo": self.repo,
+            "branch": self.branch,
+            "commit": self.commit,
+            "imageDigest": self.image_digest,
+            "appliedAt": self.applied_at,
+        }
+
+    @classmethod
+    def from_wire(cls, data: Mapping[str, object]) -> Self:
+        """Non-string values read as None; legacy entries with fewer keys read fine."""
+        return cls(
+            _str_or_none(data.get("repo")),
+            _str_or_none(data.get("branch")),
+            _str_or_none(data.get("commit")),
+            _str_or_none(data.get("imageDigest")),
+            _str_or_none(data.get("appliedAt")),
+        )
+
+    def same_release(self, other: Self) -> bool:
+        """Same repo/branch/commit/digest: a re-apply refreshes the entry, not the history."""
+        return (self.repo, self.branch, self.commit, self.image_digest) == (
+            other.repo,
+            other.branch,
+            other.commit,
+            other.image_digest,
+        )
+
+
+@dataclass(frozen=True)
+class ComposeImage:
+    """One row of `docker compose images --format json` (docker's PascalCase keys)."""
+
+    repository: str | None
+    tag: str | None
+    container_name: str | None = None
+    image_id: str | None = None
+
+    @classmethod
+    def from_wire(cls, row: Mapping[str, object]) -> Self:
+        """Non-string values read as None."""
+        return cls(
+            _str_or_none(row.get("Repository")),
+            _str_or_none(row.get("Tag")),
+            _str_or_none(row.get("ContainerName")),
+            _str_or_none(row.get("ID")),
+        )
+
+
+@dataclass(frozen=True)
+class GitProvenance:
+    """HEAD's full sha, committer date and web URL; the empty instance means no checkout."""
+
+    full_commit: str | None = None
+    last_commit: str | None = None
+    repo_url: str | None = None
+
+
+# Overview (printed by `nuk status`). The AppSource/AppIngress/AppFeatures readers are NOT the
+# pydantic models: the overview reads a possibly stale, unvalidated manifest.yml and must
+# degrade, not raise (e.g. `Source.branch` defaults to "main", the overview prints null).
+
+
+@dataclass(frozen=True)
+class AppSource:
+    """`spec.source` as the overview shows it."""
+
+    repo: str | None = None
+    branch: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """Both keys, always."""
+        return {"repo": self.repo, "branch": self.branch}
+
+    @classmethod
+    def from_wire(cls, obj: object) -> Self:
+        """Non-string values read as None."""
+        data = obj if isinstance(obj, dict) else {}
+        return cls(_str_or_none(data.get("repo")), _str_or_none(data.get("branch")))
+
+
+@dataclass(frozen=True)
+class AppIngress:
+    """One `spec.ingress[]` entry as the overview shows it."""
+
+    host: str
+    service: str | None = None
+    port: int | None = None
+    path: str | None = None
+    auth: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """All five keys, always."""
+        return {
+            "host": self.host,
+            "service": self.service,
+            "port": self.port,
+            "path": self.path,
+            "auth": self.auth,
+        }
+
+    @classmethod
+    def from_wire(cls, obj: object) -> Self | None:
+        """None for an entry without a usable host (the overview skips those)."""
+        if not isinstance(obj, dict):
+            return None
+        host = obj.get("host")
+        if not isinstance(host, str) or not host:
+            return None
+        return cls(
+            host,
+            _str_or_none(obj.get("service")),
+            _int_or_none(obj.get("port")),
+            _str_or_none(obj.get("path")),
+            _str_or_none(obj.get("auth")),
+        )
+
+
+@dataclass(frozen=True)
+class AppFeatures:
+    """The declared backing services."""
+
+    postgres: bool = False
+    redis: bool = False
+    postgres_driver: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """All three keys, always."""
+        return {
+            "postgres": self.postgres,
+            "redis": self.redis,
+            "postgresDriver": self.postgres_driver,
+        }
+
+    @classmethod
+    def from_databases(cls, obj: object) -> Self:
+        """Read a raw `spec.databases` value; same truthiness the manifest has always had."""
+        data = obj if isinstance(obj, dict) else {}
+        pg = data.get("postgres")
+        driver = pg.get("driver") if isinstance(pg, dict) else None
+        return cls(bool(pg), bool(data.get("redis")), _str_or_none(driver))
+
+
+@dataclass(frozen=True)
+class Workflow:
+    """A GitHub Actions workflow file."""
+
+    file: str
+    name: str
+    triggers: list[str] = field(default_factory=list)
+
+    def to_wire(self) -> dict[str, Json]:
+        """All three keys, always."""
+        return {"file": self.file, "name": self.name, "triggers": [*self.triggers]}
+
+
+@dataclass(frozen=True)
+class RouterStatus:
+    """A router nuk rendered, with the optional live probe."""
+
+    id: str
+    rule: str
+    live: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """All three keys, always; `live` is null unless probed."""
+        return {"id": self.id, "rule": self.rule, "live": self.live}
+
+
+@dataclass(frozen=True)
+class AppOverview:
+    """One app's entry in the overview."""
+
+    name: str
+    hosts: list[str]
+    source: AppSource | None
+    repo_url: str | None
+    commit: str | None
+    commit_url: str | None
+    last_commit: str | None
+    version: str | None
+    routers: list[RouterStatus]
+    drift: Literal["in-sync", "drift", "unknown"]
+    features: AppFeatures
+    workflows: list[Workflow]
+    ingress: list[AppIngress]
+    notes: list[str]
+    image_digest: str | None
+
+    def to_wire(self) -> dict[str, Json]:
+        """Every key, always (null, never omitted), in the order `nukview` has been reading."""
+        return {
+            "name": self.name,
+            "hosts": [*self.hosts],
+            "source": self.source.to_wire() if self.source is not None else None,
+            "repoUrl": self.repo_url,
+            "commit": self.commit,
+            "commitUrl": self.commit_url,
+            "lastCommit": self.last_commit,
+            "version": self.version,
+            "routers": [r.to_wire() for r in self.routers],
+            "drift": self.drift,
+            "features": self.features.to_wire(),
+            "workflows": [w.to_wire() for w in self.workflows],
+            "ingress": [i.to_wire() for i in self.ingress],
+            "notes": [*self.notes],
+            "imageDigest": self.image_digest,
+        }
+
+
+@dataclass(frozen=True)
+class SollVsIst:
+    """`status --all`: declared org hosts against what this command observed."""
+
+    declared_hosts: int
+    observed_hosts: int
+    declared_apps: int | None
+    observed_apps: int
+
+    def to_wire(self) -> dict[str, Json]:
+        """All four keys, always; `declaredApps` is null (nukorg/v1 declares no apps)."""
+        return {
+            "declaredHosts": self.declared_hosts,
+            "observedHosts": self.observed_hosts,
+            "declaredApps": self.declared_apps,
+            "observedApps": self.observed_apps,
+        }
+
+
+@dataclass(frozen=True)
+class Overview:
+    """The org-wide document `nuk status` prints."""
+
+    apps: list[AppOverview]
+    live_routing_available: bool
+    nuk_root: str
+    generated_at: str
+    errors: list[str]
+    converge: ConvergeStatus | None = None
+    hosts: list[Host] | None = None
+    soll_vs_ist: SollVsIst | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """`converge`, `hosts` and `sollVsIst` are absent unless set (the last two: `--all`)."""
+        out: dict[str, Json] = {
+            "apps": [a.to_wire() for a in self.apps],
+            "liveRoutingAvailable": self.live_routing_available,
+            "nukRoot": self.nuk_root,
+            "generatedAt": self.generated_at,
+            "errors": [*self.errors],
+        }
+        if self.converge is not None:
+            out["converge"] = self.converge.to_wire()
+        if self.hosts is not None:
+            out["hosts"] = [h.model_dump(by_alias=True) for h in self.hosts]
+        if self.soll_vs_ist is not None:
+            out["sollVsIst"] = self.soll_vs_ist.to_wire()
+        return out
 
 
 # --- org capability manifest (nukorg/v1) --------------------------------------
@@ -701,8 +1297,7 @@ def load(path: Path) -> Deployment | Facility:
         path: Path to the manifest YAML.
 
     Returns:
-        The validated manifest, carrying the raw parsed dict for the render
-        functions.
+        The validated manifest.
 
     Raises:
         NukError: If the document is not a valid nuk/v1 Deployment or Facility.
@@ -712,7 +1307,6 @@ def load(path: Path) -> Deployment | Facility:
         manifest = _MANIFEST_ADAPTER.validate_python(raw)
     except ValidationError:
         die(f"{path}: not a nuk/v1 Deployment or Facility")
-    manifest._raw = raw  # noqa: SLF001  # stash wire-contract input on its own model
     return manifest
 
 
@@ -1305,7 +1899,7 @@ def origin_org(repo_path: str = ".") -> str | None:
     return m.group(1) if m else None
 
 
-def persist_manifest(spec: dict, src_path: Path, dest: Path, repo_path: str | None) -> None:
+def persist_manifest(spec: Spec, src_path: Path, dest: Path, repo_path: str | None) -> None:
     """Write the deployment manifest to the controller for nukview to read.
 
     Copied verbatim, except: when applied with --repo-path and the manifest did
@@ -1314,75 +1908,58 @@ def persist_manifest(spec: dict, src_path: Path, dest: Path, repo_path: str | No
     --repo-path and whose manifests usually omit source.repo.
 
     Args:
-        spec: The raw parsed manifest dict.
+        spec: The manifest's typed spec; only decides whether to stamp.
         src_path: Path the manifest was read from.
         dest: Destination path on the controller.
         repo_path: The --repo-path checkout, if any.
     """
-    spec_body = spec.get("spec") or {}
-    src = spec_body.get("source") or {}
     origin = git_origin(repo_path) if repo_path else None
-    if origin and not src.get("repo"):
-        spec_body["source"] = {**src, "repo": origin}
-        spec["spec"] = spec_body
-        dest.write_text(yaml.safe_dump(spec, sort_keys=False), encoding="utf-8")
-    else:
+    if not (origin and not spec.source.repo):
         shutil.copy(src_path, dest)
+        return
+    # Re-read the file: the typed spec drops unknown fields and key order, and the
+    # stamped copy must keep what the operator wrote.
+    doc: object = yaml.safe_load(src_path.read_text(encoding="utf-8"))
+    if not isinstance(doc, dict):
+        msg = f"{src_path}: manifest is not a mapping"
+        raise TypeError(msg)
+    body = doc.get("spec") or {}
+    source = body.get("source") or {}
+    body["source"] = {**source, "repo": origin}
+    doc["spec"] = body
+    dest.write_text(yaml.safe_dump(doc, sort_keys=False), encoding="utf-8")
 
 
-def _compose_file(spec: dict) -> str:
-    """Read `compose.file` from a raw `spec` dict.
-
-    Accepts the bare-string form (`compose: foo.yml`), the mapping form
-    (`compose: {file: foo.yml}`), and a bare null key (`compose:`), which YAML
-    parses to None and which `_NullTolerant` treats as absent elsewhere.
-    """
-    compose = spec.get("compose")
-    if isinstance(compose, str):
-        return compose
-    if isinstance(compose, dict):
-        return compose.get("file", "docker-compose.yml")
-    return "docker-compose.yml"
-
-
-def compose_args(name: str, spec: dict) -> list[str]:
-    """Build the `docker compose` base argv for an app from its raw spec."""
+def compose_args(name: str, spec: Spec) -> list[str]:
+    """Build the `docker compose` base argv for an app from its spec."""
     repo = _repo_dir(name)
-    spec_body = spec.get("spec") or {}
-    cf = _compose_file(spec_body)
     override = project_dir(name) / "compose.override.yml"
-    args = ["docker", "compose", "-p", name, "-f", str(repo / cf)]
+    args = ["docker", "compose", "-p", name, "-f", str(repo / spec.compose.file)]
     if override.exists():
         args += ["-f", str(override)]
-    for ref in resolve_env_from(spec_body):
+    for ref in resolve_env_from(spec):
         args += ["--env-file", ref]
     return args
 
 
-def resolve_env_from(spec: dict) -> list[str]:
+def resolve_env_from(spec: Spec) -> list[str]:
     """Resolve `spec.envFrom[].secretRef` entries to existing file paths.
 
-    Uses the same resolution `compose_args` applies for `--env-file`: an entry
-    may be a dict with key `secretRef` or a bare string; only existing paths are
-    kept.
+    Uses the same resolution `compose_args` applies for `--env-file`; only
+    existing paths are kept.
 
     Args:
-        spec: The raw `spec` dict.
+        spec: The typed manifest `spec`.
 
     Returns:
         The existing secret-file paths, in manifest order.
     """
-    refs = []
-    for envfile in spec.get("envFrom") or []:
-        ref = envfile.get("secretRef") if isinstance(envfile, dict) else envfile
-        if ref and Path(ref).exists():
-            refs.append(ref)
-    return refs
+    return [e.secret_ref for e in spec.env_from if e.secret_ref and Path(e.secret_ref).exists()]
 
 
 def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-contract API; one render pass
     name: str,  # noqa: ARG001  # kept for signature stability (frozen wire-contract API / tests)
-    ingress: list[dict],
+    ingress: list[Ingress],
     db_env: str | None = None,
     env_from: list[str] | None = None,
     db_services: list[str] | None = None,
@@ -1390,7 +1967,7 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
     local_data: bool = True,
     *,
     colours: list[str] | None = None,
-) -> dict | None:
+) -> ComposeOverride | None:
     """Compose override wiring services to the shared edge/data networks + secrets.
 
     Each service gets an `env_file` list so its container actually receives the
@@ -1439,7 +2016,8 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
         The override doc, or None when no service needs any wiring.
     """
     env_from = env_from or []
-    ingress_services = [ing["service"] for ing in ingress]
+    # An address-only entry (a backend outside this host) has no compose service to wire.
+    ingress_services = [ing.service for ing in ingress if ing.service is not None]
     db_targets = (list(ingress_services) if db_env else []) if db_services is None else db_services
     db_set = set(db_targets) if db_env else set()
     # Ingress order first, then any db-only (non-ingress) services, deduped.
@@ -1449,14 +2027,14 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
     publish_ports: dict[str, list[str]] = {}
     if publish_ip:
         for ing in ingress:
-            svc, port = ing.get("service"), ing.get("port")
+            svc, port = ing.service, ing.port
             if svc and port is not None:
                 host_port = _published_port(ing)
                 mapping = f"{publish_ip}:{host_port}:{port}"
                 publish_ports.setdefault(svc, [])
                 if mapping not in publish_ports[svc]:
                     publish_ports[svc].append(mapping)
-    services: dict = {}
+    services: dict[str, ServiceWiring] = {}
     uses_edge = False
     uses_data = False
     for svc_name in ordered:
@@ -1468,38 +2046,33 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
         )
         uses_edge = uses_edge or "edge" in nets
         uses_data = uses_data or "data" in nets
-        env_files = [*env_from, *([db_env] if is_db else [])]
+        env_files = [*env_from, *([db_env] if is_db and db_env else [])]
         # Router mode expands each base service onto its colour profile keys, so
         # the same wiring (networks, creds, no published port) lands on the
         # containers the router actually resolves.
         for key in [f"{svc_name}-{c}" for c in colours] if colours else [svc_name]:
-            svc: dict = {"networks": list(nets)}
-            if publish_ip and svc_name in publish_ports:
-                svc["ports"] = list(publish_ports[svc_name])
-            if env_files:
-                svc["env_file"] = list(env_files)
-            services[key] = svc
+            services[key] = ServiceWiring(
+                networks=nets, ports=publish_ports.get(svc_name, []), env_file=env_files
+            )
     if not services:
         return None
-    networks: dict = {}
-    if uses_edge:
-        networks["edge"] = {"external": True}
-    if uses_data:
-        networks["data"] = {"external": True}
-    return {"services": services, "networks": networks}
+    external = [n for n, used in (("edge", uses_edge), ("data", uses_data)) if used]
+    return ComposeOverride(services=services, external_networks=external)
 
 
-def _published_port(ing: dict) -> int:
+def _published_port(ing: Ingress) -> int:
     """The host port a non-entry host publishes an ingress on: `hostPort`, else `port`.
 
     The publish (build_override) and the edge's backend (backend_address) must agree.
     """
-    return ing.get("hostPort") or ing["port"]
+    port = ing.host_port or ing.port
+    assert port is not None  # noqa: S101  # narrows int|None for ty; a publish always has a port
+    return port
 
 
 def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override's frozen API
     name: str,
-    ingress: list[dict],
+    ingress: list[Ingress],
     db_env: str | None = None,
     env_from: list[str] | None = None,
     db_services: list[str] | None = None,
@@ -1514,10 +2087,10 @@ def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override
     )
     if doc is None:
         return
-    (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc))
+    (project_dir(name) / "compose.override.yml").write_text(yaml.safe_dump(doc.to_wire()))
 
 
-def compose_service_names(name: str, raw: dict) -> list[str]:
+def compose_service_names(name: str, spec: Spec) -> list[str]:
     """Return the service names declared in an app's checked-out compose file.
 
     Used by `attachAll` to enumerate every service that should receive the DB
@@ -1526,20 +2099,21 @@ def compose_service_names(name: str, raw: dict) -> list[str]:
 
     Args:
         name: The deployment name (locates `<project_dir>/repo`).
-        raw: The raw manifest dict (for `spec.compose.file`).
+        spec: The typed manifest `spec` (for `compose.file`).
 
     Returns:
         The compose `services` keys, in file order.
     """
-    cf = _compose_file(raw["spec"])
-    path = _repo_dir(name) / cf
+    path = _repo_dir(name) / spec.compose.file
     if not path.exists():
         return []
-    doc = yaml.safe_load(path.read_text()) or {}
-    return list((doc.get("services") or {}).keys())
+    # The compose file is the app's own, not validated here: only `services` is read.
+    doc: object = yaml.safe_load(path.read_text()) or {}
+    services = doc.get("services") if isinstance(doc, dict) else None
+    return list(services.keys()) if isinstance(services, dict) else []
 
 
-def resolve_db_services(name: str, raw: dict, db_env: str | None) -> list[str]:
+def resolve_db_services(name: str, spec: Spec, db_env: str | None) -> list[str]:
     """Resolve which compose services the provisioned DB creds attach to.
 
     Precedence: `attachAll` (every compose service) > `attachTo` (explicit list)
@@ -1548,7 +2122,7 @@ def resolve_db_services(name: str, raw: dict, db_env: str | None) -> list[str]:
 
     Args:
         name: The deployment name.
-        raw: The raw manifest dict.
+        spec: The typed manifest `spec`.
         db_env: The provisioned creds path, or None when no DB was requested.
 
     Returns:
@@ -1556,20 +2130,18 @@ def resolve_db_services(name: str, raw: dict, db_env: str | None) -> list[str]:
     """
     if not db_env:
         return []
-    databases = raw["spec"].get("databases") or {}
-    if databases.get("attachAll"):
-        return compose_service_names(name, raw)
-    attach_to = databases.get("attachTo")
-    if attach_to:
-        return list(attach_to)
-    return [ing["service"] for ing in raw["spec"].get("ingress", []) or []]
+    if spec.databases.attach_all:
+        return compose_service_names(name, spec)
+    if spec.databases.attach_to:
+        return list(spec.databases.attach_to)
+    return [i.service for i in spec.ingress if i.service]
 
 
-def _rule(ing: dict) -> str:
+def _rule(ing: Ingress) -> str:
     """Build the Traefik router rule for one ingress entry."""
-    rule = f"Host(`{ing['host']}`)"
-    if ing.get("path"):
-        rule += f" && PathPrefix(`{ing['path']}`)"
+    rule = f"Host(`{ing.host}`)"
+    if ing.path:
+        rule += f" && PathPrefix(`{ing.path}`)"
     return rule
 
 
@@ -1597,12 +2169,12 @@ def _container_name(name: str, service: str, colour: str | None = None) -> str:
 
 def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; clean extraction would obscure the per-field ordering
     name: str,
-    ingress: list[dict],
+    ingress: list[Ingress],
     vocab: dict[str, list[str]],
     *,
     colour: str | None = None,
     dialect: str = "edge",
-) -> dict | None:
+) -> TraefikConfig | None:
     """Render the Traefik file-provider doc, or None to remove the dynamic file.
 
     Each entry needs host + (service/port, a local docker "edge"-network
@@ -1642,22 +2214,19 @@ def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; cle
         return None
     is_mesh = dialect == "mesh"
     entry_point = "mesh" if is_mesh else "websecure"
-    routers, services, middlewares = {}, {}, {}
+    cert_resolver = None if is_mesh else "letsencrypt"
+    routers: dict[str, TraefikRouter] = {}
+    services: dict[str, TraefikService] = {}
+    middlewares: dict[str, TraefikMiddleware] = {}
     for i, ing in enumerate(ingress):
         rid = f"{name}-{i}"
-        router = {
-            "rule": _rule(ing),
-            "entryPoints": [entry_point],
-            "service": rid,
-            **({} if is_mesh else {"tls": {"certResolver": "letsencrypt"}}),
-        }
-        mw = []
+        mw: list[str] = []
         # ⚠ The refusals below are load-bearing. The chain this replaced once had no
         #   `else`, and an unrecognised value fell through to a router with no auth
         #   middleware and no error — a security control failing OPEN. The lookup
         #   keeps that closed and widens it: an undeclared capability, and a
         #   capability whose chain is empty, are BOTH refusals (spec §5.4).
-        want = ing.get("auth")
+        want = ing.auth
         if want is not None:
             capability = want
             if capability not in vocab:
@@ -1676,9 +2245,9 @@ def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; cle
                 )
                 raise ValueError(msg)
             mw += vocab[capability]
-        if ing.get("path") and ing.get("stripPrefix"):
+        if ing.path and ing.strip_prefix:
             sid = f"{rid}-strip"
-            middlewares[sid] = {"stripPrefix": {"prefixes": [ing["path"]]}}
+            middlewares[sid] = StripPrefix(prefixes=[ing.path])
             mw.append(sid)
         # Every app router inherits the controller-wide branded maintenance page:
         # 502-504 from the backend → the maintenance service (see global.yml). The
@@ -1686,45 +2255,46 @@ def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; cle
         # Only the edge ships that file; the mesh dialect leaves it off.
         if not is_mesh:
             mw.append("maintenance-errors@file")
-        if mw:
-            router["middlewares"] = mw
-        if "priority" in ing:
-            router["priority"] = ing["priority"]
-        routers[rid] = router
+        routers[rid] = TraefikRouter(
+            rule=_rule(ing),
+            entry_points=[entry_point],
+            service=rid,
+            tls_cert_resolver=cert_resolver,
+            middlewares=mw,
+            priority=ing.priority,
+        )
         # `address` (remote host:port) bypasses the local edge-network container
         # naming convention entirely — used for backends on another host (e.g. a
         # libvirt VM reached over the private vswitch/cloud-network).
-        if ing.get("address"):
-            backend = ing["address"]
+        if ing.address:
+            backend = ing.address
         else:
-            backend = f"{_container_name(name, ing['service'], colour)}:{ing['port']}"
-        services[rid] = {"loadBalancer": {"servers": [{"url": f"http://{backend}"}]}}
-        if ing.get("www"):
-            host = ing["host"]
+            # The Ingress validator requires service+port unless address is set.
+            assert ing.service is not None  # noqa: S101  # narrows the optional for ty
+            assert ing.port is not None  # noqa: S101  # narrows the optional for ty
+            backend = f"{_container_name(name, ing.service, colour)}:{ing.port}"
+        services[rid] = TraefikService(url=f"http://{backend}")
+        if ing.www:
+            host = ing.host
             wid, rdid = f"{rid}-www", f"{rid}-www-redirect"
-            middlewares[rdid] = {
-                "redirectRegex": {
-                    "regex": rf"^https?://www\.{re.escape(host)}/(.*)",
-                    "replacement": f"https://{host}/${{1}}",
-                    "permanent": True,
-                }
-            }
-            routers[wid] = {
-                "rule": f"Host(`www.{host}`)",
-                "entryPoints": [entry_point],
-                "service": rid,
-                "middlewares": [rdid],
-                **({} if is_mesh else {"tls": {"certResolver": "letsencrypt"}}),
-            }
-    http = {"routers": routers, "services": services}
-    if middlewares:
-        http["middlewares"] = middlewares
-    return {"http": http}
+            middlewares[rdid] = RedirectRegex(
+                regex=rf"^https?://www\.{re.escape(host)}/(.*)",
+                replacement=f"https://{host}/${{1}}",
+                permanent=True,
+            )
+            routers[wid] = TraefikRouter(
+                rule=f"Host(`www.{host}`)",
+                entry_points=[entry_point],
+                service=rid,
+                tls_cert_resolver=cert_resolver,
+                middlewares=[rdid],
+            )
+    return TraefikConfig(routers=routers, services=services, middlewares=middlewares)
 
 
 def write_ingress(
     name: str,
-    ingress: list[dict],
+    ingress: list[Ingress],
     vocab: dict[str, list[str]],
     *,
     colour: str | None = None,
@@ -1740,7 +2310,7 @@ def write_ingress(
     if doc is None:
         target.unlink(missing_ok=True)
         return
-    text = yaml.safe_dump(doc)
+    text = yaml.safe_dump(doc.to_wire())
     # Every write is an fsnotify event that makes Traefik rebuild its whole dynamic
     # config, and the loop re-applies every cycle — skip identical content.
     try:
@@ -2157,7 +2727,7 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
 
 
 @contextmanager
-def converge_lock(state_dir: Path) -> Iterator[bool]:
+def converge_lock(state_dir: Path) -> Generator[bool]:
     """Hold the whole-cycle lock, yielding False if another run already holds it.
 
     Non-blocking, and contention is exit 0: a skipped cycle is harmless because
@@ -2217,7 +2787,7 @@ def provision_remote_databases(
     *,
     self_ip: str | None = None,
     org: Org | None = None,
-) -> list[dict]:
+) -> list[ManifestResult]:
     """Provision every deployment's databases on this host IF it owns the capability.
 
     The placement-gate exception (spec §3.1): a deployment placed `app` is a
@@ -2231,20 +2801,21 @@ def provision_remote_databases(
     provider = env_facility(facilities, _DATABASES_CAPABILITY)
     if provider is None or not placement_matches(provider, role, self_ip=self_ip, org=org):
         return []
-    out: list[dict] = []
+    out: list[ManifestResult] = []
     for path in sorted((tree / DEPLOYMENT_DIR).glob("*.yml")):
         try:
             manifest = load(path)
         except SystemExit as e:
-            out.append(_result(path.name, "Database", "failed", _exit_reason(e, "load failed")))
+            out.append(
+                ManifestResult(path.name, "Database", "failed", _exit_reason(e, "load failed"))
+            )
             continue
         if manifest.kind != "Deployment":
             continue
-        dbs = manifest.raw.get("spec", {}).get("databases") or {}
-        if not (dbs.get("postgres") or dbs.get("redis")):
+        dbs = manifest.spec.databases
+        if not (dbs.wants_postgres or dbs.wants_redis):
             continue
         name = manifest.metadata.name
-        entry = _result(name, "Database")
         try:
             # remote_ip=None → the LOCAL data stack is provisioned, on this host.
             provision_databases(name, dbs, facilities, remote_ip=None)
@@ -2253,18 +2824,15 @@ def provision_remote_databases(
             # `_psql` uses check=True, so a SQL failure (disk full, role/db
             # conflict, container hiccup) surfaces as CalledProcessError, not
             # SystemExit. The data host still writes converge-status.json.
-            entry["result"] = "failed"
-            if isinstance(e, SystemExit):
-                entry["error"] = _exit_reason(e, "provision failed")
-            else:
-                entry["error"] = f"provision failed: {e}"
-        out.append(entry)
+            error = (
+                _exit_reason(e, "provision failed")
+                if isinstance(e, SystemExit)
+                else f"provision failed: {e}"
+            )
+            out.append(ManifestResult(name, "Database", "failed", error))
+            continue
+        out.append(ManifestResult(name, "Database"))
     return out
-
-
-def _result(name: str, kind: str, result: str = "ok", error: str | None = None) -> dict:
-    """One converge-status manifest entry (spec §7.6)."""
-    return {"name": name, "kind": kind, "result": result, "error": error}
 
 
 def _exit_reason(e: SystemExit, default: str) -> str:
@@ -2288,7 +2856,7 @@ def _deployment_tree(ctx: TreeContext, manifest: Deployment, path: Path) -> Path
     return branch / path.relative_to(ctx.tree)
 
 
-def apply_tree(ctx: TreeContext) -> list[dict]:  # noqa: C901  # placement ambiguity is recorded per manifest, not raised out of the loop
+def apply_tree(ctx: TreeContext) -> list[ManifestResult]:  # noqa: C901  # placement ambiguity is recorded per manifest, not raised out of the loop
     """Apply this host's Facilities, then its Deployments (spec §7 steps 6-7).
 
     Facilities first within a cycle (§7.1): effect VOCABULARY is git-derived and
@@ -2314,28 +2882,33 @@ def apply_tree(ctx: TreeContext) -> list[dict]:  # noqa: C901  # placement ambig
         ctx: The source's tree, this host's identity and what the source may change.
 
     Returns:
-        One `{"name", "kind", "result", "error"}` entry per manifest this host
-        owns, facilities first, each directory in filename order. `result` is
-        "ok", "failed", or "refused".
+        One ManifestResult per manifest this host owns, facilities first, each
+        directory in filename order. `result` is "ok", "failed", or "refused".
     """
     tree, role = ctx.tree, ctx.role
-    results: list[dict] = []
+    results: list[ManifestResult] = []
     failed_caps: set[str] = set()
-    for kind, directory in (("Facility", FACILITY_DIR), ("Deployment", DEPLOYMENT_DIR)):
+    kinds: tuple[tuple[ManifestKind, str], ...] = (
+        ("Facility", FACILITY_DIR),
+        ("Deployment", DEPLOYMENT_DIR),
+    )
+    for kind, directory in kinds:
         if directory not in ctx.apply:
             continue
         for path in sorted((tree / directory).glob("*.yml")):
             try:
                 manifest = load(path)
             except SystemExit as e:
-                results.append(_result(path.name, kind, "failed", _exit_reason(e, "load failed")))
+                results.append(
+                    ManifestResult(path.name, kind, "failed", _exit_reason(e, "load failed"))
+                )
                 continue
             if manifest.kind != kind:
                 continue
             try:
                 matches = placement_matches(manifest, role, self_ip=ctx.self_ip, org=ctx.org)
             except ValueError as e:
-                results.append(_result(manifest.metadata.name, kind, "failed", str(e)))
+                results.append(ManifestResult(manifest.metadata.name, kind, "failed", str(e)))
                 continue
             if not matches:
                 continue
@@ -2347,7 +2920,7 @@ def apply_tree(ctx: TreeContext) -> list[dict]:  # noqa: C901  # placement ambig
                         f"consumes {sorted(poisoned)} from a facility that "
                         f"failed its health gate this cycle (spec §7.5)"
                     )
-                    results.append(_result(manifest.metadata.name, kind, "refused", reason))
+                    results.append(ManifestResult(manifest.metadata.name, kind, "refused", reason))
                     continue
                 apply_path = _deployment_tree(ctx, manifest, path)
             # A signed (non-unsigned) deployment must BUILD the signed tag, not the
@@ -2364,29 +2937,27 @@ def apply_tree(ctx: TreeContext) -> list[dict]:  # noqa: C901  # placement ambig
                 if isinstance(manifest, Deployment) and not manifest.spec.source.unsigned
                 else None
             )
-            entry = _result(manifest.metadata.name, kind)
             try:
                 cmd_apply(apply_path, None, ctx=ctx, pin_commit=pin_commit)
             except (SystemExit, ValueError, subprocess.CalledProcessError, OSError) as e:
-                entry["result"] = "failed"
-                entry["error"] = (
-                    _exit_reason(e, "apply failed") if isinstance(e, SystemExit) else str(e)
-                )
+                error = _exit_reason(e, "apply failed") if isinstance(e, SystemExit) else str(e)
+                results.append(ManifestResult(manifest.metadata.name, kind, "failed", error))
                 if isinstance(manifest, Facility):
                     failed_caps |= _provided_capabilities(manifest)
-            results.append(entry)
+                continue
+            results.append(ManifestResult(manifest.metadata.name, kind))
     # The placement exception (spec §3.1) runs in addition to the filter above: a
     # `{placement: app}` deployment is a container/ingress no-op here but its
     # `spec.databases` fragment is still this host's job when it owns the
     # facility. A deployment the loop already produced (applied, refused, failed)
     # was provisioned by `cmd_apply` itself — the sweep must not double it.
-    handled = {r["name"] for r in results if r["kind"] == "Deployment"}
+    handled = {r.name for r in results if r.kind == "Deployment"}
     results.extend(
         r
         for r in provision_remote_databases(
             tree, role, ctx.facilities, self_ip=ctx.self_ip, org=ctx.org
         )
-        if r["name"] not in handled
+        if r.name not in handled
     )
     return results
 
@@ -2437,39 +3008,35 @@ def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a d
     *,
     role: str,
     tenant: str | None,
-    sources: dict[str, dict],
+    sources: dict[str, SourceBlock],
     warnings: list[str],
-    logging: dict | None = None,
+    logging: LoggingStatus | None = None,
     error: str | None = None,
 ) -> None:
     """Record the cycle's outcome (spec §7.6, contracts C3).
 
-    `sources` maps each source name to its block `{result, error, tag, commit, apply,
-    manifests, rendered, refusedRoutes}`. `logging` is the LOGGING pipeline's own health —
+    `sources` maps each source name to its block. `logging` is the LOGGING pipeline's own health —
     info-only (spec §14.3): recorded, never a per-manifest result, never a failure
     condition; absent for non-edge cycles. `error` is set when the cycle could not even
     start (an unreadable sources.yml), so a failure is still a status, not silence.
 
     Consumed by `drift.sh` and by `nuk status`.
     """
-    payload: dict = {
-        "role": role,
-        "tenant": tenant,
-        "appliedAt": _iso_utc_now(),
-        "reapWarnings": warnings,
-        "sources": sources,
-    }
-    if logging is not None:
-        payload["logging"] = logging
-    if error is not None:
-        payload["error"] = error
-    _atomic_write(path, json.dumps(payload, indent=2) + "\n")
+    status = ConvergeStatus(
+        role=role,
+        tenant=tenant,
+        applied_at=_iso_utc_now(),
+        reap_warnings=warnings,
+        sources=sources,
+        logging=logging,
+        error=error,
+    )
+    _atomic_write(path, json.dumps(status.to_wire(), indent=2) + "\n")
 
 
-def read_converge_status(path: Path = CONVERGE_STATUS) -> dict | None:
+def read_converge_status(path: Path = CONVERGE_STATUS) -> ConvergeStatus | None:
     """The last recorded cycle, or None if absent/unreadable/malformed."""
-    data = _read_json_safe(path)
-    return data if isinstance(data, dict) else None
+    return ConvergeStatus.from_wire(_read_json_safe(path))
 
 
 _SOURCE_FAILURES = (ValueError, SystemExit, subprocess.CalledProcessError, OSError)
@@ -2477,7 +3044,7 @@ _SOURCE_FAILURES = (ValueError, SystemExit, subprocess.CalledProcessError, OSErr
 
 def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are all read, none derived
     src: SourceEntry,
-    block: dict,
+    block: SourceBlock,
     *,
     role: str,
     self_ip: str | None,
@@ -2503,7 +3070,7 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
         )
         raise ValueError(msg)
     tag, tag_sha, branch_sha = sync_source(src, signers_dir, state_dir)
-    block.update(tag=tag, commit=tag_sha)
+    block.tag, block.commit = tag, tag_sha
     print(f"target: {src.name} {tag} ({tag_sha[:12]}) role={role}")
     repo = source_state_dir(state_dir, src.name) / "repo"
     tag_tree = scratch / src.name / "tag"
@@ -2525,23 +3092,26 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
 
 
 def _apply_source(
-    src: SourceEntry, ctx: TreeContext, block: dict, state_dir: Path, auth: HostAuth
+    src: SourceEntry, ctx: TreeContext, block: SourceBlock, state_dir: Path, auth: HostAuth
 ) -> None:
     """Apply a prepared source: manifests, then routes; record it applied only if all went well."""
-    block["manifests"] = apply_tree(ctx)
+    block.manifests = apply_tree(ctx)
     if "routes" in src.apply and ctx.role in _ENTRY_ROLES:
         routes = render_routes(ctx, auth)
-        block["rendered"] = routes.rendered
-        block["refusedRoutes"] = routes.refused
+        block.rendered = routes.rendered
+        block.refused_routes = routes.refused
+    # _prepare_source always sets both before a source reaches the apply pass.
+    assert block.tag is not None  # noqa: S101  # narrows the union for ty
+    assert block.commit is not None  # noqa: S101  # narrows the union for ty
     record_applied(
-        block["tag"], block["commit"], source_state_dir(state_dir, src.name) / "last-applied-tag"
+        block.tag, block.commit, source_state_dir(state_dir, src.name) / "last-applied-tag"
     )
 
 
-def _refuse(src: SourceEntry, block: dict, e: BaseException) -> None:
-    block["result"] = "refused"
-    block["error"] = _exit_reason(e, "converge refused") if isinstance(e, SystemExit) else str(e)
-    print(f"REFUSING source {src.name}: {block['error']}", file=sys.stderr)
+def _refuse(src: SourceEntry, block: SourceBlock, e: BaseException) -> None:
+    block.result = "refused"
+    block.error = _exit_reason(e, "converge refused") if isinstance(e, SystemExit) else str(e)
+    print(f"REFUSING source {src.name}: {block.error}", file=sys.stderr)
 
 
 def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are all read, none derived
@@ -2553,7 +3123,7 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
     state_dir: Path,
     scratch: Path,
     platform: Path | None,
-) -> tuple[dict, TreeContext | None]:
+) -> tuple[SourceBlock, TreeContext | None]:
     """PREPARE one source (sync/verify/archive); never raises for a source-level failure.
 
     The apply step moved to `_run_cycle`'s second pass so every source's tree is known
@@ -2564,16 +3134,7 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
         (None when that failed, or when the platform tree is incomplete) — the platform's
         context is what tenant sources build on. `result` is "refused" on any failure here.
     """
-    block: dict = {
-        "result": "ok",
-        "error": None,
-        "tag": None,
-        "commit": None,
-        "apply": list(src.apply),
-        "manifests": [],
-        "rendered": [],
-        "refusedRoutes": [],
-    }
+    block = SourceBlock(apply=[str(a) for a in src.apply])
     try:
         ctx = _prepare_source(
             src,
@@ -2587,7 +3148,7 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
         )
         if src.is_platform and ctx.org is None:
             msg = (
-                f"the platform tree at {block['tag']} lacks {DEFAULT_ORG_FILE} — "
+                f"the platform tree at {block.tag} lacks {DEFAULT_ORG_FILE} — "
                 f"backends and routes resolve from it and cannot be guessed"
             )
             raise ValueError(msg)  # noqa: TRY301  # same refusal path as every other failure here
@@ -2609,7 +3170,7 @@ class _UnknownAuthorizationError(NukError):
 def _load_prepared_delegations(
     prepared: list[tuple[SourceEntry, TreeContext]],
     *,
-    blocks: dict[str, dict],
+    blocks: dict[str, SourceBlock],
 ) -> tuple[dict[str, list[Delegation]], list[tuple[SourceEntry, TreeContext]]]:
     """Load each routable prepared owner's `delegations.yml`, refusing a malformed one (spec §2).
 
@@ -2655,7 +3216,7 @@ def _refuse_bad_declarations(
     registry: TenantRegistry,
     delegations: dict[str, list[Delegation]],
     *,
-    blocks: dict[str, dict],
+    blocks: dict[str, SourceBlock],
 ) -> list[tuple[SourceEntry, TreeContext]]:
     """Refuse each source whose declarations do not validate; return the survivors.
 
@@ -2700,7 +3261,7 @@ def _host_auth(
     *,
     state_dir: Path,
     refused: list[SourceEntry],
-    blocks: dict[str, dict],
+    blocks: dict[str, SourceBlock],
 ) -> tuple[HostAuth, list[tuple[SourceEntry, TreeContext]]]:
     """Build the cycle's host authorization from the registry and every owner's loans.
 
@@ -2733,16 +3294,14 @@ def _host_auth(
         # the cache would add nothing but a spurious "not in the registry" refusal.
         if not src.is_platform and "routes" in src.apply and platform_ctx is not None:
             delegations[src.name] = _cached_delegations(state_dir, src.name)
-    surviving = _refuse_bad_declarations(
-        prepared_ok, refused, registry, delegations, blocks=blocks
-    )
+    surviving = _refuse_bad_declarations(prepared_ok, refused, registry, delegations, blocks=blocks)
     for src, ctx in surviving:
         if ctx.tenant is not None and "routes" in src.apply:
             store_delegations(state_dir, ctx.tenant, delegations[ctx.tenant])
     return HostAuth(registry, delegations), surviving
 
 
-def _logging_status(role: str, platform_ctx: TreeContext | None) -> dict | None:
+def _logging_status(role: str, platform_ctx: TreeContext | None) -> LoggingStatus | None:
     """The LOGGING pipeline's own health (spec §14.3): info-only, edge cycles only."""
     if role != "edge" or platform_ctx is None:
         return None
@@ -2750,18 +3309,18 @@ def _logging_status(role: str, platform_ctx: TreeContext | None) -> dict | None:
     if facility is None:
         return None
     reason = facility_health(facility)
-    return {"healthy": reason is None, "detail": reason or "ok"}
+    return LoggingStatus(healthy=reason is None, detail=reason or "ok")
 
 
 def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
     sources: list[SourceEntry],
-    blocks: dict[str, dict],
+    blocks: dict[str, SourceBlock],
     *,
     role: str,
     self_ip: str | None,
     signers_dir: Path,
     state_dir: Path,
-) -> tuple[list[str], dict | None, bool, str | None]:
+) -> tuple[list[str], LoggingStatus | None, bool, str | None]:
     """Converge every source, platform first; fill `blocks`.
 
     Two passes: first PREPARE every source (fetch/verify/archive) and keep its context, so
@@ -2815,7 +3374,7 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
                 except _SOURCE_FAILURES as e:
                     _refuse(src, blocks[src.name], e)
         trees = [ctx.tree for _src, ctx in applied]
-        clean = cycle_error is None and all(b["result"] == "ok" for b in blocks.values())
+        clean = cycle_error is None and all(b.result == "ok" for b in blocks.values())
         # A refused source has no tree this cycle, so its apps would all read as orphans;
         # only a clean cycle can tell what is really undeclared.
         warnings = reap_report(*trees) if clean else []
@@ -2839,9 +3398,9 @@ def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> i
             print("another converge run holds the lock; skipping this cycle")
             return 0
         role, self_ip = read_self()
-        blocks: dict[str, dict] = {}
+        blocks: dict[str, SourceBlock] = {}
         warnings: list[str] = []
-        logging_status: dict | None = None
+        logging_status: LoggingStatus | None = None
         error: str | None = None
         code = 1
         sources: list[SourceEntry] = []
@@ -3161,7 +3720,7 @@ def _router_present(facilities: list[Facility]) -> bool:
 
 
 def backend_address(
-    org: Org, manifest: Deployment, ing: dict, *, router_present: bool = False
+    org: Org, manifest: Deployment, ing: Ingress, *, router_present: bool = False
 ) -> str:
     """Where the edge should send traffic for one ingress entry.
 
@@ -3180,8 +3739,8 @@ def backend_address(
             has several hosts and none is marked default (ambiguous), or the
             placement names a `host` the org does not declare.
     """
-    if ing.get("address"):
-        return ing["address"]
+    if ing.address:
+        return ing.address
     placement = manifest.spec.placement
     if placement is None:
         msg = (
@@ -3284,8 +3843,8 @@ def _refuse_route(host: str, owner: str | None, refused: list[str]) -> None:
 
 
 def _authorized_ingress(
-    ingress: list[dict], tenant: str, auth: HostAuth | None, refused: list[str]
-) -> list[dict]:
+    ingress: list[Ingress], tenant: str, auth: HostAuth | None, refused: list[str]
+) -> list[Ingress]:
     """The ingress entries a tenant source may render, `www.` included (spec §3/§6).
 
     A host resolving to anyone but `tenant` is refused. `www.<host>` is a second,
@@ -3293,20 +3852,20 @@ def _authorized_ingress(
     too, or the redirect router is an unauthenticated hijack vector. Without that
     coverage the variant is dropped — the apex router still renders.
     """
-    allowed: list[dict] = []
+    allowed: list[Ingress] = []
     for ing in ingress:
-        host = str(ing.get("host", ""))
+        host = ing.host
         owner = auth.resolve(host) if auth is not None else None
         if owner != tenant:
             _refuse_route(host, owner, refused)
             continue
         entry = ing
-        if ing.get("www"):
+        if ing.www:
             www_host = f"www.{host}"
             www_owner = auth.resolve(www_host) if auth is not None else None
             if www_owner != tenant:
                 _refuse_route(www_host, www_owner, refused)
-                entry = {k: v for k, v in ing.items() if k != "www"}
+                entry = ing.model_copy(update={"www": False})
         allowed.append(entry)
     return allowed
 
@@ -3367,7 +3926,7 @@ def _render_routers(
     rendered: list[str] = []
     refused: list[str] = []
     for manifest in deployments:
-        ingress = manifest.raw.get("spec", {}).get("ingress") or []
+        ingress = manifest.spec.ingress
         if not ingress:
             continue
         # A deployment placed on an entry host runs ALONGSIDE Traefik, so
@@ -3389,8 +3948,14 @@ def _render_routers(
                 continue
             ingress = allowed
         resolved = [
-            {k: v for k, v in ing.items() if k not in {"service", "port", "hostPort"}}
-            | {"address": backend_address(org, manifest, ing, router_present=router_present)}
+            ing.model_copy(
+                update={
+                    "address": backend_address(org, manifest, ing, router_present=router_present),
+                    "service": None,
+                    "port": None,
+                    "host_port": None,
+                }
+            )
             for ing in ingress
         ]
         name = manifest.metadata.name
@@ -3841,13 +4406,13 @@ def data_host_ip(org: Org) -> str | None:
 
 
 def provision_databases(
-    app: str, databases: dict, facilities: list[Facility], *, remote_ip: str | None = None
+    app: str, databases: Databases, facilities: list[Facility], *, remote_ip: str | None = None
 ) -> str | None:
     """Provision the databases a manifest requested.
 
     Args:
         app: The app name.
-        databases: The raw `spec.databases` dict.
+        databases: The manifest's `spec.databases`.
         facilities: The tree's Facility manifests, to check the `databases`
             env capability is actually declared before binding against it.
         remote_ip: The data host's private IP when this host is NOT the data
@@ -3858,9 +4423,8 @@ def provision_databases(
         The path to the creds env-file the override should inject, or None when
         no databases are requested.
     """
-    pg = databases.get("postgres")
-    want_pg = bool(pg)
-    want_redis = bool(databases.get("redis"))
+    want_pg = databases.wants_postgres
+    want_redis = databases.wants_redis
     if not (want_pg or want_redis):
         return None
     # Fail closed before touching the data stack: binding against a facility the
@@ -3889,7 +4453,7 @@ def provision_databases(
         env: dict[str, str] = {}  # remote mode derives fresh; never carry stale keys
         if want_pg:
             pw = derive_db_password(seed, "pg", app)
-            env["DATABASE_URL"] = _pg_url(app, pw, remote_ip, _pg_driver(pg))
+            env["DATABASE_URL"] = _pg_url(app, pw, remote_ip, databases.postgres_driver)
         if want_redis:
             env["REDIS_URL"] = _redis_url(app, derive_db_password(seed, "redis", app), remote_ip)
         return write_db_env(app, env)
@@ -3897,7 +4461,9 @@ def provision_databases(
     prev = read_db_env(app)
     env = {}
     if want_pg:
-        env["DATABASE_URL"] = ensure_postgres(app, prev.get("DATABASE_URL"), _pg_driver(pg))
+        env["DATABASE_URL"] = ensure_postgres(
+            app, prev.get("DATABASE_URL"), databases.postgres_driver
+        )
     if want_redis:
         env["REDIS_URL"] = ensure_redis(app, prev.get("REDIS_URL"))
     return write_db_env(app, env)
@@ -3968,7 +4534,7 @@ def _releases_path(name: str) -> Path:
     return RELEASES / f"{name}.jsonl"
 
 
-def read_provenance_history(name: str) -> list[dict]:
+def read_provenance_history(name: str) -> list[ReleaseEntry]:
     """Every recorded release for `name`, oldest first; `[]` if none.
 
     Reads /var/lib/nuk/releases/<name>.jsonl, skipping unparseable lines — a
@@ -3982,11 +4548,11 @@ def read_provenance_history(name: str) -> list[dict]:
     if not path.exists():
         data = _read_json_safe(_provenance_path(name))
         if isinstance(data, dict):
-            return [data]
+            return [ReleaseEntry.from_wire(data)]
         if isinstance(data, list):
-            return [e for e in data if isinstance(e, dict)]
+            return [ReleaseEntry.from_wire(e) for e in data if isinstance(e, dict)]
         return []
-    entries: list[dict] = []
+    entries: list[ReleaseEntry] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
@@ -3995,11 +4561,11 @@ def read_provenance_history(name: str) -> list[dict]:
         except ValueError:
             continue
         if isinstance(entry, dict):
-            entries.append(entry)
+            entries.append(ReleaseEntry.from_wire(entry))
     return entries
 
 
-def read_provenance(name: str) -> dict | None:
+def read_provenance(name: str) -> ReleaseEntry | None:
     """The CURRENT release for `name`, or None if nothing is recorded.
 
     Signature and contract unchanged across the history migration: `cmd_status`
@@ -4031,22 +4597,21 @@ def write_provenance(
         commit: The full deployed commit sha, if resolvable.
         image_digest: The deployed image's digest, if resolvable.
     """
-    entry = {
-        "repo": repo,
-        "branch": branch,
-        "commit": commit,
-        "imageDigest": image_digest,
-        "appliedAt": _iso_utc_now(),
-    }
+    entry = ReleaseEntry(
+        repo=repo,
+        branch=branch,
+        commit=commit,
+        image_digest=image_digest,
+        applied_at=_iso_utc_now(),
+    )
     history = read_provenance_history(name)
-    identity = ("repo", "branch", "commit", "imageDigest")
-    if history and all(history[-1].get(k) == entry[k] for k in identity):
+    if history and history[-1].same_release(entry):
         history[-1] = entry
     else:
         history.append(entry)
     RELEASES.mkdir(parents=True, exist_ok=True)
     _releases_path(name).write_text(
-        "".join(json.dumps(e) + "\n" for e in history[-RELEASE_LIMIT:]),
+        "".join(json.dumps(e.to_wire()) + "\n" for e in history[-RELEASE_LIMIT:]),
         encoding="utf-8",
     )
 
@@ -4056,7 +4621,7 @@ def _full_commit_sha(repo_dir: Path) -> str | None:
     return _git_try(repo_dir, "rev-parse", "HEAD")
 
 
-def _parse_compose_images_json(text: str) -> list[dict]:
+def _parse_compose_images_json(text: str) -> list[ComposeImage]:
     """Parse `docker compose images --format json` output (one array or JSON-lines)."""
     text = text.strip()
     if not text:
@@ -4069,26 +4634,22 @@ def _parse_compose_images_json(text: str) -> list[dict]:
             rows = [json.loads(line) for line in text.splitlines() if line.strip()]
     except (ValueError, json.JSONDecodeError):
         return []
-    return [row for row in rows if isinstance(row, dict)]
+    return [ComposeImage.from_wire(row) for row in rows if isinstance(row, dict)]
 
 
-def _primary_container(name: str, raw: dict) -> str | None:
+def _primary_container(name: str, spec: Spec) -> str | None:
     """Container name of the deployment's primary service, or None if it names none.
 
     The probe service of a blue-green strategy (in the active colour), else the
     first ingress backend: the service whose image IS the release.
     """
-    spec = raw.get("spec") or {}
-    strategy = spec.get("strategy") or {}
-    if strategy.get("type") == "blue-green":
-        service = (strategy.get("health") or {}).get("service")
-        return _container_name(name, service, active_colour(name)) if service else None
-    ingress = spec.get("ingress") or []
-    service = ingress[0].get("service") if ingress else None
+    if spec.strategy is not None and spec.strategy.type == "blue-green":
+        return _container_name(name, spec.strategy.health.service, active_colour(name))
+    service = spec.ingress[0].service if spec.ingress else None
     return _container_name(name, service) if service else None
 
 
-def _resolve_image_digest(name: str, raw: dict) -> str | None:
+def _resolve_image_digest(name: str, spec: Spec) -> str | None:
     """Best-effort digest of the app's primary compose image, or None if unresolvable.
 
     `compose images` lists rows in no stable order, so the row is the primary
@@ -4098,7 +4659,7 @@ def _resolve_image_digest(name: str, raw: dict) -> str | None:
     """
     try:
         proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
-            [*compose_args(name, raw), "images", "--format", "json"],
+            [*compose_args(name, spec), "images", "--format", "json"],
             capture_output=True,
             text=True,
             check=True,
@@ -4107,17 +4668,16 @@ def _resolve_image_digest(name: str, raw: dict) -> str | None:
     except (subprocess.SubprocessError, OSError):
         return None
     rows = _parse_compose_images_json(proc.stdout)
-    if not rows:
+    if not rows or not rows[0].repository:
         return None
-    primary = _primary_container(name, raw)
-    row = next(
-        (r for r in rows if primary and r.get("ContainerName") == primary),
-        min(rows, key=lambda r: r.get("ContainerName") or ""),
+    primary = _primary_container(name, spec)
+    image = next(
+        (r for r in rows if primary and r.container_name == primary),
+        min(rows, key=lambda r: r.container_name or ""),
     )
-    repository = row.get("Repository")
-    if not repository:
+    if not image.repository:
         return None
-    reference = f"{repository}:{row['Tag']}" if row.get("Tag") else row.get("ID")
+    reference = f"{image.repository}:{image.tag}" if image.tag else image.image_id
     if not reference:
         return None
     try:
@@ -4141,7 +4701,7 @@ def _resolve_image_digest(name: str, raw: dict) -> str | None:
 # source — this never throws out of build_overview().
 
 
-def _read_yaml_safe(path: Path) -> dict | list | None:
+def _read_yaml_safe(path: Path) -> object:
     """Best-effort YAML read: None on any I/O or parse error, never raises."""
     try:
         return yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -4157,21 +4717,21 @@ def _read_json_safe(path: Path) -> object:
         return None
 
 
-def _git_provenance(repo_dir: Path) -> dict:
+def _git_provenance(repo_dir: Path) -> GitProvenance:
     """Full commit sha + committer date + github web URL for `repo_dir`'s HEAD.
 
-    Returns {} when there is no checkout / no commit — the caller degrades that
-    field rather than failing.
+    Returns the empty GitProvenance when there is no checkout / no commit — the
+    caller degrades that field rather than failing.
     """
     out = _git_try(repo_dir, "log", "-1", "--format=%H%x09%cI")
     if not out:
-        return {}
+        return GitProvenance()
     full_commit, _, date = out.partition("\t")
-    return {
-        "full_commit": full_commit,
-        "last_commit": date or None,
-        "repo_url": git_origin(str(repo_dir)),
-    }
+    return GitProvenance(
+        full_commit=full_commit,
+        last_commit=date or None,
+        repo_url=git_origin(str(repo_dir)),
+    )
 
 
 _VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
@@ -4195,12 +4755,12 @@ def _read_version(repo_dir: Path) -> str | None:
     return _git_try(repo_dir, "describe", "--tags", "--always", "--abbrev=7")
 
 
-def _list_workflows(repo_dir: Path) -> list[dict]:
+def _list_workflows(repo_dir: Path) -> list[Workflow]:
     """GitHub Actions workflows in `repo_dir`, with normalised trigger events."""
     wf_dir = repo_dir / ".github" / "workflows"
     if not wf_dir.is_dir():
         return []
-    out = []
+    out: list[Workflow] = []
     for f in sorted(wf_dir.iterdir()):
         if f.suffix not in {".yml", ".yaml"}:
             continue
@@ -4213,27 +4773,29 @@ def _list_workflows(repo_dir: Path) -> list[dict]:
         if isinstance(on, str):
             triggers = [on]
         elif isinstance(on, list):
-            triggers = on
+            triggers = [str(t) for t in on]
         elif isinstance(on, dict):
-            triggers = list(on.keys())
+            triggers = [str(k) for k in on]
         else:
             triggers = []
         name = doc.get("name")
         wf_name = name if isinstance(name, str) else f.name
-        out.append({"file": f.name, "name": wf_name, "triggers": triggers})
+        out.append(Workflow(f.name, wf_name, triggers))
     return out
 
 
-def _dynamic_routers(name: str) -> list[dict] | None:
+def _dynamic_routers(name: str) -> list[RouterStatus] | None:
     """Router id/rule pairs nuk rendered into the Traefik file provider for `name`."""
     doc = _read_yaml_safe(_router_file(name))
     http = doc.get("http") if isinstance(doc, dict) else None
     routers = http.get("routers") if isinstance(http, dict) else None
-    if not routers:
+    if not isinstance(routers, dict) or not routers:
         return None
-    return [
-        {"id": rid, "rule": (r or {}).get("rule", ""), "live": None} for rid, r in routers.items()
-    ]
+    out: list[RouterStatus] = []
+    for rid, r in routers.items():
+        rule = r.get("rule") if isinstance(r, dict) else None
+        out.append(RouterStatus(rid, rule if isinstance(rule, str) else "", None))
+    return out
 
 
 def _probe(host: str, timeout: float = 2.5) -> str | None:
@@ -4255,18 +4817,20 @@ def _probe(host: str, timeout: float = 2.5) -> str | None:
     return "missing" if status >= 500 else "enabled"  # noqa: PLR2004  # HTTP status code, not a magic number
 
 
-def _annotate_routers(routers: list[dict] | None, hosts: list[str]) -> list[dict]:
+def _annotate_routers(routers: list[RouterStatus] | None, hosts: list[str]) -> list[RouterStatus]:
     """Attach a best-effort live probe to each router, matched by its rule's host."""
     with ThreadPoolExecutor(max_workers=8) as pool:
         live_by_host = dict(zip(hosts, pool.map(_probe, hosts), strict=True))
-    out = []
+    out: list[RouterStatus] = []
     for r in routers or []:
-        host = next((h for h in hosts if f"`{h}`" in r.get("rule", "")), None)
-        out.append({**r, "live": live_by_host.get(host) if host else None})
+        host = next((h for h in hosts if f"`{h}`" in r.rule), None)
+        out.append(replace(r, live=live_by_host.get(host) if host else None))
     return out
 
 
-def _drift_for(hosts: list[str], routers: list[dict] | None) -> str:
+def _drift_for(
+    hosts: list[str], routers: list[RouterStatus] | None
+) -> Literal["in-sync", "drift", "unknown"]:
     """Two-file consistency check between the manifest's hosts and Traefik's routers.
 
     Does every manifest ingress host appear in a router nuk actually rendered?
@@ -4278,41 +4842,27 @@ def _drift_for(hosts: list[str], routers: list[dict] | None) -> str:
         return "unknown"
     if routers is None:
         return "drift"
-    blob = " ".join(r.get("rule", "") for r in routers)
+    blob = " ".join(r.rule for r in routers)
     return "in-sync" if all(f"`{h}`" in blob for h in hosts) else "drift"
 
 
-def _overview_ingress_fields(spec: dict) -> tuple[list[str], list[dict]]:
+def _overview_ingress_fields(spec: object) -> tuple[list[str], list[AppIngress]]:
     """Deduped host list + full ingress view list from a manifest's `spec.ingress`."""
-    entries = [i for i in (spec.get("ingress") or []) if isinstance(i, dict) and i.get("host")]
-    hosts = list(dict.fromkeys(i["host"] for i in entries))
-    ingress = [
-        {
-            "host": i["host"],
-            "service": i.get("service"),
-            "port": i.get("port"),
-            "path": i.get("path"),
-            "auth": i.get("auth"),
-        }
-        for i in entries
-    ]
+    raw = spec.get("ingress") if isinstance(spec, dict) else None
+    entries = raw if isinstance(raw, list) else []
+    ingress = [a for a in map(AppIngress.from_wire, entries) if a is not None]
+    hosts = list(dict.fromkeys(a.host for a in ingress))
     return hosts, ingress
 
 
-def _overview_features(spec: dict) -> dict:
+def _overview_features(spec: object) -> AppFeatures:
     """`spec.databases` -> the declared-backing-services view."""
-    databases = spec.get("databases")
-    databases = databases if isinstance(databases, dict) else {}
-    pg = databases.get("postgres")
-    return {
-        "postgres": bool(pg),
-        "redis": bool(databases.get("redis")),
-        "postgresDriver": _pg_driver(pg),
-    }
+    data = spec if isinstance(spec, dict) else {}
+    return AppFeatures.from_databases(data.get("databases"))
 
 
 def _overview_provenance(
-    name: str, source_raw: dict | None
+    name: str, source: AppSource | None
 ) -> tuple[str | None, str | None, str | None, str | None, str | None]:
     """commit/commitUrl/repoUrl/lastCommit/imageDigest, provenance.json-first.
 
@@ -4324,24 +4874,22 @@ def _overview_provenance(
     provenance = read_provenance(name)
     git_prov = _git_provenance(repo_dir)
 
-    full_commit = (provenance or {}).get("commit") or git_prov.get("full_commit")
+    full_commit = (provenance.commit if provenance else None) or git_prov.full_commit
     commit = full_commit[:12] if full_commit else None
 
-    web = git_prov.get("repo_url")
+    web = git_prov.repo_url
     commit_url = f"{web}/commit/{full_commit}" if web and full_commit else None
-    declared_repo_url = (
-        github_url(source_raw["repo"]) if source_raw and source_raw.get("repo") else None
-    )
+    declared_repo_url = github_url(source.repo) if source and source.repo else None
     return (
         commit,
         commit_url,
         declared_repo_url or web,
-        git_prov.get("last_commit"),
-        (provenance or {}).get("imageDigest"),
+        git_prov.last_commit,
+        provenance.image_digest if provenance else None,
     )
 
 
-def _read_app_overview(name: str, *, probe_enabled: bool = False) -> dict:
+def _read_app_overview(name: str, *, probe_enabled: bool = False) -> AppOverview:
     """Build one app's Overview entry from on-disk state. Degrades; never raises."""
     notes: list[str] = []
     manifest_raw = _read_yaml_safe(_manifest_file(name))
@@ -4351,12 +4899,12 @@ def _read_app_overview(name: str, *, probe_enabled: bool = False) -> dict:
     spec = spec if isinstance(spec, dict) else {}
 
     hosts, ingress = _overview_ingress_fields(spec)
-    source_raw = spec.get("source") if isinstance(spec.get("source"), dict) else None
+    source_raw = spec.get("source")
     source = (
-        {"repo": source_raw.get("repo"), "branch": source_raw.get("branch")} if source_raw else None
+        AppSource.from_wire(source_raw) if isinstance(source_raw, dict) and source_raw else None
     )
 
-    commit, commit_url, repo_url, last_commit, image_digest = _overview_provenance(name, source_raw)
+    commit, commit_url, repo_url, last_commit, image_digest = _overview_provenance(name, source)
     if not commit:
         notes.append("no git checkout / commit unavailable")
 
@@ -4364,26 +4912,26 @@ def _read_app_overview(name: str, *, probe_enabled: bool = False) -> dict:
     routers = _dynamic_routers(name)
     routers_out = _annotate_routers(routers, hosts) if probe_enabled else (routers or [])
 
-    return {
-        "name": name,
-        "hosts": hosts,
-        "source": source,
-        "repoUrl": repo_url,
-        "commit": commit,
-        "commitUrl": commit_url,
-        "lastCommit": last_commit,
-        "version": _read_version(repo_dir),
-        "routers": routers_out,
-        "drift": _drift_for(hosts, routers),
-        "features": _overview_features(spec),
-        "workflows": _list_workflows(repo_dir),
-        "ingress": ingress,
-        "notes": notes,
-        "imageDigest": image_digest,
-    }
+    return AppOverview(
+        name=name,
+        hosts=hosts,
+        source=source,
+        repo_url=repo_url,
+        commit=commit,
+        commit_url=commit_url,
+        last_commit=last_commit,
+        version=_read_version(repo_dir),
+        routers=routers_out,
+        drift=_drift_for(hosts, routers),
+        features=_overview_features(spec),
+        workflows=_list_workflows(repo_dir),
+        ingress=ingress,
+        notes=notes,
+        image_digest=image_digest,
+    )
 
 
-def build_overview(*, probe_enabled: bool = False) -> dict:
+def build_overview(*, probe_enabled: bool = False) -> Overview:
     """Walk DEPLOYS/*/ and build the org-wide status Overview. Degrades; never raises."""
     errors: list[str] = []
     names: list[str] = []
@@ -4391,24 +4939,24 @@ def build_overview(*, probe_enabled: bool = False) -> dict:
         names = sorted(p.name for p in DEPLOYS.iterdir() if p.is_dir())
     else:
         errors.append(f"cannot read {DEPLOYS} — is /opt/nuklaut mounted?")
-    return {
-        "apps": [_read_app_overview(n, probe_enabled=probe_enabled) for n in names],
-        "liveRoutingAvailable": False,  # Traefik api@internal integration is a later chapter
-        "nukRoot": str(ROOT),
-        "generatedAt": _iso_utc_now(),
-        "errors": errors,
-    }
+    return Overview(
+        apps=[_read_app_overview(n, probe_enabled=probe_enabled) for n in names],
+        live_routing_available=False,  # Traefik api@internal integration is a later chapter
+        nuk_root=str(ROOT),
+        generated_at=_iso_utc_now(),
+        errors=errors,
+    )
 
 
-def _soll_vs_ist(overview: dict, org_file: Path | None) -> dict:
+def _soll_vs_ist(overview: Overview, org_file: Path | None) -> Overview:
     """`--all`: declared org hosts (soll) vs this command's local observation (ist).
 
     Args:
-        overview: The already-built Overview dict (read for its observed app count).
+        overview: The already-built Overview (read for its observed app count).
         org_file: Path to the org manifest (`nuklaut.org.yml`); required.
 
     Returns:
-        The extra top-level keys `status --all` adds to the Overview.
+        The overview with the `--all` blocks (`hosts`, `sollVsIst`) set.
 
     Raises:
         NukError: When `org_file` is not given, or is not a valid Org manifest.
@@ -4416,18 +4964,19 @@ def _soll_vs_ist(overview: dict, org_file: Path | None) -> dict:
     if org_file is None:
         die("nuk status --all: --org-file PATH is required (path to nuklaut.org.yml)")
     org = load_org(org_file)
-    return {
-        "hosts": [h.model_dump(by_alias=True) for h in org.hosts],
-        "sollVsIst": {
-            "declaredHosts": len(org.hosts),
+    return replace(
+        overview,
+        hosts=org.hosts,
+        soll_vs_ist=SollVsIst(
+            declared_hosts=len(org.hosts),
             # TODO(K2.5): per-host observed via DOCKER_HOST fan-out (ssh per host,  # noqa: FIX002
             # one nuk status per host, merge). Kapitel 1 is single-host, so
             # "observed" is just this controller — the one this command runs on.
-            "observedHosts": 1,
-            "declaredApps": None,  # nukorg/v1 does not declare apps (yet)
-            "observedApps": len(overview["apps"]),
-        },
-    }
+            observed_hosts=1,
+            declared_apps=None,  # nukorg/v1 does not declare apps (yet)
+            observed_apps=len(overview.apps),
+        ),
+    )
 
 
 # --- command layer ------------------------------------------------------------
@@ -4497,9 +5046,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     """
     manifest_path = resolve_manifest(manifest_path)
     manifest = load(manifest_path)
-    raw = manifest.raw
     name = manifest.metadata.name
-    raw_spec = raw.get("spec") or {}
     if manifest.kind == "Facility" and not _is_privileged():
         print(
             f"{name}: Facility apply requires root or membership in group "
@@ -4562,7 +5109,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         manifest.kind == "Facility"
         and not repo_path
         and not source.repo
-        and not raw_spec.get("compose")
+        and not manifest.spec.compose.model_fields_set
     )
     pdir = project_dir(name)
     pdir.mkdir(parents=True, exist_ok=True)
@@ -4615,8 +5162,8 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             )
         sh("rsync", "-a", "--delete", f"{payload}/", str(repo) + "/")
     if pin_digest:
-        _pin_image(name, raw, pin_digest)
-    ingress = raw_spec.get("ingress", []) or []
+        _pin_image(name, manifest.spec, pin_digest)
+    ingress = manifest.spec.ingress
     org = ctx.org
     remote_ip = None
     if org is not None:
@@ -4631,17 +5178,15 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         )
         if not owns_databases:
             remote_ip = data_host_ip(org)
-    db_env = provision_databases(
-        name, raw_spec.get("databases") or {}, facilities, remote_ip=remote_ip
-    )
-    db_services = resolve_db_services(name, raw, db_env)
+    db_env = provision_databases(name, manifest.spec.databases, facilities, remote_ip=remote_ip)
+    db_services = resolve_db_services(name, manifest.spec, db_env)
     if db_env and not db_services:
         print(
             f"{name}: databases provisioned but no service to attach them to — "
             f"DATABASE_URL/REDIS_URL won't be injected. Add an ingress entry, or set "
             f"spec.databases.attachTo / attachAll to target a worker."
         )
-    env_from = resolve_env_from(raw_spec)
+    env_from = resolve_env_from(manifest.spec)
     if env_from and not ingress:
         print(
             f"{name}: spec.envFrom secrets resolved but no ingress service to "
@@ -4685,17 +5230,17 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         # `cmd_rollback`) never migrates — forward-only, and the recorded
         # revision it restores may predate the current migration head. A
         # blue-green colour flip never reaches here at all.
-        key = _rollout_key(name, raw, migrate, strategy)
+        key = _rollout_key(name, manifest.spec, migrate, strategy)
         if key is None or key != migrated_digest(name):
-            _run_migrations(name, raw, migrate, strategy, key)
+            _run_migrations(name, manifest.spec, migrate, strategy, key)
     if strategy is not None and strategy.type == "blue-green":
         # Blue-green replaces "ingress -> up -d" with a colour rollout: bring the
         # idle colour up (its compose profile), gate on its health, flip the
         # app-host file router to it, record it, then drain the old colour. The
         # app host owns its own router here (the edge routes stably to it), so
         # the colourless `edge_term` unlink below is deliberately bypassed.
-        persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
-        _apply_blue_green(name, raw, ingress, vocab, strategy, **mesh_kwargs)
+        persist_manifest(manifest.spec, manifest_path, pdir / "manifest.yml", repo_path)
+        _apply_blue_green(name, manifest.spec, ingress, vocab, strategy, **mesh_kwargs)
     else:
         if edge_term and not router_mode:
             _router_file(name).unlink(missing_ok=True)  # inert here; the edge owns it
@@ -4705,13 +5250,13 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         # facilities-less re-apply — the digest-path rollback — re-decides router mode
         # from the marker rather than guessing `edge` and unlinking the app-host router.
         record_router_dialect(name, "mesh" if router_mode else "edge")
-        persist_manifest(raw, manifest_path, pdir / "manifest.yml", repo_path)
+        persist_manifest(manifest.spec, manifest_path, pdir / "manifest.yml", repo_path)
         # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
         # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
         # whose image id changed. A declaration-only Facility has no compose file at
         # all — there is nothing to bring up.
         if not declaration_only:
-            sh(*compose_args(name, raw), "up", "-d")
+            sh(*compose_args(name, manifest.spec), "up", "-d")
     # An unhealthy facility must not become "current": write_provenance is what
     # `nuk status`, `nuk rollback` and drift.sh read as the deployed state, so
     # appending here would both hide the breakage and put the last known-good
@@ -4727,7 +5272,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             repo=source.repo,
             branch=source.branch,
             commit=_full_commit_sha(repo) if (repo / ".git").exists() else None,
-            image_digest=_resolve_image_digest(name, raw),
+            image_digest=_resolve_image_digest(name, manifest.spec),
         )
     except OSError as e:
         print(f"{name}: provenance not recorded ({e})")
@@ -4753,7 +5298,7 @@ def _migrate_service(name: str, migrate: Migrate, strategy: Strategy | None) -> 
 
 
 def _run_migrations(
-    name: str, raw: dict, migrate: Migrate, strategy: Strategy | None, digest: str | None
+    name: str, spec: Spec, migrate: Migrate, strategy: Strategy | None, digest: str | None
 ) -> None:
     """Run the deployment's one-shot migration, failing the deploy on any error.
 
@@ -4766,7 +5311,7 @@ def _run_migrations(
     colour = _migrate_colour(name, strategy)
     profile = ["--profile", colour] if colour else []
     argv = [
-        *compose_args(name, raw),
+        *compose_args(name, spec),
         *profile,
         "run",
         "--rm",
@@ -4781,7 +5326,7 @@ def _run_migrations(
         # SIGKILL reaches the compose client, not the container it started; stop
         # the one-off by hand so a hung migration cannot keep running against the DB.
         subprocess.run(  # noqa: S603  # fixed argv, no shell
-            [*compose_args(name, raw), "rm", "-sf", service], check=False
+            [*compose_args(name, spec), "rm", "-sf", service], check=False
         )
         die(f"{name}: migration timed out after {migrate.timeout}s — deploy aborted")
     except subprocess.CalledProcessError as e:
@@ -4790,10 +5335,10 @@ def _run_migrations(
         record_migrated_digest(name, digest)
 
 
-def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/dialect, one per concern
+def _apply_blue_green(  # noqa: PLR0913  # name/spec/ingress/vocab/strategy/dialect, one per concern
     name: str,
-    raw: dict,
-    ingress: list[dict],
+    spec: Spec,
+    ingress: list[Ingress],
     vocab: dict[str, list[str]],
     strategy: Strategy,
     *,
@@ -4808,8 +5353,8 @@ def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/diale
 
     Args:
         name: The deployment name.
-        raw: The raw manifest dict (for `compose_args`).
-        ingress: The raw `spec.ingress[]` entries.
+        spec: The manifest `spec` (for `compose_args`).
+        ingress: The `spec.ingress[]` routes.
         vocab: Route capabilities resolved from the tree.
         strategy: The parsed `spec.strategy` block.
         dialect: The file-router dialect the flip writes; `"mesh"` on a router-mode
@@ -4818,7 +5363,7 @@ def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/diale
     active = active_colour(name)
     idle = idle_colour(active)
     health = strategy.health
-    sh(*compose_args(name, raw), "--profile", idle, "up", "-d")
+    sh(*compose_args(name, spec), "--profile", idle, "up", "-d")
     # Resolve `sh` at call time (await_healthy's default binds the original at
     # import), so the probe runs through the same runner this host is configured
     # to use — and tests can capture it.
@@ -4838,11 +5383,9 @@ def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/diale
         # each ingress backend — so a manifest that names them other than the
         # conventional backend/frontend still tears the old colour fully down.
         # dict.fromkeys dedups while preserving manifest order.
-        published = dict.fromkeys(
-            [health.service, *(i.get("service") for i in ingress if i.get("service"))]
-        )
+        published = dict.fromkeys([health.service, *(i.service for i in ingress if i.service)])
         sh(
-            *compose_args(name, raw),
+            *compose_args(name, spec),
             "--profile",
             active,
             "down",
@@ -4852,8 +5395,8 @@ def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/diale
 
 def _rollback_blue_green(
     name: str,
-    raw: dict,
-    ingress: list[dict],
+    spec: Spec,
+    ingress: list[Ingress],
     vocab: dict[str, list[str]],
     strategy: Strategy,
 ) -> None:
@@ -4875,7 +5418,7 @@ def _rollback_blue_green(
     """
     previous = idle_colour(active_colour(name))
     health = strategy.health
-    sh(*compose_args(name, raw), "--profile", previous, "up", "-d", "--no-recreate")
+    sh(*compose_args(name, spec), "--profile", previous, "up", "-d", "--no-recreate")
     await_healthy(
         _container_name(name, health.service, previous),
         health.path,
@@ -4911,7 +5454,9 @@ def cmd_get() -> None:
         print(f"{name:24} {ps:32} {hosts}")
 
 
-def _configured_service_image(name: str, raw: dict, service: str, colour: str | None) -> str | None:
+def _configured_service_image(
+    name: str, spec: Spec, service: str, colour: str | None
+) -> str | None:
     """The image reference compose CONFIGURES for `service`, or None if unresolvable.
 
     Resolved per service, with the colour's profile enabled: a blue-green
@@ -4921,7 +5466,7 @@ def _configured_service_image(name: str, raw: dict, service: str, colour: str | 
     profile = ["--profile", colour] if colour else []
     try:
         proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
-            [*compose_args(name, raw), *profile, "config", "--format", "json"],
+            [*compose_args(name, spec), *profile, "config", "--format", "json"],
             capture_output=True,
             text=True,
             check=True,
@@ -4936,7 +5481,7 @@ def _configured_service_image(name: str, raw: dict, service: str, colour: str | 
 
 
 def _configured_image_digest(
-    name: str, raw: dict, service: str, colour: str | None = None
+    name: str, spec: Spec, service: str, colour: str | None = None
 ) -> str | None:
     """Digest of the image the compose file CONFIGURES for `service`, or None.
 
@@ -4946,7 +5491,7 @@ def _configured_image_digest(
     its own identity and needs no daemon lookup (or local image); a tag resolves
     through the daemon's RepoDigests.
     """
-    image = _configured_service_image(name, raw, service, colour)
+    image = _configured_service_image(name, spec, service, colour)
     if image is None:
         return None
     if "@sha256:" in image:
@@ -4964,7 +5509,7 @@ def _configured_image_digest(
     return digest or None
 
 
-def _rollout_key(name: str, raw: dict, migrate: Migrate, strategy: Strategy | None) -> str | None:
+def _rollout_key(name: str, spec: Spec, migrate: Migrate, strategy: Strategy | None) -> str | None:
     """The key a rollout is compared by: the migrate service's image digest, else the revision.
 
     The converge loop re-applies every cycle, so `spec.migrate` must key off what
@@ -4975,7 +5520,7 @@ def _rollout_key(name: str, raw: dict, migrate: Migrate, strategy: Strategy | No
     collide across releases.
     """
     service = _migrate_service(name, migrate, strategy)
-    digest = _configured_image_digest(name, raw, service, _migrate_colour(name, strategy))
+    digest = _configured_image_digest(name, spec, service, _migrate_colour(name, strategy))
     if digest:
         return digest
     revision = _applied_revision(name)
@@ -5054,17 +5599,17 @@ def cmd_status_overview(
     """
     overview = build_overview(probe_enabled=probe)
     converge = read_converge_status()
-    if converge:
-        overview["converge"] = converge
+    if converge is not None:
+        overview = replace(overview, converge=converge)
     if show_all:
-        overview.update(_soll_vs_ist(overview, org_file))
-    print(json.dumps(overview, indent=2 if pretty else None))
+        overview = _soll_vs_ist(overview, org_file)
+    print(json.dumps(overview.to_wire(), indent=2 if pretty else None))
 
 
 def cmd_logs(name: str) -> None:
     """Follow compose logs for a deployment."""
     manifest = load(_manifest_file(name))
-    sh(*compose_args(name, manifest.raw), "logs", "-f")
+    sh(*compose_args(name, manifest.spec), "logs", "-f")
 
 
 def cmd_rollout(name: str) -> None:
@@ -5074,15 +5619,15 @@ def cmd_rollout(name: str) -> None:
     if (repo / ".git").exists():
         sh("git", "-C", str(repo), "pull", "--ff-only")
     # else: workflow-managed deployment — re-trigger the workflow to update the tree.
-    sh(*compose_args(name, manifest.raw), "pull")
-    sh(*compose_args(name, manifest.raw), "up", "-d")
+    sh(*compose_args(name, manifest.spec), "pull")
+    sh(*compose_args(name, manifest.spec), "up", "-d")
 
 
-def _compose_images(name: str, raw: dict) -> list[str]:
+def _compose_images(name: str, spec: Spec) -> list[str]:
     """The image references the compose project resolves to, in service order."""
     try:
         proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
-            [*compose_args(name, raw), "config", "--images"],
+            [*compose_args(name, spec), "config", "--images"],
             capture_output=True,
             text=True,
             check=True,
@@ -5093,7 +5638,7 @@ def _compose_images(name: str, raw: dict) -> list[str]:
     return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
 
 
-def _pin_image(name: str, raw: dict, pin_digest: str) -> None:
+def _pin_image(name: str, spec: Spec, pin_digest: str) -> None:
     """Point the app's compose image reference at the pinned digest (spec §8).
 
     The digest is the identity of the re-applied release. Order matters:
@@ -5110,7 +5655,7 @@ def _pin_image(name: str, raw: dict, pin_digest: str) -> None:
     """
     repo_name = pin_digest.split("@", maxsplit=1)[0]
     refs = [
-        ref for ref in _compose_images(name, raw) if ref.split("@")[0].split(":")[0] == repo_name
+        ref for ref in _compose_images(name, spec) if ref.split("@")[0].split(":")[0] == repo_name
     ]
     if not refs:
         die(
@@ -5165,10 +5710,10 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
             print(f"{name}: no releases recorded")
             return
         for i, entry in enumerate(history):
-            commit = (entry.get("commit") or "-")[:12]
-            digest = (entry.get("imageDigest") or "-").split("@")[-1][:12]
+            commit = (entry.commit or "-")[:12]
+            digest = (entry.image_digest or "-").split("@")[-1][:12]
             marker = "  (current)" if i == len(history) - 1 else ""
-            print(f"{i:>3}  {commit}  {digest}  {entry.get('appliedAt', '?')}{marker}")
+            print(f"{i:>3}  {commit}  {digest}  {entry.applied_at or '?'}{marker}")
         return
     manifest = _manifest_file(name)
     if not manifest.exists():
@@ -5209,8 +5754,7 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
         # until the next converge cycle corrects it.
         ctx = TreeContext.for_path(manifest)
         vocab = route_vocabulary(ctx.facilities) if ctx.facilities else DEFAULT_ROUTE_VOCAB
-        ingress = (raw.get("spec") or {}).get("ingress", []) or []
-        _rollback_blue_green(name, raw, ingress, vocab, strategy)
+        _rollback_blue_green(name, parsed.spec, parsed.spec.ingress, vocab, strategy)
         return
     if to is None and len(history) < 2:  # noqa: PLR2004  # need a current AND a previous
         die(f"{name}: no previous release recorded — nothing to roll back to")
@@ -5219,21 +5763,21 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
         entry = history[index]
     except IndexError:
         die(f"{name}: no release at index {to} (history has {len(history)} entries)")
-    digest = entry.get("imageDigest")
+    digest = entry.image_digest
     if not digest:
         die(
             f"{name}: the release at index {index} has no recorded imageDigest "
             f"(a source-built deploy, or one predating digest resolution) — it cannot "
             f"be re-applied by digest (spec §8). Roll forward, or re-apply its commit by hand."
         )
-    commit = entry.get("commit")
+    commit = entry.commit
     if not commit:
         die(
             f"{name}: the release at index {index} has no recorded commit "
             f"(a workflow deploy from a .git-less tree) — its compose tree is "
             f"unreproducible, cannot re-apply it"
         )
-    print(f"{name}: rolling back to {digest} (applied {entry.get('appliedAt', '?')})")
+    print(f"{name}: rolling back to {digest} (applied {entry.applied_at or '?'})")
     cmd_apply(manifest, None, pin_commit=commit, pin_digest=digest)
 
 
@@ -5242,7 +5786,7 @@ def cmd_delete(name: str, purge: bool) -> None:
     pdir = project_dir(name)
     if (pdir / "manifest.yml").exists():
         manifest = load(pdir / "manifest.yml")
-        subprocess.run([*compose_args(name, manifest.raw), "down", "-v"], check=False)  # noqa: S603  # argv built from fixed verbs
+        subprocess.run([*compose_args(name, manifest.spec), "down", "-v"], check=False)  # noqa: S603  # argv built from fixed verbs
     _router_file(name).unlink(missing_ok=True)
     shutil.rmtree(pdir, ignore_errors=True)
     # The app's database is kept by default — its creds file (in SECRETS, not

@@ -24,8 +24,10 @@ def test_legacy_single_host_gets_maintenance_only():
     definition — so http.middlewares stays empty when nothing strips/redirects.
     """
     doc = nuk.build_ingress(
-        "bartix", [{"host": "bartix.de", "service": "web", "port": 8080}], nuk.DEFAULT_ROUTE_VOCAB
-    )
+        "bartix",
+        [nuk.Ingress.model_validate({"host": "bartix.de", "service": "web", "port": 8080})],
+        nuk.DEFAULT_ROUTE_VOCAB,
+    ).to_wire()
     assert doc == {
         "http": {
             "routers": {
@@ -58,17 +60,21 @@ def test_kolbe_pathprefix_split():
     doc = nuk.build_ingress(
         "kolbe",
         [
-            {
-                "host": "kolbe.astrojones.de",
-                "path": "/api",
-                "stripPrefix": True,
-                "service": "backend",
-                "port": 8000,
-            },
-            {"host": "kolbe.astrojones.de", "service": "frontend", "port": 80},
+            nuk.Ingress.model_validate(
+                {
+                    "host": "kolbe.astrojones.de",
+                    "path": "/api",
+                    "stripPrefix": True,
+                    "service": "backend",
+                    "port": 8000,
+                }
+            ),
+            nuk.Ingress.model_validate(
+                {"host": "kolbe.astrojones.de", "service": "frontend", "port": 80}
+            ),
         ],
         nuk.DEFAULT_ROUTE_VOCAB,
-    )
+    ).to_wire()
     routers = doc["http"]["routers"]
     services = doc["http"]["services"]
     mws = doc["http"]["middlewares"]
@@ -94,8 +100,10 @@ def test_path_without_strip_has_no_local_middleware():
     still inherits the maintenance-errors reference.
     """
     doc = nuk.build_ingress(
-        "a", [{"host": "h", "path": "/x", "service": "s", "port": 1}], nuk.DEFAULT_ROUTE_VOCAB
-    )
+        "a",
+        [nuk.Ingress.model_validate({"host": "h", "path": "/x", "service": "s", "port": 1})],
+        nuk.DEFAULT_ROUTE_VOCAB,
+    ).to_wire()
     assert doc["http"]["routers"]["a-0"]["rule"] == "Host(`h`) && PathPrefix(`/x`)"
     assert doc["http"]["routers"]["a-0"]["middlewares"] == ["maintenance-errors@file"]
     # no app-local middleware DEFINITIONS (maintenance-errors lives in global.yml)
@@ -106,9 +114,13 @@ def test_every_app_router_inherits_maintenance_errors():
     """The www-redirect router is the one exception — it 301s, no backend to guard."""
     doc = nuk.build_ingress(
         "kolbeapp",
-        [{"host": "kolbeapp.de", "service": "frontend", "port": 80, "www": True}],
+        [
+            nuk.Ingress.model_validate(
+                {"host": "kolbeapp.de", "service": "frontend", "port": 80, "www": True}
+            )
+        ],
         nuk.DEFAULT_ROUTE_VOCAB,
-    )
+    ).to_wire()
     routers = doc["http"]["routers"]
     assert routers["kolbeapp-0"]["middlewares"] == ["maintenance-errors@file"]
     assert routers["kolbeapp-0-www"]["middlewares"] == ["kolbeapp-0-www-redirect"]
@@ -120,9 +132,13 @@ def test_auth_basic_prepends_the_gate_ahead_of_maintenance_errors():
     """
     doc = nuk.build_ingress(
         "nukview",
-        [{"host": "nuk.example.de", "service": "nukview", "port": 3000, "auth": "basic"}],
+        [
+            nuk.Ingress.model_validate(
+                {"host": "nuk.example.de", "service": "nukview", "port": 3000, "auth": "basic"}
+            )
+        ],
         nuk.DEFAULT_ROUTE_VOCAB,
-    )
+    ).to_wire()
     assert doc["http"]["routers"]["nukview-0"]["middlewares"] == [
         "auth@file",
         "maintenance-errors@file",
@@ -135,17 +151,19 @@ def test_auth_basic_with_pathprefix_orders_basic_then_strip():
     doc = nuk.build_ingress(
         "api",
         [
-            {
-                "host": "h",
-                "path": "/api",
-                "stripPrefix": True,
-                "service": "s",
-                "port": 1,
-                "auth": "basic",
-            }
+            nuk.Ingress.model_validate(
+                {
+                    "host": "h",
+                    "path": "/api",
+                    "stripPrefix": True,
+                    "service": "s",
+                    "port": 1,
+                    "auth": "basic",
+                }
+            )
         ],
         nuk.DEFAULT_ROUTE_VOCAB,
-    )
+    ).to_wire()
     assert doc["http"]["routers"]["api-0"]["middlewares"] == [
         "auth@file",
         "api-0-strip",
@@ -163,13 +181,12 @@ def test_unknown_auth_value_refuses_to_render_instead_of_publishing(bad):
 
     Regression for a fail-open authentication control: `auth` was an unvalidated `str` and
     the render matched it with if/elif and no else, so a typo produced a router with no auth
-    middleware and no error. build_ingress works on raw dicts (it does not see the Literal),
-    so it refuses on its own.
+    middleware and no error. model_construct skips the Literal validation a loaded manifest
+    gets, so build_ingress must refuse on its own.
     """
+    entry = nuk.Ingress.model_construct(host="h", service="s", port=1, auth=bad)
     with pytest.raises(ValueError, match="no facility in the tree provides"):
-        nuk.build_ingress(
-            "demo", [{"host": "h", "service": "s", "port": 1, "auth": bad}], nuk.DEFAULT_ROUTE_VOCAB
-        )
+        nuk.build_ingress("demo", [entry], nuk.DEFAULT_ROUTE_VOCAB)
 
 
 @pytest.mark.parametrize("retired", ["oauth", "authentik", "oauth2-proxy"])
@@ -186,8 +203,10 @@ def test_ingress_auth_accepts_only_basic():
 
 def test_explicit_priority():
     doc = nuk.build_ingress(
-        "a", [{"host": "h", "service": "s", "port": 1, "priority": 100}], nuk.DEFAULT_ROUTE_VOCAB
-    )
+        "a",
+        [nuk.Ingress.model_validate({"host": "h", "service": "s", "port": 1, "priority": 100})],
+        nuk.DEFAULT_ROUTE_VOCAB,
+    ).to_wire()
     assert doc["http"]["routers"]["a-0"]["priority"] == 100
 
 
@@ -197,9 +216,13 @@ def test_explicit_priority():
 def test_address_backend_bypasses_local_container_naming():
     doc = nuk.build_ingress(
         "hello",
-        [{"host": "hello.astrojones.guru", "address": "10.10.2.4:8080"}],
+        [
+            nuk.Ingress.model_validate(
+                {"host": "hello.astrojones.guru", "address": "10.10.2.4:8080"}
+            )
+        ],
         nuk.DEFAULT_ROUTE_VOCAB,
-    )
+    ).to_wire()
     servers = doc["http"]["services"]["hello-0"]["loadBalancer"]["servers"]
     assert servers == [{"url": "http://10.10.2.4:8080"}]
 
@@ -224,10 +247,12 @@ def test_www_redirect_router_and_middleware():
     doc = nuk.build_ingress(
         "kolbeapp",
         [
-            {"host": "kolbeapp.de", "service": "frontend", "port": 80, "www": True},
+            nuk.Ingress.model_validate(
+                {"host": "kolbeapp.de", "service": "frontend", "port": 80, "www": True}
+            ),
         ],
         nuk.DEFAULT_ROUTE_VOCAB,
-    )
+    ).to_wire()
     routers = doc["http"]["routers"]
     mws = doc["http"]["middlewares"]
     # main router unchanged
@@ -241,12 +266,20 @@ def test_www_redirect_router_and_middleware():
     assert rr["permanent"] is True
 
 
+def _override(name, ingress, *args, **kwargs):
+    """Wire form of build_override for dict ingress entries; the no-wiring None is a test bug."""
+    parsed = [nuk.Ingress.model_validate(i) for i in ingress]
+    doc = nuk.build_override(name, parsed, *args, **kwargs)
+    assert doc is not None
+    return doc.to_wire()
+
+
 # --- override: edge-network join, dedup shared services -----------------------
 
 
 def test_override_dedups_shared_service():
     # both entries reference frontend; override must list it once
-    ov = nuk.build_override(
+    ov = _override(
         "kolbe",
         [
             {
@@ -279,7 +312,7 @@ def test_override_empty_is_none():
 
 
 def test_override_with_db_joins_data_and_env_file():
-    ov = nuk.build_override(
+    ov = _override(
         "nukview",
         [{"host": "nuk.astrojones.de", "service": "nukview", "port": 3000}],
         db_env="/opt/nuklaut/secrets/nukview-db.env",
@@ -302,13 +335,15 @@ def test_override_with_db_joins_data_and_env_file():
 def test_resolve_env_from_filters_to_existing_paths(tmp_path):
     present = tmp_path / "present.env"
     present.write_text("FOO=bar\n")
-    spec = {
-        "envFrom": [
-            {"secretRef": str(present)},
-            {"secretRef": str(tmp_path / "missing.env")},
-            str(tmp_path / "also-missing.env"),
-        ]
-    }
+    spec = nuk.Spec.model_validate(
+        {
+            "envFrom": [
+                {"secretRef": str(present)},
+                {"secretRef": str(tmp_path / "missing.env")},
+                {"secretRef": str(tmp_path / "also-missing.env")},
+            ]
+        }
+    )
     assert nuk.resolve_env_from(spec) == [str(present)]
 
 
@@ -319,7 +354,7 @@ def test_override_env_from_injected_into_ingress_service(tmp_path):
     """
     secret = tmp_path / "app.env"
     secret.write_text("API_KEY=shh\n")
-    ov = nuk.build_override(
+    ov = _override(
         "kolbe",
         [{"host": "kolbe.astrojones.de", "service": "backend", "port": 8000}],
         env_from=[str(secret)],
@@ -341,7 +376,7 @@ def test_override_env_from_and_db_env_both_present_db_env_last(tmp_path):
     secret = tmp_path / "app.env"
     secret.write_text("API_KEY=shh\n")
     db_env = "/opt/nuklaut/secrets/nukview-db.env"
-    ov = nuk.build_override(
+    ov = _override(
         "nukview",
         [{"host": "nuk.astrojones.de", "service": "nukview", "port": 3000}],
         db_env=db_env,
@@ -360,7 +395,7 @@ def test_override_env_from_and_db_env_both_present_db_env_last(tmp_path):
 
 
 def test_override_without_env_from_or_db_env_has_no_env_file():
-    ov = nuk.build_override("bartix", [{"host": "bartix.de", "service": "web", "port": 8080}])
+    ov = _override("bartix", [{"host": "bartix.de", "service": "web", "port": 8080}])
     assert ov["services"] == {"web": {"networks": ["edge"]}}
     assert "env_file" not in ov["services"]["web"]
 
@@ -379,7 +414,7 @@ def test_write_override_includes_env_from(tmp_path, monkeypatch):
 
     nuk.write_override(
         "kolbe",
-        [{"host": "kolbe.astrojones.de", "service": "backend", "port": 8000}],
+        [nuk.Ingress(host="kolbe.astrojones.de", service="backend", port=8000)],
         env_from=[str(secret)],
     )
     doc = yaml.safe_load((deploys / "kolbe" / "compose.override.yml").read_text())
@@ -406,7 +441,7 @@ def test_databases_parses_attach_selectors():
 def test_override_db_services_default_is_ingress_backcompat():
     """db_services=None keeps the legacy behaviour: ingress services get the db."""
     db_env = "/opt/nuklaut/secrets/app-db.env"
-    ov = nuk.build_override(
+    ov = _override(
         "app", [{"host": "app.de", "service": "web", "port": 8080}], db_env=db_env
     )
     assert ov["services"]["web"] == {"networks": ["edge", "data"], "env_file": [db_env]}
@@ -418,7 +453,7 @@ def test_override_attaches_db_to_explicit_non_ingress_service():
     that has no ingress, while the ingress service keeps edge + db.
     """
     db_env = "/opt/nuklaut/secrets/app-db.env"
-    ov = nuk.build_override(
+    ov = _override(
         "app",
         [{"host": "app.de", "service": "web", "port": 8080}],
         db_env=db_env,
@@ -435,7 +470,7 @@ def test_override_worker_only_app_receives_db_url_without_edge():
     nothing uses — is omitted entirely.
     """
     db_env = "/opt/nuklaut/secrets/batch-db.env"
-    ov = nuk.build_override("batch", [], db_env=db_env, db_services=["worker"])
+    ov = _override("batch", [], db_env=db_env, db_services=["worker"])
     assert ov["services"] == {"worker": {"networks": ["data"], "env_file": [db_env]}}
     assert ov["networks"] == {"data": {"external": True}}
 
@@ -447,7 +482,7 @@ def test_override_attach_to_excluding_ingress_keeps_secrets_but_not_db(tmp_path)
     secret = tmp_path / "app.env"
     secret.write_text("API_KEY=shh\n")
     db_env = "/opt/nuklaut/secrets/app-db.env"
-    ov = nuk.build_override(
+    ov = _override(
         "app",
         [{"host": "app.de", "service": "web", "port": 8080}],
         db_env=db_env,
@@ -460,7 +495,7 @@ def test_override_attach_to_excluding_ingress_keeps_secrets_but_not_db(tmp_path)
 
 def test_build_override_remote_db_skips_local_data_network(tmp_path):
     db_env = str(tmp_path / "app-db.env")
-    ov = nuk.build_override(
+    ov = _override(
         "app",
         [{"host": "app.example.com", "service": "web", "port": 8080}],
         db_env,
@@ -477,7 +512,7 @@ def test_build_override_remote_db_skips_local_data_network(tmp_path):
 
 def test_build_override_local_db_still_joins_data_network(tmp_path):
     db_env = str(tmp_path / "app-db.env")
-    ov = nuk.build_override(
+    ov = _override(
         "app",
         [{"host": "app.example.com", "service": "web", "port": 8080}],
         db_env,
@@ -495,8 +530,7 @@ def test_compose_service_names_reads_repo_compose(tmp_path, monkeypatch):
     (repo / "docker-compose.yml").write_text(
         yaml.safe_dump({"services": {"web": {"image": "x"}, "worker": {"image": "y"}}})
     )
-    raw = {"spec": {}}
-    assert sorted(nuk.compose_service_names("app", raw)) == ["web", "worker"]
+    assert sorted(nuk.compose_service_names("app", nuk.Spec())) == ["web", "worker"]
 
 
 def test_compose_service_names_with_bare_string_compose(tmp_path, monkeypatch):
@@ -509,8 +543,8 @@ def test_compose_service_names_with_bare_string_compose(tmp_path, monkeypatch):
     (repo / "docker-compose.data.yml").write_text(
         yaml.safe_dump({"services": {"db": {"image": "x"}}})
     )
-    raw = {"spec": {"compose": "docker-compose.data.yml"}}
-    assert nuk.compose_service_names("app", raw) == ["db"]
+    spec = nuk.Spec.model_validate({"compose": "docker-compose.data.yml"})
+    assert nuk.compose_service_names("app", spec) == ["db"]
 
 
 def test_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
@@ -518,7 +552,7 @@ def test_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
     project_dir = tmp_path / "app" / "repo"
     project_dir.mkdir(parents=True)
-    spec = {"spec": {"compose": "docker-compose.data.yml"}}
+    spec = nuk.Spec.model_validate({"compose": "docker-compose.data.yml"})
     args = nuk.compose_args("app", spec)
     assert str(project_dir / "docker-compose.data.yml") in args
 
@@ -528,14 +562,14 @@ def test_compose_args_with_dict_compose_still_works(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
     project_dir = tmp_path / "app" / "repo"
     project_dir.mkdir(parents=True)
-    spec = {"spec": {"compose": {"file": "docker-compose.data.yml"}}}
+    spec = nuk.Spec.model_validate({"compose": {"file": "docker-compose.data.yml"}})
     args = nuk.compose_args("app", spec)
     assert str(project_dir / "docker-compose.data.yml") in args
 
 
 def test_load_then_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
     """End-to-end: nuk.load() on a manifest with compose as a bare string
-    feeds compose_args via manifest.raw without crashing.
+    feeds compose_args via manifest.spec without crashing.
     """
     monkeypatch.setattr(nuk, "DEPLOYS", tmp_path)
     project_dir = tmp_path / "app" / "repo"
@@ -555,29 +589,29 @@ def test_load_then_compose_args_with_bare_string_compose(tmp_path, monkeypatch):
         )
     )
     manifest = nuk.load(manifest_path)
-    args = nuk.compose_args("app", manifest.raw)
+    args = nuk.compose_args("app", manifest.spec)
     assert str(project_dir / "docker-compose.data.yml") in args
     assert manifest.spec.compose.file == "docker-compose.data.yml"
 
 
 def test_resolve_db_services_empty_without_db_env():
-    raw = {"spec": {"ingress": [{"host": "a", "service": "web", "port": 80}]}}
-    assert nuk.resolve_db_services("app", raw, None) == []
+    spec = nuk.Spec.model_validate({"ingress": [{"host": "a", "service": "web", "port": 80}]})
+    assert nuk.resolve_db_services("app", spec, None) == []
 
 
 def test_resolve_db_services_defaults_to_ingress():
-    raw = {"spec": {"ingress": [{"host": "a", "service": "web", "port": 80}]}}
-    assert nuk.resolve_db_services("app", raw, "/x/app-db.env") == ["web"]
+    spec = nuk.Spec.model_validate({"ingress": [{"host": "a", "service": "web", "port": 80}]})
+    assert nuk.resolve_db_services("app", spec, "/x/app-db.env") == ["web"]
 
 
 def test_resolve_db_services_attach_to_wins():
-    raw = {
-        "spec": {
+    spec = nuk.Spec.model_validate(
+        {
             "ingress": [{"host": "a", "service": "web", "port": 80}],
             "databases": {"postgres": True, "attachTo": ["web", "worker"]},
         }
-    }
-    assert nuk.resolve_db_services("app", raw, "/x/app-db.env") == ["web", "worker"]
+    )
+    assert nuk.resolve_db_services("app", spec, "/x/app-db.env") == ["web", "worker"]
 
 
 def test_resolve_db_services_attach_all_enumerates_compose(tmp_path, monkeypatch):
@@ -587,8 +621,8 @@ def test_resolve_db_services_attach_all_enumerates_compose(tmp_path, monkeypatch
     (repo / "docker-compose.yml").write_text(
         yaml.safe_dump({"services": {"worker": {"image": "x"}, "beat": {"image": "y"}}})
     )
-    raw = {"spec": {"databases": {"postgres": True, "attachAll": True}}}
-    assert sorted(nuk.resolve_db_services("batch", raw, "/x/batch-db.env")) == ["beat", "worker"]
+    spec = nuk.Spec.model_validate({"databases": {"postgres": True, "attachAll": True}})
+    assert sorted(nuk.resolve_db_services("batch", spec, "/x/batch-db.env")) == ["beat", "worker"]
 
 
 # --- database identifier / literal guards -------------------------------------
@@ -620,8 +654,9 @@ def test_pw_from_url_roundtrip():
 
 
 def test_provision_databases_noop_without_request():
-    assert nuk.provision_databases("app", {}, []) is None
-    assert nuk.provision_databases("app", {"postgres": False, "redis": False}, []) is None
+    assert nuk.provision_databases("app", nuk.Databases.model_validate({}), []) is None
+    off = nuk.Databases.model_validate({"postgres": False, "redis": False})
+    assert nuk.provision_databases("app", off, []) is None
 
 
 def test_db_env_roundtrip(tmp_path, monkeypatch):
@@ -687,11 +722,13 @@ def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
         return (f"postgresql+{driver}" if driver else "postgresql") + f"://{app}:x@h:5432/{app}"
 
     monkeypatch.setattr(nuk, "ensure_postgres", fake_pg)
-    nuk.provision_databases("app", {"postgres": {"driver": "asyncpg"}}, [])
+    nuk.provision_databases(
+        "app", nuk.Databases.model_validate({"postgres": {"driver": "asyncpg"}}), []
+    )
     assert seen == ["asyncpg"]
     assert nuk.read_db_env("app")["DATABASE_URL"].startswith("postgresql+asyncpg://")
 
-    nuk.provision_databases("app", {"postgres": True}, [])
+    nuk.provision_databases("app", nuk.Databases.model_validate({"postgres": True}), [])
     assert seen == ["asyncpg", None]
 
 
@@ -809,7 +846,7 @@ def test_provision_databases_runs_preflight_before_exec(tmp_path, monkeypatch):
 
     monkeypatch.setattr(nuk, "ensure_postgres", fail)
     with pytest.raises(SystemExit):
-        nuk.provision_databases("app", {"postgres": True}, [])
+        nuk.provision_databases("app", nuk.Databases.model_validate({"postgres": True}), [])
 
 
 # --- vendored data stack (issue #10): the owned, reproducible source ----------
@@ -863,16 +900,16 @@ def test_persist_manifest_stamps_source_repo_from_origin(tmp_path, monkeypatch):
     from the checkout's git origin, so nukview can link the app to its repo.
     """
     monkeypatch.setattr(nuk, "git_origin", lambda p: "https://github.com/astrojones/kolbe")
-    spec = {
+    doc = {
         "apiVersion": "nuk/v1",
         "kind": "Deployment",
         "metadata": {"name": "kolbe"},
         "spec": {"ingress": []},
     }
     src = tmp_path / "deployment.yml"
-    src.write_text("placeholder")
+    src.write_text(yaml.safe_dump(doc), encoding="utf-8")
     dest = tmp_path / "manifest.yml"
-    nuk.persist_manifest(spec, src, dest, "/ws")
+    nuk.persist_manifest(nuk.load(src).spec, src, dest, "/ws")
     out = yaml.safe_load(dest.read_text())
     assert out["spec"]["source"]["repo"] == "https://github.com/astrojones/kolbe"
 
@@ -882,12 +919,7 @@ def test_persist_manifest_preserves_declared_source_repo(tmp_path, monkeypatch):
     declared source wins over the git origin and the file is left untouched.
     """
     monkeypatch.setattr(nuk, "git_origin", lambda p: "https://github.com/astrojones/OTHER")
-    spec = {
-        "apiVersion": "nuk/v1",
-        "kind": "Deployment",
-        "metadata": {"name": "x"},
-        "spec": {"source": {"repo": "https://github.com/astrojones/declared"}},
-    }
+    spec = nuk.Spec.model_validate({"source": {"repo": "https://github.com/astrojones/declared"}})
     src = tmp_path / "deployment.yml"
     src.write_text("verbatim-content")
     dest = tmp_path / "manifest.yml"
@@ -898,11 +930,10 @@ def test_persist_manifest_preserves_declared_source_repo(tmp_path, monkeypatch):
 def test_persist_manifest_verbatim_when_origin_unavailable(tmp_path, monkeypatch):
     """No git origin (e.g. not a github checkout) => plain verbatim copy, no stamp."""
     monkeypatch.setattr(nuk, "git_origin", lambda p: None)
-    spec = {"apiVersion": "nuk/v1", "kind": "Deployment", "metadata": {"name": "x"}, "spec": {}}
     src = tmp_path / "deployment.yml"
     src.write_text("verbatim")
     dest = tmp_path / "manifest.yml"
-    nuk.persist_manifest(spec, src, dest, None)
+    nuk.persist_manifest(nuk.Spec(), src, dest, None)
     assert dest.read_text() == "verbatim"
 
 
@@ -919,16 +950,16 @@ def test_persist_manifest_stamps_bare_spec_from_real_git_origin(tmp_path):
 
     run("git", "init", "-q")
     run("git", "remote", "add", "origin", "https://github.com/astrojones/kolbe.git")
-    spec = {
+    doc = {
         "apiVersion": "nuk/v1",
         "kind": "Deployment",
         "metadata": {"name": "kolbe"},
         "spec": None,
     }
     src = tmp_path / "deployment.yml"
-    src.write_text("spec:\n", encoding="utf-8")
+    src.write_text(yaml.safe_dump(doc), encoding="utf-8")
     dest = tmp_path / "manifest.yml"
-    nuk.persist_manifest(spec, src, dest, str(checkout))
+    nuk.persist_manifest(nuk.load(src).spec, src, dest, str(checkout))
     out = yaml.safe_load(dest.read_text())
     assert out["spec"]["source"]["repo"] == "https://github.com/astrojones/kolbe"
 
@@ -1157,7 +1188,7 @@ def test_read_self_absent_defaults_to_entry_role(tmp_path, monkeypatch):
 
 
 def test_override_publish_ip_binds_private_ip_and_drops_edge():
-    ov = nuk.build_override(
+    ov = _override(
         "hello",
         [{"host": "hello.modl-agent.com", "service": "web", "port": 8080}],
         publish_ip="10.0.1.20",
@@ -1167,7 +1198,7 @@ def test_override_publish_ip_binds_private_ip_and_drops_edge():
 
 
 def test_override_publish_ip_with_db_keeps_data_network():
-    ov = nuk.build_override(
+    ov = _override(
         "hello",
         [{"host": "hello.modl-agent.com", "service": "web", "port": 8080}],
         db_env="/opt/nuklaut/secrets/hello-db.env",
@@ -1181,9 +1212,7 @@ def test_override_publish_ip_with_db_keeps_data_network():
 
 def test_override_publish_ip_none_is_byte_identical_to_legacy():
     ingress = [{"host": "hello.modl-agent.com", "service": "web", "port": 8080}]
-    assert nuk.build_override("hello", ingress, publish_ip=None) == nuk.build_override(
-        "hello", ingress
-    )
+    assert _override("hello", ingress, publish_ip=None) == _override("hello", ingress)
 
 
 def test_host_port_overrides_publish_to_avoid_collision():
@@ -1191,7 +1220,7 @@ def test_host_port_overrides_publish_to_avoid_collision():
     hostPort remaps the HOST side the app publishes on.
     """
     ingress = [{"host": "b.modl-agent.com", "service": "web", "port": 8080, "hostPort": 8081}]
-    ov = nuk.build_override("b", ingress, publish_ip="10.0.1.20")
+    ov = _override("b", ingress, publish_ip="10.0.1.20")
     assert ov["services"]["web"]["ports"] == ["10.0.1.20:8081:8080"]  # host 8081 -> container 8080
 
 
@@ -1202,10 +1231,10 @@ def test_host_port_field_parses_via_alias():
 
 def test_compose_args_tolerates_null_compose(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "project_dir", lambda _n: tmp_path)
-    args = nuk.compose_args("app", {"spec": {"compose": None}})
+    args = nuk.compose_args("app", nuk.Spec.model_validate({"compose": None}))
     assert args[0:2] == ["docker", "compose"]
 
 
 def test_compose_service_names_tolerates_null_compose(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "project_dir", lambda _n: tmp_path)
-    assert nuk.compose_service_names("app", {"spec": {"compose": None}}) == []
+    assert nuk.compose_service_names("app", nuk.Spec.model_validate({"compose": None})) == []

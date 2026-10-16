@@ -96,7 +96,11 @@ def _stand_up(  # noqa: PLR0913  # test fixture helper — one knob per axis und
     (pdir / "manifest.yml").write_text(yaml.safe_dump(manifest), encoding="utf-8")
 
     if with_dynamic:
-        nuk.write_ingress(name, ingress, nuk.DEFAULT_ROUTE_VOCAB)
+        nuk.write_ingress(
+            name,
+            [nuk.Ingress.model_validate(i) for i in ingress],
+            nuk.DEFAULT_ROUTE_VOCAB,
+        )
 
     sha = None
     if with_git:
@@ -110,7 +114,7 @@ def _stand_up(  # noqa: PLR0913  # test fixture helper — one knob per axis und
 
 def test_build_overview_top_level_shape(tmp_path, monkeypatch):
     _stand_up(tmp_path, monkeypatch, with_git=True)
-    overview = nuk.build_overview()
+    overview = nuk.build_overview().to_wire()
     assert set(overview) == {"apps", "liveRoutingAvailable", "nukRoot", "generatedAt", "errors"}
     assert overview["errors"] == []
     assert overview["liveRoutingAvailable"] is False
@@ -129,7 +133,7 @@ def test_build_overview_top_level_shape(tmp_path, monkeypatch):
 def test_build_overview_missing_deploys_degrades(tmp_path, monkeypatch):
     """No /opt/nuklaut/deployments -> empty apps + a top-level error, never raises."""
     monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "nonexistent" / "deployments")
-    overview = nuk.build_overview()
+    overview = nuk.build_overview().to_wire()
     assert overview["apps"] == []
     assert overview["errors"]
     assert "cannot read" in overview["errors"][0]
@@ -145,7 +149,7 @@ def test_build_overview_lists_apps_without_manifest_too(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "ROOT", root)
     monkeypatch.setattr(nuk, "DEPLOYS", deploys)
     monkeypatch.setattr(nuk, "DYNAMIC", root / "traefik" / "dynamic")
-    overview = nuk.build_overview()
+    overview = nuk.build_overview().to_wire()
     assert [a["name"] for a in overview["apps"]] == ["ghost"]
     assert "manifest.yml unreadable" in overview["apps"][0]["notes"]
     assert overview["apps"][0]["drift"] == "unknown"
@@ -155,7 +159,7 @@ def test_build_overview_lists_apps_without_manifest_too(tmp_path, monkeypatch):
 
 
 def test_drift_in_sync_when_host_is_rendered():
-    routers = [{"id": "app-0", "rule": "Host(`app.astrojones.de`)", "live": None}]
+    routers = [nuk.RouterStatus("app-0", "Host(`app.astrojones.de`)")]
     assert nuk._drift_for(["app.astrojones.de"], routers) == "in-sync"
 
 
@@ -164,13 +168,13 @@ def test_drift_when_dynamic_file_missing():
 
 
 def test_drift_when_host_absent_from_rendered_routers():
-    routers = [{"id": "app-0", "rule": "Host(`other.astrojones.de`)", "live": None}]
+    routers = [nuk.RouterStatus("app-0", "Host(`other.astrojones.de`)")]
     assert nuk._drift_for(["app.astrojones.de"], routers) == "drift"
 
 
 def test_drift_unknown_when_no_ingress_hosts():
     assert nuk._drift_for([], None) == "unknown"
-    assert nuk._drift_for([], [{"id": "x", "rule": "", "live": None}]) == "unknown"
+    assert nuk._drift_for([], [nuk.RouterStatus("x", "")]) == "unknown"
 
 
 def test_read_app_overview_drift_in_sync_end_to_end(tmp_path, monkeypatch):
@@ -178,7 +182,7 @@ def test_read_app_overview_drift_in_sync_end_to_end(tmp_path, monkeypatch):
     write_ingress render path (not a hand-rolled router fixture).
     """
     _stand_up(tmp_path, monkeypatch, with_git=True)
-    app = nuk._read_app_overview("app")
+    app = nuk._read_app_overview("app").to_wire()
     assert app["drift"] == "in-sync"
     assert app["hosts"] == ["app.astrojones.de"]
     assert app["routers"][0]["rule"] == "Host(`app.astrojones.de`)"
@@ -186,7 +190,7 @@ def test_read_app_overview_drift_in_sync_end_to_end(tmp_path, monkeypatch):
 
 def test_read_app_overview_drift_when_dynamic_file_absent(tmp_path, monkeypatch):
     _stand_up(tmp_path, monkeypatch, with_git=True, with_dynamic=False)
-    app = nuk._read_app_overview("app")
+    app = nuk._read_app_overview("app").to_wire()
     assert app["drift"] == "drift"
     assert app["routers"] == []
 
@@ -200,7 +204,7 @@ def test_read_app_overview_degrades_on_missing_manifest(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "ROOT", root)
     monkeypatch.setattr(nuk, "DEPLOYS", root / "deployments")
     monkeypatch.setattr(nuk, "DYNAMIC", root / "traefik" / "dynamic")
-    app = nuk._read_app_overview("app")
+    app = nuk._read_app_overview("app").to_wire()
     assert "manifest.yml unreadable" in app["notes"]
     assert app["hosts"] == []
     assert app["source"] is None
@@ -210,7 +214,7 @@ def test_read_app_overview_degrades_on_missing_manifest(tmp_path, monkeypatch):
 
 def test_read_app_overview_degrades_on_no_git_checkout(tmp_path, monkeypatch):
     _stand_up(tmp_path, monkeypatch, with_git=False)
-    app = nuk._read_app_overview("app")
+    app = nuk._read_app_overview("app").to_wire()
     assert app["commit"] is None
     assert app["commitUrl"] is None
     assert app["version"] is None
@@ -237,7 +241,7 @@ def test_provenance_commit_and_digest_take_precedence_over_git_checkout(tmp_path
         ),
         encoding="utf-8",
     )
-    app = nuk._read_app_overview("app")
+    app = nuk._read_app_overview("app").to_wire()
     assert app["commit"] == provenance_sha[:12]
     assert app["commit"] != checkout_sha[:12]
     assert app["imageDigest"] == "sha256:deadbeef"
@@ -245,7 +249,7 @@ def test_provenance_commit_and_digest_take_precedence_over_git_checkout(tmp_path
 
 def test_provenance_absent_falls_back_to_git_checkout(tmp_path, monkeypatch):
     _pdir, checkout_sha = _stand_up(tmp_path, monkeypatch, with_git=True)
-    app = nuk._read_app_overview("app")
+    app = nuk._read_app_overview("app").to_wire()
     assert app["commit"] == checkout_sha[:12]
     assert app["imageDigest"] is None
 
@@ -254,7 +258,7 @@ def test_provenance_malformed_json_degrades_to_git_checkout(tmp_path, monkeypatc
     pdir, checkout_sha = _stand_up(tmp_path, monkeypatch, with_git=True)
     (pdir / "provenance.json").write_text("{not valid json", encoding="utf-8")
     assert nuk.read_provenance("app") is None
-    app = nuk._read_app_overview("app")
+    app = nuk._read_app_overview("app").to_wire()
     assert app["commit"] == checkout_sha[:12]
 
 
@@ -268,11 +272,13 @@ def test_write_provenance_then_read_provenance_roundtrips(tmp_path, monkeypatch)
         image_digest=None,
     )
     data = nuk.read_provenance("app")
-    assert data["repo"] == "https://github.com/astrojones/app"
-    assert data["branch"] == "main"
-    assert data["commit"] == "a" * 40
-    assert data["imageDigest"] is None
-    datetime.fromisoformat(data["appliedAt"])
+    assert data is not None
+    assert data.repo == "https://github.com/astrojones/app"
+    assert data.branch == "main"
+    assert data.commit == "a" * 40
+    assert data.image_digest is None
+    assert data.applied_at is not None
+    datetime.fromisoformat(data.applied_at)
 
 
 def test_read_provenance_absent_returns_none(tmp_path, monkeypatch):
@@ -290,13 +296,13 @@ def test_features_postgres_object_form_captures_driver(tmp_path, monkeypatch):
         with_git=True,
         manifest_extra={"databases": {"postgres": {"driver": "asyncpg"}, "redis": True}},
     )
-    app = nuk._read_app_overview("app")
+    app = nuk._read_app_overview("app").to_wire()
     assert app["features"] == {"postgres": True, "redis": True, "postgresDriver": "asyncpg"}
 
 
 def test_features_default_false_when_no_databases(tmp_path, monkeypatch):
     _stand_up(tmp_path, monkeypatch, with_git=True)
-    app = nuk._read_app_overview("app")
+    app = nuk._read_app_overview("app").to_wire()
     assert app["features"] == {"postgres": False, "redis": False, "postgresDriver": None}
 
 
@@ -310,7 +316,7 @@ def test_workflows_lists_normalised_triggers(tmp_path, monkeypatch):
     (wf_dir / "ci.yml").write_text(
         yaml.safe_dump({"name": "CI", "on": ["push", "pull_request"]}), encoding="utf-8"
     )
-    app = nuk._read_app_overview("app")
+    app = nuk._read_app_overview("app").to_wire()
     assert app["workflows"] == [
         {"file": "ci.yml", "name": "CI", "triggers": ["push", "pull_request"]}
     ]
@@ -318,7 +324,7 @@ def test_workflows_lists_normalised_triggers(tmp_path, monkeypatch):
 
 def test_workflows_empty_when_no_workflows_dir(tmp_path, monkeypatch):
     _stand_up(tmp_path, monkeypatch, with_git=True)
-    assert nuk._read_app_overview("app")["workflows"] == []
+    assert nuk._read_app_overview("app").to_wire()["workflows"] == []
 
 
 # --- probe: off by default, no network calls -------------------------------------
@@ -331,14 +337,14 @@ def test_probe_disabled_by_default_never_called(tmp_path, monkeypatch):
         pytest.fail("probe must not run unless explicitly enabled")
 
     monkeypatch.setattr(nuk, "_probe", _boom)
-    app = nuk._read_app_overview("app", probe_enabled=False)
+    app = nuk._read_app_overview("app", probe_enabled=False).to_wire()
     assert app["routers"][0]["live"] is None
 
 
 def test_probe_enabled_annotates_routers(tmp_path, monkeypatch):
     _stand_up(tmp_path, monkeypatch, with_git=True)
     monkeypatch.setattr(nuk, "_probe", lambda host, timeout=2.5: "enabled")  # noqa: ARG005
-    app = nuk._read_app_overview("app", probe_enabled=True)
+    app = nuk._read_app_overview("app", probe_enabled=True).to_wire()
     assert app["routers"][0]["live"] == "enabled"
 
 
@@ -460,18 +466,20 @@ def test_apply_writes_provenance_json(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "_resolve_image_digest", lambda name, raw: "sha256:cafef00d")  # noqa: ARG005
     nuk.cmd_apply(manifest_path, None)
     provenance = nuk.read_provenance("app")
-    assert provenance["repo"] == "https://github.com/astrojones/app"
-    assert provenance["branch"] == "main"
-    assert provenance["commit"] == sha
-    assert provenance["imageDigest"] == "sha256:cafef00d"
-    datetime.fromisoformat(provenance["appliedAt"])
+    assert provenance is not None
+    assert provenance.repo == "https://github.com/astrojones/app"
+    assert provenance.branch == "main"
+    assert provenance.commit == sha
+    assert provenance.image_digest == "sha256:cafef00d"
+    assert provenance.applied_at is not None
+    datetime.fromisoformat(provenance.applied_at)
 
 
 def test_apply_surfaces_provenance_through_status(tmp_path, monkeypatch):
     manifest_path, sha, _calls = _apply_manifest(tmp_path, monkeypatch)
     monkeypatch.setattr(nuk, "_resolve_image_digest", lambda name, raw: None)  # noqa: ARG005
     nuk.cmd_apply(manifest_path, None)
-    app = nuk._read_app_overview("app")
+    app = nuk._read_app_overview("app").to_wire()
     assert app["commit"] == sha[:12]
 
 
@@ -504,7 +512,7 @@ def test_resolve_image_digest_happy_path(monkeypatch):
         raise AssertionError(cmd)
 
     monkeypatch.setattr(nuk.subprocess, "run", fake_run)
-    digest = nuk._resolve_image_digest("app", {"spec": {}})
+    digest = nuk._resolve_image_digest("app", nuk.Spec.model_validate({}))
     assert digest == "ghcr.io/astrojones/app@sha256:abc123"
 
 
@@ -513,7 +521,7 @@ def test_resolve_image_digest_degrades_when_docker_unavailable(monkeypatch):
         raise FileNotFoundError
 
     monkeypatch.setattr(nuk.subprocess, "run", fake_run)
-    assert nuk._resolve_image_digest("app", {"spec": {}}) is None
+    assert nuk._resolve_image_digest("app", nuk.Spec.model_validate({})) is None
 
 
 def test_resolve_image_digest_degrades_on_empty_images_output(monkeypatch):
@@ -522,7 +530,7 @@ def test_resolve_image_digest_degrades_on_empty_images_output(monkeypatch):
         "run",
         lambda cmd, **kwargs: subprocess.CompletedProcess(cmd, 0, stdout=""),  # noqa: ARG005
     )
-    assert nuk._resolve_image_digest("app", {"spec": {}}) is None
+    assert nuk._resolve_image_digest("app", nuk.Spec.model_validate({})) is None
 
 
 # --- _parse_compose_images_json: tolerate null rows and malformed input --------
@@ -540,14 +548,16 @@ def test_parse_compose_images_json_single_null_array_is_empty():
 
 
 def test_parse_compose_images_json_drops_null_rows_keeps_dicts():
-    assert nuk._parse_compose_images_json('[{"Repository":"x"},null]') == [{"Repository": "x"}]
+    assert nuk._parse_compose_images_json('[{"Repository":"x"},null]') == [
+        nuk.ComposeImage("x", None)
+    ]
 
 
 def test_parse_compose_images_json_parses_json_lines_skipping_blanks():
     text = '{"Repository":"x"}\n\n{"Repository":"y"}\n'
     assert nuk._parse_compose_images_json(text) == [
-        {"Repository": "x"},
-        {"Repository": "y"},
+        nuk.ComposeImage("x", None),
+        nuk.ComposeImage("y", None),
     ]
 
 
@@ -581,12 +591,12 @@ _KOLBE_DIGEST_ROWS = [
         "ID": "sha256:3c",
     },
 ]
-_KOLBE_RAW = {
-    "spec": {
+_KOLBE_SPEC = nuk.Spec.model_validate(
+    {
         "strategy": {"type": "blue-green", "health": {"service": "backend", "path": "/health"}},
         "ingress": [{"host": "k.example", "service": "frontend", "port": 80}],
     }
-}
+)
 
 
 def _digest_docker(monkeypatch, rows, inspected: list[str]) -> None:
@@ -607,7 +617,7 @@ def test_resolve_image_digest_resolves_a_digest_pinned_container(monkeypatch, re
     inspected: list[str] = []
     rows = list(reversed(_KOLBE_DIGEST_ROWS)) if reverse else list(_KOLBE_DIGEST_ROWS)
     _digest_docker(monkeypatch, rows, inspected)
-    digest = nuk._resolve_image_digest("kolbe", _KOLBE_RAW)
+    digest = nuk._resolve_image_digest("kolbe", _KOLBE_SPEC)
     assert digest == "ghcr.io/x/backend@sha256:backend"
     assert inspected == ["sha256:2b"]  # looked up by image ID: there is no tag
 
@@ -615,4 +625,4 @@ def test_resolve_image_digest_resolves_a_digest_pinned_container(monkeypatch, re
 def test_resolve_image_digest_prefers_the_health_service_over_row_order(monkeypatch):
     inspected: list[str] = []
     _digest_docker(monkeypatch, [_KOLBE_DIGEST_ROWS[0], _KOLBE_DIGEST_ROWS[1]], inspected)
-    assert nuk._resolve_image_digest("kolbe", _KOLBE_RAW) == "ghcr.io/x/backend@sha256:backend"
+    assert nuk._resolve_image_digest("kolbe", _KOLBE_SPEC) == "ghcr.io/x/backend@sha256:backend"

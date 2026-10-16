@@ -120,9 +120,8 @@ def test_remote_mode_writes_private_ip_urls(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "ensure_postgres", _boom)
     monkeypatch.setattr(nuk, "ensure_redis", _boom)
 
-    path = nuk.provision_databases(
-        "hello", {"postgres": True, "redis": True}, [], remote_ip="10.0.10.180"
-    )
+    dbs = nuk.Databases.model_validate({"postgres": True, "redis": True})
+    path = nuk.provision_databases("hello", dbs, [], remote_ip="10.0.10.180")
     body = pathlib.Path(path).read_text(encoding="utf-8")
     pg = nuk.derive_db_password(seed, "pg", "hello")
     rd = nuk.derive_db_password(seed, "redis", "hello")
@@ -136,7 +135,9 @@ def test_remote_mode_without_seed_refuses(monkeypatch):
     import pytest
 
     with pytest.raises(SystemExit, match="seed"):
-        nuk.provision_databases("hello", {"postgres": True}, [], remote_ip="10.0.10.180")
+        nuk.provision_databases(
+            "hello", nuk.Databases.model_validate({"postgres": True}), [], remote_ip="10.0.10.180"
+        )
 
 
 def test_data_host_ip_reads_org_role():
@@ -253,7 +254,9 @@ def test_capability_owner_provisions_a_placement_skipped_deployment(tmp_path, mo
     out = nuk.provision_remote_databases(tree, "data", facs)
     # placement says app, but the DATA host provisions it (spec §3.1 exception)
     assert seen == [("hello", None)]
-    assert out == [{"name": "hello", "kind": "Database", "result": "ok", "error": None}]
+    assert [r.to_wire() for r in out] == [
+        {"name": "hello", "kind": "Database", "result": "ok", "error": None}
+    ]
 
 
 def test_non_owner_does_not_provision(tmp_path, monkeypatch):
@@ -308,9 +311,9 @@ def test_sweep_catches_called_process_error_not_just_systemexit(tmp_path, monkey
 
     monkeypatch.setattr(nuk, "provision_databases", boom)
     out = nuk.provision_remote_databases(tree, "data", nuk.load_facilities(tree))
-    assert [r["name"] for r in out] == ["hello"]
-    assert out[0]["result"] == "failed"
-    assert out[0]["error"].startswith("provision failed:")
+    assert [r.name for r in out] == ["hello"]
+    assert out[0].result == "failed"
+    assert out[0].error.startswith("provision failed:")
 
 
 def test_apply_tree_survives_a_malformed_facility(tmp_path, monkeypatch):
@@ -328,10 +331,10 @@ def test_apply_tree_survives_a_malformed_facility(tmp_path, monkeypatch):
     applied = []
     monkeypatch.setattr(nuk, "cmd_apply", lambda path, _rp, **_k: applied.append(path.stem))
     results = nuk.apply_tree(_ctx(tree, "data"))  # must not raise
-    by_name = {r["name"]: r for r in results}
-    assert by_name["broken.yml"]["result"] == "failed"
-    assert "not a nuk/v1" in by_name["broken.yml"]["error"]
-    assert by_name["data-stack"]["result"] == "ok"
+    by_name = {r.name: r for r in results}
+    assert by_name["broken.yml"].result == "failed"
+    assert "not a nuk/v1" in by_name["broken.yml"].error
+    assert by_name["data-stack"].result == "ok"
     assert applied == ["data-stack"]
 
 

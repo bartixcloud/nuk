@@ -122,7 +122,7 @@ def test_backend_resolves_from_the_org_manifest(tmp_path):
     tree = _tree(tmp_path, {"hello": HELLO}, {"basic": GATE_FACILITY})
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
-    assert nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0]) == "10.0.10.107:8080"
+    assert nuk.backend_address(org, hello, hello.spec.ingress[0]) == "10.0.10.107:8080"
 
 
 def test_backend_unpinned_app_uses_the_default_host(tmp_path):
@@ -135,7 +135,7 @@ def test_backend_unpinned_app_uses_the_default_host(tmp_path):
     )
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
-    addr = nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0], router_present=True)
+    addr = nuk.backend_address(org, hello, hello.spec.ingress[0], router_present=True)
     assert addr == "10.0.10.107:8443"  # the default `deploy`, not the first `kolbe-app`
 
 
@@ -144,7 +144,7 @@ def test_backend_honours_an_explicit_address(tmp_path):
     tree = _tree(tmp_path, {"hello": HELLO}, {})
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
-    ing = {"host": "x.example.com", "address": "192.0.2.9:9000"}
+    ing = nuk.Ingress.model_validate({"host": "x.example.com", "address": "192.0.2.9:9000"})
     assert nuk.backend_address(org, hello, ing) == "192.0.2.9:9000"
 
 
@@ -152,7 +152,9 @@ def test_backend_honours_host_port(tmp_path):
     tree = _tree(tmp_path, {"hello": HELLO}, {})
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
-    ing = {"host": "x.example.com", "service": "web", "port": 8080, "hostPort": 18080}
+    ing = nuk.Ingress.model_validate(
+        {"host": "x.example.com", "service": "web", "port": 8080, "hostPort": 18080}
+    )
     assert nuk.backend_address(org, hello, ing) == "10.0.10.107:18080"
 
 
@@ -163,7 +165,7 @@ def test_backend_refuses_an_unplaced_deployment(tmp_path):
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
     with pytest.raises(ValueError, match=r"no spec\.placement"):
-        nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0])
+        nuk.backend_address(org, hello, hello.spec.ingress[0])
 
 
 def test_backend_refuses_a_role_the_org_does_not_declare(tmp_path):
@@ -173,7 +175,7 @@ def test_backend_refuses_a_role_the_org_does_not_declare(tmp_path):
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
     with pytest.raises(ValueError, match="no host with role"):
-        nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0])
+        nuk.backend_address(org, hello, hello.spec.ingress[0])
 
 
 def test_backend_address_uses_pinned_app_host(tmp_path):
@@ -186,7 +188,7 @@ def test_backend_address_uses_pinned_app_host(tmp_path):
     )
     org = nuk.load_org(tree / "org.yml")
     pinned = nuk.load_deployments(tree)[0]
-    addr = nuk.backend_address(org, pinned, pinned.raw["spec"]["ingress"][0], router_present=True)
+    addr = nuk.backend_address(org, pinned, pinned.spec.ingress[0], router_present=True)
     assert addr == "10.0.10.190:8443"  # kolbe-app, not deploy (10.0.10.107)
 
 
@@ -197,7 +199,7 @@ def test_backend_refuses_a_pinned_host_the_org_does_not_declare(tmp_path):
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
     with pytest.raises(ValueError, match="no host with that name"):
-        nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0])
+        nuk.backend_address(org, hello, hello.spec.ingress[0])
 
 
 def test_backend_refuses_an_ambiguous_unpinned_app(tmp_path):
@@ -206,7 +208,7 @@ def test_backend_refuses_an_ambiguous_unpinned_app(tmp_path):
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
     with pytest.raises(ValueError, match="ambiguous"):
-        nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0], router_present=True)
+        nuk.backend_address(org, hello, hello.spec.ingress[0], router_present=True)
 
 
 def test_backend_refuses_a_pin_to_a_host_of_another_role(tmp_path):
@@ -216,7 +218,7 @@ def test_backend_refuses_a_pin_to_a_host_of_another_role(tmp_path):
     org = nuk.load_org(tree / "org.yml")
     hello = nuk.load_deployments(tree)[0]
     with pytest.raises(ValueError, match="role"):
-        nuk.backend_address(org, hello, hello.raw["spec"]["ingress"][0])
+        nuk.backend_address(org, hello, hello.spec.ingress[0])
 
 
 def test_edge_renders_a_router_for_every_deployment(tmp_path, monkeypatch):

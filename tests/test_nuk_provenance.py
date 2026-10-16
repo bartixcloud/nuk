@@ -45,7 +45,7 @@ def test_append_preserves_the_earlier_entry(state):
     nuk.write_provenance("hello", repo="r", branch="main", commit="a" * 40, image_digest="sha256:1")
     nuk.write_provenance("hello", repo="r", branch="main", commit="b" * 40, image_digest="sha256:2")
     history = nuk.read_provenance_history("hello")
-    assert [e["commit"] for e in history] == ["a" * 40, "b" * 40]
+    assert [e.commit for e in history] == ["a" * 40, "b" * 40]
 
 
 def test_read_provenance_returns_the_newest_entry(state):
@@ -54,7 +54,7 @@ def test_read_provenance_returns_the_newest_entry(state):
     nuk.write_provenance("hello", repo="r", branch="main", commit="b" * 40, image_digest=None)
     current = nuk.read_provenance("hello")
     assert current is not None
-    assert current["commit"] == "b" * 40
+    assert current.commit == "b" * 40
 
 
 def test_a_legacy_single_object_seeds_a_one_entry_history(state):
@@ -75,7 +75,7 @@ def test_a_legacy_single_object_seeds_a_one_entry_history(state):
     )
     history = nuk.read_provenance_history("hello")
     assert len(history) == 1
-    assert history[0]["commit"] == "a" * 40
+    assert history[0].commit == "a" * 40
 
 
 def test_a_legacy_list_seeds_the_history(state):
@@ -97,7 +97,7 @@ def test_a_legacy_list_seeds_the_history(state):
         ),
         encoding="utf-8",
     )
-    assert [e["commit"] for e in nuk.read_provenance_history("hello")] == ["a" * 40, "b" * 40]
+    assert [e.commit for e in nuk.read_provenance_history("hello")] == ["a" * 40, "b" * 40]
 
 
 def test_appending_to_a_legacy_seed_writes_jsonl_and_leaves_the_seed_untouched(state):
@@ -139,8 +139,8 @@ def test_history_is_capped_at_twenty(state):
         )
     history = nuk.read_provenance_history("hello")
     assert len(history) == 20
-    assert history[-1]["commit"] == f"{24:040d}"
-    assert history[0]["commit"] == f"{5:040d}"
+    assert history[-1].commit == f"{24:040d}"
+    assert history[0].commit == f"{5:040d}"
 
 
 def test_malformed_lines_are_skipped(state):
@@ -154,7 +154,7 @@ def test_malformed_lines_are_skipped(state):
         + "\n",
         encoding="utf-8",
     )
-    assert [e["commit"] for e in nuk.read_provenance_history("hello")] == ["a" * 40, "b" * 40]
+    assert [e.commit for e in nuk.read_provenance_history("hello")] == ["a" * 40, "b" * 40]
 
 
 def test_an_absent_history_reads_as_empty(state):
@@ -402,7 +402,7 @@ def test_pin_image_pulls_and_retags_the_matching_compose_ref(monkeypatch):
         lambda name, raw: ["ghcr.io/astrojones/hello:main", "ghcr.io/astrojones/hello:sidecar"],
     )
     monkeypatch.setattr(nuk, "sh", lambda *cmd: commands.append(cmd))
-    nuk._pin_image("hello", {"spec": {}}, "ghcr.io/astrojones/hello@sha256:abc")
+    nuk._pin_image("hello", nuk.Spec(), "ghcr.io/astrojones/hello@sha256:abc")
     assert ("docker", "pull", "ghcr.io/astrojones/hello@sha256:abc") in commands
     assert (
         "docker",
@@ -422,7 +422,7 @@ def test_pin_image_refuses_when_no_compose_ref_matches(monkeypatch):
     monkeypatch.setattr(nuk, "_compose_images", lambda name, raw: ["quay.io/other/app:main"])
     monkeypatch.setattr(nuk, "sh", lambda *cmd: pytest.fail("must not pull"))
     with pytest.raises(SystemExit, match="references no image"):
-        nuk._pin_image("hello", {"spec": {}}, "ghcr.io/astrojones/hello@sha256:abc")
+        nuk._pin_image("hello", nuk.Spec(), "ghcr.io/astrojones/hello@sha256:abc")
 
 
 def test_pin_image_fails_closed_when_the_digest_is_gone(monkeypatch):
@@ -438,5 +438,5 @@ def test_pin_image_fails_closed_when_the_digest_is_gone(monkeypatch):
     monkeypatch.setattr(nuk, "_compose_images", lambda name, raw: ["ghcr.io/astrojones/hello:main"])
     monkeypatch.setattr(nuk, "sh", sh)
     with pytest.raises(subprocess.CalledProcessError):
-        nuk._pin_image("hello", {"spec": {}}, "ghcr.io/astrojones/hello@sha256:abc")
+        nuk._pin_image("hello", nuk.Spec(), "ghcr.io/astrojones/hello@sha256:abc")
     assert len(pulled) == 1
