@@ -3042,39 +3042,35 @@ def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a d
     *,
     role: str,
     tenant: str | None,
-    sources: dict[str, Raw],
+    sources: dict[str, SourceBlock],
     warnings: list[str],
-    logging: dict[str, bool | str] | None = None,
+    logging: LoggingStatus | None = None,
     error: str | None = None,
 ) -> None:
     """Record the cycle's outcome (spec §7.6, contracts C3).
 
-    `sources` maps each source name to its block `{result, error, tag, commit, apply,
-    manifests, rendered, refusedRoutes}`. `logging` is the LOGGING pipeline's own health —
+    `sources` maps each source name to its block. `logging` is the LOGGING pipeline's own health —
     info-only (spec §14.3): recorded, never a per-manifest result, never a failure
     condition; absent for non-edge cycles. `error` is set when the cycle could not even
     start (an unreadable sources.yml), so a failure is still a status, not silence.
 
     Consumed by `drift.sh` and by `nuk status`.
     """
-    payload: Raw = {
-        "role": role,
-        "tenant": tenant,
-        "appliedAt": _iso_utc_now(),
-        "reapWarnings": warnings,
-        "sources": sources,
-    }
-    if logging is not None:
-        payload["logging"] = logging
-    if error is not None:
-        payload["error"] = error
-    _atomic_write(path, json.dumps(payload, indent=2) + "\n")
+    status = ConvergeStatus(
+        role=role,
+        tenant=tenant,
+        applied_at=_iso_utc_now(),
+        reap_warnings=warnings,
+        sources=sources,
+        logging=logging,
+        error=error,
+    )
+    _atomic_write(path, json.dumps(status.to_wire(), indent=2) + "\n")
 
 
-def read_converge_status(path: Path = CONVERGE_STATUS) -> Raw | None:
+def read_converge_status(path: Path = CONVERGE_STATUS) -> ConvergeStatus | None:
     """The last recorded cycle, or None if absent/unreadable/malformed."""
-    data = _read_json_safe(path)
-    return data if isinstance(data, dict) else None
+    return ConvergeStatus.from_wire(_read_json_safe(path))
 
 
 _SOURCE_FAILURES = (ValueError, SystemExit, subprocess.CalledProcessError, OSError)
@@ -3082,7 +3078,7 @@ _SOURCE_FAILURES = (ValueError, SystemExit, subprocess.CalledProcessError, OSErr
 
 def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are all read, none derived
     src: SourceEntry,
-    block: Raw,
+    block: SourceBlock,
     *,
     role: str,
     self_ip: str | None,
@@ -3108,7 +3104,7 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
         )
         raise ValueError(msg)
     tag, tag_sha, branch_sha = sync_source(src, signers_dir, state_dir)
-    block.update(tag=tag, commit=tag_sha)
+    block.tag, block.commit = tag, tag_sha
     print(f"target: {src.name} {tag} ({tag_sha[:12]}) role={role}")
     repo = source_state_dir(state_dir, src.name) / "repo"
     tag_tree = scratch / src.name / "tag"
@@ -3130,23 +3126,26 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
 
 
 def _apply_source(
-    src: SourceEntry, ctx: TreeContext, block: Raw, state_dir: Path, auth: HostAuth
+    src: SourceEntry, ctx: TreeContext, block: SourceBlock, state_dir: Path, auth: HostAuth
 ) -> None:
     """Apply a prepared source: manifests, then routes; record it applied only if all went well."""
-    block["manifests"] = apply_tree(ctx)
+    block.manifests = apply_tree(ctx)
     if "routes" in src.apply and ctx.role in _ENTRY_ROLES:
         routes = render_routes(ctx, auth)
-        block["rendered"] = routes.rendered
-        block["refusedRoutes"] = routes.refused
+        block.rendered = routes.rendered
+        block.refused_routes = routes.refused
+    # _prepare_source always sets both before a source reaches the apply pass.
+    assert block.tag is not None  # noqa: S101  # narrows the union for ty
+    assert block.commit is not None  # noqa: S101  # narrows the union for ty
     record_applied(
-        block["tag"], block["commit"], source_state_dir(state_dir, src.name) / "last-applied-tag"
+        block.tag, block.commit, source_state_dir(state_dir, src.name) / "last-applied-tag"
     )
 
 
-def _refuse(src: SourceEntry, block: Raw, e: BaseException) -> None:
-    block["result"] = "refused"
-    block["error"] = _exit_reason(e, "converge refused") if isinstance(e, SystemExit) else str(e)
-    print(f"REFUSING source {src.name}: {block['error']}", file=sys.stderr)
+def _refuse(src: SourceEntry, block: SourceBlock, e: BaseException) -> None:
+    block.result = "refused"
+    block.error = _exit_reason(e, "converge refused") if isinstance(e, SystemExit) else str(e)
+    print(f"REFUSING source {src.name}: {block.error}", file=sys.stderr)
 
 
 def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are all read, none derived
@@ -3158,7 +3157,7 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
     state_dir: Path,
     scratch: Path,
     platform: Path | None,
-) -> tuple[Raw, TreeContext | None]:
+) -> tuple[SourceBlock, TreeContext | None]:
     """PREPARE one source (sync/verify/archive); never raises for a source-level failure.
 
     The apply step moved to `_run_cycle`'s second pass so every source's tree is known
@@ -3169,16 +3168,7 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
         (None when that failed, or when the platform tree is incomplete) — the platform's
         context is what tenant sources build on. `result` is "refused" on any failure here.
     """
-    block: Raw = {
-        "result": "ok",
-        "error": None,
-        "tag": None,
-        "commit": None,
-        "apply": list(src.apply),
-        "manifests": [],
-        "rendered": [],
-        "refusedRoutes": [],
-    }
+    block = SourceBlock(apply=[str(a) for a in src.apply])
     try:
         ctx = _prepare_source(
             src,
@@ -3192,7 +3182,7 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
         )
         if src.is_platform and ctx.org is None:
             msg = (
-                f"the platform tree at {block['tag']} lacks {DEFAULT_ORG_FILE} — "
+                f"the platform tree at {block.tag} lacks {DEFAULT_ORG_FILE} — "
                 f"backends and routes resolve from it and cannot be guessed"
             )
             raise ValueError(msg)  # noqa: TRY301  # same refusal path as every other failure here
@@ -3214,7 +3204,7 @@ class _UnknownAuthorizationError(NukError):
 def _load_prepared_delegations(
     prepared: list[tuple[SourceEntry, TreeContext]],
     *,
-    blocks: dict[str, Raw],
+    blocks: dict[str, SourceBlock],
 ) -> tuple[dict[str, list[Delegation]], list[tuple[SourceEntry, TreeContext]]]:
     """Load each routable prepared owner's `delegations.yml`, refusing a malformed one (spec §2).
 
@@ -3260,7 +3250,7 @@ def _refuse_bad_declarations(
     registry: TenantRegistry,
     delegations: dict[str, list[Delegation]],
     *,
-    blocks: dict[str, Raw],
+    blocks: dict[str, SourceBlock],
 ) -> list[tuple[SourceEntry, TreeContext]]:
     """Refuse each source whose declarations do not validate; return the survivors.
 
@@ -3305,7 +3295,7 @@ def _host_auth(
     *,
     state_dir: Path,
     refused: list[SourceEntry],
-    blocks: dict[str, Raw],
+    blocks: dict[str, SourceBlock],
 ) -> tuple[HostAuth, list[tuple[SourceEntry, TreeContext]]]:
     """Build the cycle's host authorization from the registry and every owner's loans.
 
@@ -3338,16 +3328,14 @@ def _host_auth(
         # the cache would add nothing but a spurious "not in the registry" refusal.
         if not src.is_platform and "routes" in src.apply and platform_ctx is not None:
             delegations[src.name] = _cached_delegations(state_dir, src.name)
-    surviving = _refuse_bad_declarations(
-        prepared_ok, refused, registry, delegations, blocks=blocks
-    )
+    surviving = _refuse_bad_declarations(prepared_ok, refused, registry, delegations, blocks=blocks)
     for src, ctx in surviving:
         if ctx.tenant is not None and "routes" in src.apply:
             store_delegations(state_dir, ctx.tenant, delegations[ctx.tenant])
     return HostAuth(registry, delegations), surviving
 
 
-def _logging_status(role: str, platform_ctx: TreeContext | None) -> dict[str, bool | str] | None:
+def _logging_status(role: str, platform_ctx: TreeContext | None) -> LoggingStatus | None:
     """The LOGGING pipeline's own health (spec §14.3): info-only, edge cycles only."""
     if role != "edge" or platform_ctx is None:
         return None
@@ -3355,18 +3343,18 @@ def _logging_status(role: str, platform_ctx: TreeContext | None) -> dict[str, bo
     if facility is None:
         return None
     reason = facility_health(facility)
-    return {"healthy": reason is None, "detail": reason or "ok"}
+    return LoggingStatus(healthy=reason is None, detail=reason or "ok")
 
 
 def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
     sources: list[SourceEntry],
-    blocks: dict[str, Raw],
+    blocks: dict[str, SourceBlock],
     *,
     role: str,
     self_ip: str | None,
     signers_dir: Path,
     state_dir: Path,
-) -> tuple[list[str], dict[str, bool | str] | None, bool, str | None]:
+) -> tuple[list[str], LoggingStatus | None, bool, str | None]:
     """Converge every source, platform first; fill `blocks`.
 
     Two passes: first PREPARE every source (fetch/verify/archive) and keep its context, so
@@ -3420,7 +3408,7 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
                 except _SOURCE_FAILURES as e:
                     _refuse(src, blocks[src.name], e)
         trees = [ctx.tree for _src, ctx in applied]
-        clean = cycle_error is None and all(b["result"] == "ok" for b in blocks.values())
+        clean = cycle_error is None and all(b.result == "ok" for b in blocks.values())
         # A refused source has no tree this cycle, so its apps would all read as orphans;
         # only a clean cycle can tell what is really undeclared.
         warnings = reap_report(*trees) if clean else []
@@ -3444,9 +3432,9 @@ def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> i
             print("another converge run holds the lock; skipping this cycle")
             return 0
         role, self_ip = read_self()
-        blocks: dict[str, Raw] = {}
+        blocks: dict[str, SourceBlock] = {}
         warnings: list[str] = []
-        logging_status: dict[str, bool | str] | None = None
+        logging_status: LoggingStatus | None = None
         error: str | None = None
         code = 1
         sources: list[SourceEntry] = []
