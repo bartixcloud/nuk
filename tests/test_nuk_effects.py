@@ -386,7 +386,9 @@ def test_env_bind_refuses_when_no_facility_declares_it(tmp_path, monkeypatch):
     )
     facilities = nuk.load_facilities(_tree(tmp_path, gate=GATE_FACILITY))
     with pytest.raises(SystemExit, match="no facility provides"):
-        nuk.provision_databases("hello", {"postgres": True}, facilities)
+        nuk.provision_databases(
+            "hello", nuk.Databases.model_validate({"postgres": True}), facilities
+        )
 
 
 def test_env_bind_proceeds_when_the_tree_ships_no_facilities_dir(tmp_path, monkeypatch):
@@ -403,7 +405,7 @@ def test_env_bind_proceeds_when_the_tree_ships_no_facilities_dir(tmp_path, monke
     monkeypatch.setattr(nuk, "ensure_postgres", lambda *_a, **_k: "postgresql://x")
     monkeypatch.setattr(nuk, "write_db_env", lambda _app, _env: "/opt/nuklaut/secrets/hello-db.env")
     assert nuk.load_facilities(tmp_path) == []  # the legacy tree, verbatim
-    out = nuk.provision_databases("hello", {"postgres": True}, [])
+    out = nuk.provision_databases("hello", nuk.Databases.model_validate({"postgres": True}), [])
     assert calls == [(True, False)]
     assert out == "/opt/nuklaut/secrets/hello-db.env"
 
@@ -411,7 +413,7 @@ def test_env_bind_proceeds_when_the_tree_ships_no_facilities_dir(tmp_path, monke
 def test_env_bind_is_a_noop_when_nothing_is_requested(tmp_path):
     """No databases requested = no capability needed. The guard must not fire."""
     facilities = nuk.load_facilities(_tree(tmp_path, gate=GATE_FACILITY))
-    assert nuk.provision_databases("hello", {}, facilities) is None
+    assert nuk.provision_databases("hello", nuk.Databases.model_validate({}), facilities) is None
 
 
 def test_env_bind_proceeds_when_the_facility_is_declared(tmp_path, monkeypatch):
@@ -422,7 +424,9 @@ def test_env_bind_proceeds_when_the_facility_is_declared(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "ensure_postgres", lambda *_a, **_k: "postgresql://x")
     monkeypatch.setattr(nuk, "write_db_env", lambda _app, _env: "/opt/nuklaut/secrets/hello-db.env")
     facilities = nuk.load_facilities(_tree(tmp_path, data=DATA_FACILITY))
-    out = nuk.provision_databases("hello", {"postgres": True}, facilities)
+    out = nuk.provision_databases(
+        "hello", nuk.Databases.model_validate({"postgres": True}), facilities
+    )
     assert calls == [(True, False)]
     assert out == "/opt/nuklaut/secrets/hello-db.env"
 

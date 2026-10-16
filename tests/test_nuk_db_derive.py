@@ -120,9 +120,8 @@ def test_remote_mode_writes_private_ip_urls(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "ensure_postgres", _boom)
     monkeypatch.setattr(nuk, "ensure_redis", _boom)
 
-    path = nuk.provision_databases(
-        "hello", {"postgres": True, "redis": True}, [], remote_ip="10.0.10.180"
-    )
+    dbs = nuk.Databases.model_validate({"postgres": True, "redis": True})
+    path = nuk.provision_databases("hello", dbs, [], remote_ip="10.0.10.180")
     body = pathlib.Path(path).read_text(encoding="utf-8")
     pg = nuk.derive_db_password(seed, "pg", "hello")
     rd = nuk.derive_db_password(seed, "redis", "hello")
@@ -136,7 +135,9 @@ def test_remote_mode_without_seed_refuses(monkeypatch):
     import pytest
 
     with pytest.raises(SystemExit, match="seed"):
-        nuk.provision_databases("hello", {"postgres": True}, [], remote_ip="10.0.10.180")
+        nuk.provision_databases(
+            "hello", nuk.Databases.model_validate({"postgres": True}), [], remote_ip="10.0.10.180"
+        )
 
 
 def test_data_host_ip_reads_org_role():
