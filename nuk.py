@@ -31,7 +31,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Literal, NoReturn, cast
 from urllib.parse import urlparse
 
 import typer
@@ -99,6 +99,20 @@ _DATABASES_CAPABILITY = "databases"
 # or install/upgrade a pinned copy with `nuk update` (→ uv tool install --from …).
 NUK_REPO = "astrojones/nuk"
 NUK_GIT = f"git+https://github.com/{NUK_REPO}"
+
+
+class NukError(SystemExit):
+    """A refusal nuk surfaces to the operator: message to stderr, exit status 1.
+
+    Subclasses SystemExit so the one-process-exit contract (and every caller that
+    already treats a refusal as an exit) is unchanged, while giving raise sites a
+    named type that handlers can catch without also swallowing a stray sys.exit.
+    """
+
+
+def die(message: str) -> NoReturn:
+    """Refuse with `message`: the single raise point for operator-facing failures."""
+    raise NukError(message)
 
 
 # --- manifest models ----------------------------------------------------------
@@ -672,11 +686,11 @@ def validate_ingress_hosts(org: Org, manifest: Deployment | Facility) -> None:
         manifest: A deployment manifest whose ingress hosts must be covered.
 
     Raises:
-        SystemExit: If any ingress host is not under a managed domain.
+        NukError: If any ingress host is not under a managed domain.
     """
     for ing in manifest.spec.ingress:
         if not any(ing.host == d or ing.host.endswith(f".{d}") for d in org.domains):
-            sys.exit(f"nuk: ingress host {ing.host!r} is not under a managed domain {org.domains}")
+            die(f"nuk: ingress host {ing.host!r} is not under a managed domain {org.domains}")
 
 
 def sh(*cmd: str, cwd: Path | None = None, timeout: float | None = None) -> None:
@@ -695,13 +709,13 @@ def load(path: Path) -> Deployment | Facility:
         functions.
 
     Raises:
-        SystemExit: If the document is not a valid nuk/v1 Deployment or Facility.
+        NukError: If the document is not a valid nuk/v1 Deployment or Facility.
     """
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     try:
         manifest = _MANIFEST_ADAPTER.validate_python(raw)
     except ValidationError:
-        sys.exit(f"{path}: not a nuk/v1 Deployment or Facility")
+        die(f"{path}: not a nuk/v1 Deployment or Facility")
     manifest._raw = raw  # noqa: SLF001  # stash wire-contract input on its own model
     return manifest
 
@@ -731,16 +745,16 @@ def load_org(path: Path) -> Org:
         The validated Org.
 
     Raises:
-        SystemExit: If the file is unreadable or not a valid nukorg/v1 Org.
+        NukError: If the file is unreadable or not a valid nukorg/v1 Org.
     """
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except OSError as e:
-        sys.exit(f"{path}: {e}")
+        die(f"{path}: {e}")
     try:
         return Org.model_validate(raw)
     except ValidationError as e:
-        sys.exit(f"{path}: invalid nukorg/v1 Org\n{e}")
+        die(f"{path}: invalid nukorg/v1 Org\n{e}")
 
 
 # --- tenant registry (bartixcloud/infra/tenants.yml, contracts C2) ------------------
@@ -816,17 +830,17 @@ def load_tenants(tree: Path) -> TenantRegistry:
     """Parse `<tree>/tenants.yml` (the platform tree).
 
     Raises:
-        SystemExit: If the file is unreadable or invalid.
+        NukError: If the file is unreadable or invalid.
     """
     path = tree / TENANTS_FILE
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except OSError as e:
-        sys.exit(f"{path}: {e}")
+        die(f"{path}: {e}")
     try:
         return TenantRegistry.model_validate(raw)
     except ValidationError as e:
-        sys.exit(f"{path}: invalid tenants registry\n{e}")
+        die(f"{path}: invalid tenants registry\n{e}")
 
 
 def host_in_domains(host: str, domains: list[str]) -> bool:
@@ -856,15 +870,15 @@ def org_get(org: Org, dotted: str) -> object:
         The value at that path (scalar, list, or dict).
 
     Raises:
-        SystemExit: If any path segment is missing.
+        NukError: If any path segment is missing.
     """
     node: object = org.model_dump(by_alias=True)
     for part in dotted.split("."):
         if not isinstance(node, dict):
-            sys.exit(f"nuk org get: no such key: {dotted}")
+            die(f"nuk org get: no such key: {dotted}")
         current = cast("dict[str, object]", node)
         if part not in current:
-            sys.exit(f"nuk org get: no such key: {dotted}")
+            die(f"nuk org get: no such key: {dotted}")
         node = current[part]
     return node
 
@@ -2572,7 +2586,7 @@ def route_vocabulary(facilities: list[Facility]) -> dict[str, list[str]]:
     same order the hardcoded default chain uses.
 
     Raises:
-        SystemExit: If two facilities declare the same capability. A closed
+        NukError: If two facilities declare the same capability. A closed
             vocabulary with two answers is not closed; picking one silently
             would let a manifest added to the tree shadow the real gate.
     """
@@ -2582,7 +2596,7 @@ def route_vocabulary(facilities: list[Facility]) -> dict[str, list[str]]:
         if route is None:
             continue
         if route.capability in vocab:
-            sys.exit(
+            die(
                 f"nuk: route capability {route.capability!r} is declared by more than one "
                 f"facility (second: {f.metadata.name!r}). Refusing an ambiguous vocabulary."
             )
@@ -3021,10 +3035,10 @@ def _safe_ident(name: str) -> str:
         The identifier, unchanged, when valid.
 
     Raises:
-        SystemExit: When the identifier does not match `[a-z][a-z0-9_-]*`.
+        NukError: When the identifier does not match `[a-z][a-z0-9_-]*`.
     """
     if not _IDENT.match(name):
-        sys.exit(f"nuk: {name!r} is not a valid database identifier ([a-z][a-z0-9_-]*)")
+        die(f"nuk: {name!r} is not a valid database identifier ([a-z][a-z0-9_-]*)")
     return name
 
 
@@ -3189,13 +3203,13 @@ def preflight_data_stack(want_pg: bool, want_redis: bool) -> None:
         want_redis: Whether redis provisioning was requested.
 
     Raises:
-        SystemExit: When a required container is missing/unhealthy, pgvector is
+        NukError: When a required container is missing/unhealthy, pgvector is
             unavailable, or the redis `nukadmin` user cannot be reached.
     """
     if want_pg:
         _require_container(PG_CONTAINER, "postgres")
         if _psql("SELECT 1 FROM pg_available_extensions WHERE name = 'vector';") != "1":
-            sys.exit(
+            die(
                 f"nuk: pgvector not available in {PG_CONTAINER!r} — the data stack image "
                 f"must provide the 'vector' extension (use pgvector/pgvector)"
             )
@@ -3206,7 +3220,7 @@ def preflight_data_stack(want_pg: bool, want_redis: bool) -> None:
         except subprocess.CalledProcessError:
             whoami = ""
         if whoami != "nukadmin":
-            sys.exit(
+            die(
                 f"nuk: redis 'nukadmin' admin user not reachable in "
                 f"{REDIS_CONTAINER!r} — {_DATA_STACK_HINT}"
             )
@@ -3216,9 +3230,9 @@ def _require_container(container: str, label: str) -> None:
     """Abort with an actionable message unless `container` exists and is healthy."""
     exists, healthy = _container_state(container)
     if not exists:
-        sys.exit(f"nuk: shared {label} container {container!r} not found — {_DATA_STACK_HINT}")
+        die(f"nuk: shared {label} container {container!r} not found — {_DATA_STACK_HINT}")
     if not healthy:
-        sys.exit(f"nuk: shared {label} container {container!r} not healthy — {_DATA_STACK_HINT}")
+        die(f"nuk: shared {label} container {container!r} not healthy — {_DATA_STACK_HINT}")
 
 
 def load_db_seed() -> bytes | None:
@@ -3254,7 +3268,7 @@ def derive_db_password(seed: bytes, kind: str, app: str) -> str:
     import hmac
 
     if kind not in {"pg", "redis"}:
-        sys.exit(f"nuk: derive_db_password kind must be 'pg' or 'redis', got {kind!r}")
+        die(f"nuk: derive_db_password kind must be 'pg' or 'redis', got {kind!r}")
     info = f"nuk-db:{kind}:{app}".encode()
     # RFC 5869 HKDF-SHA-256, salt = HashLen zeros (i.e. empty salt), one block.
     prk = hmac.new(b"\x00" * 32, seed, hashlib.sha256).digest()
@@ -3303,10 +3317,10 @@ def ensure_postgres(app: str, prev_url: str | None, driver: str | None = None) -
         A DATABASE_URL for the provisioned database.
 
     Raises:
-        SystemExit: When `driver` is not a lowercase token.
+        NukError: When `driver` is not a lowercase token.
     """
     if driver and not re.fullmatch(r"[a-z][a-z0-9]*", driver):
-        sys.exit(f"nuk: invalid postgres driver {driver!r}")
+        die(f"nuk: invalid postgres driver {driver!r}")
     pw = _db_password("pg", app, prev_url)
     _psql(
         f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = {_lit(app)}) "
@@ -3392,7 +3406,7 @@ def provision_databases(
     # (`route_vocabulary(facilities) if facilities else DEFAULT_ROUTE_VOCAB`):
     # only a tree that opted INTO facilities and still omits this one is refused.
     if facilities and env_facility(facilities, _DATABASES_CAPABILITY) is None:
-        sys.exit(
+        die(
             f"{app}: spec.databases requests {_DATABASES_CAPABILITY!r} but no facility "
             f"provides it. Apply facilities/data-stack.yml first, or drop spec.databases."
         )
@@ -3401,7 +3415,7 @@ def provision_databases(
         # The app host derives; it never provisions (spec §3.1 topology condition).
         seed = load_db_seed()
         if seed is None:
-            sys.exit(
+            die(
                 f"{app}: spec.databases needs the fleet DB seed at {DB_SEED_ENV} "
                 f"to derive remote credentials — deliver it via converge.sh"
             )
@@ -3901,10 +3915,10 @@ def _soll_vs_ist(overview: dict, org_file: Path | None) -> dict:
         The extra top-level keys `status --all` adds to the Overview.
 
     Raises:
-        SystemExit: When `org_file` is not given, or is not a valid Org manifest.
+        NukError: When `org_file` is not given, or is not a valid Org manifest.
     """
     if org_file is None:
-        sys.exit("nuk status --all: --org-file PATH is required (path to nuklaut.org.yml)")
+        die("nuk status --all: --org-file PATH is required (path to nuklaut.org.yml)")
     org = load_org(org_file)
     return {
         "hosts": [h.model_dump(by_alias=True) for h in org.hosts],
@@ -4069,14 +4083,14 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         # unchanged.
         payload = manifest_path.resolve().parent / name
         if not payload.is_dir():
-            sys.exit(
+            die(
                 f"{manifest_path}: Facility {name} has no source.repo and no "
                 f"facilities/{name}/ payload directory — nothing to apply"
             )
         shutil.rmtree(repo, ignore_errors=True)
         sh("rsync", "-a", "--delete", f"{payload}/", str(repo) + "/")
     else:
-        sys.exit(f"{manifest_path}: spec.source.repo is required unless --repo-path is given")
+        die(f"{manifest_path}: spec.source.repo is required unless --repo-path is given")
     if pin_digest:
         _pin_image(name, raw, pin_digest)
     ingress = raw_spec.get("ingress", []) or []
@@ -4115,7 +4129,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     # its private IP — that is the backend the edge's router points at.
     edge_term = role not in _ENTRY_ROLES and bool(ingress)
     if edge_term and self_ip is None:
-        sys.exit(
+        die(
             f"{name}: host is non-edge (role={role}) but /etc/nuklaut/host.env has no "
             f"PRIVATE_IP — cannot publish ingress for the edge to reach"
         )
@@ -4180,7 +4194,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     # appending here would both hide the breakage and put the last known-good
     # entry out of rollback's reach (spec §5.4).
     if manifest.kind == "Facility" and (reason := facility_health(manifest)) is not None:
-        sys.exit(f"{name}: facility is not healthy — {reason}. Provenance not appended.")
+        die(f"{name}: facility is not healthy — {reason}. Provenance not appended.")
     # Provenance is best-effort: `status` prefers it over the live repo/ checkout
     # (trustworthy even for rsync-mirrored, .git-less workflow deploys), but a
     # write failure here must never fail an otherwise-successful apply.
@@ -4418,7 +4432,7 @@ def cmd_status(name: str) -> None:
     """
     manifest_file = _manifest_file(name)
     if not manifest_file.exists():
-        sys.exit(f"nuk: {name}: no such deployment ({manifest_file} not found)")
+        die(f"nuk: {name}: no such deployment ({manifest_file} not found)")
     manifest = load(manifest_file)
     source = manifest.spec.source
 
@@ -4518,7 +4532,7 @@ def _pin_image(name: str, raw: dict, pin_digest: str) -> None:
     opposite direction.
 
     Raises:
-        SystemExit: If no compose image comes from the digest's repository, or
+        NukError: If no compose image comes from the digest's repository, or
             the pull fails.
     """
     repo_name = pin_digest.split("@", maxsplit=1)[0]
@@ -4526,7 +4540,7 @@ def _pin_image(name: str, raw: dict, pin_digest: str) -> None:
         ref for ref in _compose_images(name, raw) if ref.split("@")[0].split(":")[0] == repo_name
     ]
     if not refs:
-        sys.exit(
+        die(
             f"{name}: the pinned compose references no image from {repo_name} — "
             f"cannot pin {pin_digest}"
         )
@@ -4566,7 +4580,7 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
         show: Print the history and apply nothing.
 
     Raises:
-        SystemExit: If there is nothing to roll back to, the index is out of
+        NukError: If there is nothing to roll back to, the index is out of
             range, the target entry lacks its imageDigest or its commit, the
             persisted manifest is gone, it no longer validates under the
             current schema, or it is a Facility (facility rollback is the tag,
@@ -4585,18 +4599,18 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
         return
     manifest = _manifest_file(name)
     if not manifest.exists():
-        sys.exit(f"{name}: {manifest} is missing — nothing to re-apply")
+        die(f"{name}: {manifest} is missing — nothing to re-apply")
     try:
         raw = yaml.safe_load(manifest.read_text(encoding="utf-8"))
         parsed = _MANIFEST_ADAPTER.validate_python(raw)
     except ValidationError as e:
-        sys.exit(
+        die(
             f"{name}: the persisted manifest no longer validates under the current "
             f"schema (a field was removed since; spec §8) — refusing to silently "
             f"upgrade it into the new schema: {e}"
         )
     if parsed.kind != "Deployment":
-        sys.exit(
+        die(
             f"{name}: the persisted manifest is a {parsed.kind}, not a Deployment — "
             f"facility rollback needs no mechanism, cut a new tag at the old tree (spec §8)"
         )
@@ -4611,7 +4625,7 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
         if not _active_colour_file(name).exists():
             # `active_colour` would default to blue, flipping to a colour that
             # never ran. Refuse instead, mirroring the digest path's wording.
-            sys.exit(f"{name}: no previous release recorded — nothing to roll back to")
+            die(f"{name}: no previous release recorded — nothing to roll back to")
         # Resolve the vocabulary the same way `cmd_apply` does, from the
         # manifest's tree, so rollback and apply cannot drift. The persisted
         # manifest lives in the deploy state dir, which ships no facilities/, so
@@ -4626,22 +4640,22 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
         _rollback_blue_green(name, raw, ingress, vocab, strategy)
         return
     if to is None and len(history) < 2:  # noqa: PLR2004  # need a current AND a previous
-        sys.exit(f"{name}: no previous release recorded — nothing to roll back to")
+        die(f"{name}: no previous release recorded — nothing to roll back to")
     index = -2 if to is None else to
     try:
         entry = history[index]
     except IndexError:
-        sys.exit(f"{name}: no release at index {to} (history has {len(history)} entries)")
+        die(f"{name}: no release at index {to} (history has {len(history)} entries)")
     digest = entry.get("imageDigest")
     if not digest:
-        sys.exit(
+        die(
             f"{name}: the release at index {index} has no recorded imageDigest "
             f"(a source-built deploy, or one predating digest resolution) — it cannot "
             f"be re-applied by digest (spec §8). Roll forward, or re-apply its commit by hand."
         )
     commit = entry.get("commit")
     if not commit:
-        sys.exit(
+        die(
             f"{name}: the release at index {index} has no recorded commit "
             f"(a workflow deploy from a .git-less tree) — its compose tree is "
             f"unreproducible, cannot re-apply it"
@@ -4784,14 +4798,14 @@ def _root(
         version: Whether `--version` was passed (handled by the eager callback).
 
     Raises:
-        SystemExit: When `/opt/nuklaut` is absent (nuk runs on the controller).
+        NukError: When `/opt/nuklaut` is absent (nuk runs on the controller).
             The `org` and `update` subcommands are exempt — they run off the
             controller too (operator workstation, CI, the deploy plugin).
     """
     if ctx.invoked_subcommand in {"org", "update"}:
         return
     if not ROOT.exists():
-        sys.exit(
+        die(
             f"nuk: {ROOT} does not exist — nuk runs on the controller, "
             f"not your workstation. Use: ./deploy.sh nuk {ctx.invoked_subcommand}"
         )
@@ -5013,12 +5027,12 @@ def cmd_update(to: str | None, check: bool) -> None:
         check: Only report installed-vs-latest; install nothing.
 
     Raises:
-        SystemExit: If the latest release cannot be resolved, or the uv install fails.
+        NukError: If the latest release cannot be resolved, or the uv install fails.
     """
     current = __version__
     target = to or latest_release_tag()
     if not target:
-        sys.exit("nuk update: could not resolve the latest release (network?). Pass --to <ref>.")
+        die("nuk update: could not resolve the latest release (network?). Pass --to <ref>.")
     if check:
         print(f"nuk {current} installed - latest is {target}")
         return
@@ -5029,7 +5043,7 @@ def cmd_update(to: str | None, check: bool) -> None:
     try:
         sh("uv", "tool", "install", "--force", "--from", f"{NUK_GIT}@{target}", "nuk")
     except (subprocess.SubprocessError, OSError) as e:
-        sys.exit(
+        die(
             f"nuk update: uv install failed ({e}). Is uv installed? "
             f"Manual: uv tool install --from {NUK_GIT}@{target} nuk"
         )
@@ -5062,7 +5076,7 @@ def _org_resolve(
     """Print the GitHub org of a repo's origin (its `<org>/infra` holds the manifest)."""
     org = origin_org(repo_path)
     if not org:
-        sys.exit("nuk org resolve: no github origin remote found")
+        die("nuk org resolve: no github origin remote found")
     print(org)
 
 
