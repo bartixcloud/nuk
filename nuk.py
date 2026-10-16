@@ -5329,7 +5329,7 @@ def _migrate_service(name: str, migrate: Migrate, strategy: Strategy | None) -> 
 
 
 def _run_migrations(
-    name: str, raw: Raw, migrate: Migrate, strategy: Strategy | None, digest: str | None
+    name: str, spec: Spec, migrate: Migrate, strategy: Strategy | None, digest: str | None
 ) -> None:
     """Run the deployment's one-shot migration, failing the deploy on any error.
 
@@ -5342,7 +5342,7 @@ def _run_migrations(
     colour = _migrate_colour(name, strategy)
     profile = ["--profile", colour] if colour else []
     argv = [
-        *compose_args(name, raw),
+        *compose_args(name, spec),
         *profile,
         "run",
         "--rm",
@@ -5357,7 +5357,7 @@ def _run_migrations(
         # SIGKILL reaches the compose client, not the container it started; stop
         # the one-off by hand so a hung migration cannot keep running against the DB.
         subprocess.run(  # noqa: S603  # fixed argv, no shell
-            [*compose_args(name, raw), "rm", "-sf", service], check=False
+            [*compose_args(name, spec), "rm", "-sf", service], check=False
         )
         die(f"{name}: migration timed out after {migrate.timeout}s — deploy aborted")
     except subprocess.CalledProcessError as e:
@@ -5366,10 +5366,10 @@ def _run_migrations(
         record_migrated_digest(name, digest)
 
 
-def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/dialect, one per concern
+def _apply_blue_green(  # noqa: PLR0913  # name/spec/ingress/vocab/strategy/dialect, one per concern
     name: str,
-    raw: Raw,
-    ingress: list[Raw],
+    spec: Spec,
+    ingress: list[Ingress],
     vocab: dict[str, list[str]],
     strategy: Strategy,
     *,
@@ -5384,8 +5384,8 @@ def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/diale
 
     Args:
         name: The deployment name.
-        raw: The raw manifest dict (for `compose_args`).
-        ingress: The raw `spec.ingress[]` entries.
+        spec: The manifest `spec` (for `compose_args`).
+        ingress: The `spec.ingress[]` routes.
         vocab: Route capabilities resolved from the tree.
         strategy: The parsed `spec.strategy` block.
         dialect: The file-router dialect the flip writes; `"mesh"` on a router-mode
@@ -5394,7 +5394,7 @@ def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/diale
     active = active_colour(name)
     idle = idle_colour(active)
     health = strategy.health
-    sh(*compose_args(name, raw), "--profile", idle, "up", "-d")
+    sh(*compose_args(name, spec), "--profile", idle, "up", "-d")
     # Resolve `sh` at call time (await_healthy's default binds the original at
     # import), so the probe runs through the same runner this host is configured
     # to use — and tests can capture it.
@@ -5414,11 +5414,9 @@ def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/diale
         # each ingress backend — so a manifest that names them other than the
         # conventional backend/frontend still tears the old colour fully down.
         # dict.fromkeys dedups while preserving manifest order.
-        published = dict.fromkeys(
-            [health.service, *(i.get("service") for i in ingress if i.get("service"))]
-        )
+        published = dict.fromkeys([health.service, *(i.service for i in ingress if i.service)])
         sh(
-            *compose_args(name, raw),
+            *compose_args(name, spec),
             "--profile",
             active,
             "down",
@@ -5428,8 +5426,8 @@ def _apply_blue_green(  # noqa: PLR0913  # name/raw/ingress/vocab/strategy/diale
 
 def _rollback_blue_green(
     name: str,
-    raw: Raw,
-    ingress: list[Raw],
+    spec: Spec,
+    ingress: list[Ingress],
     vocab: dict[str, list[str]],
     strategy: Strategy,
 ) -> None:
@@ -5443,7 +5441,7 @@ def _rollback_blue_green(
     """
     previous = idle_colour(active_colour(name))
     health = strategy.health
-    sh(*compose_args(name, raw), "--profile", previous, "up", "-d")
+    sh(*compose_args(name, spec), "--profile", previous, "up", "-d")
     await_healthy(
         _container_name(name, health.service, previous),
         health.path,
