@@ -137,7 +137,7 @@ def test_run_migrations_timeout_stops_the_container(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk.subprocess, "run", fake_run)
     with pytest.raises(SystemExit):
         nuk._run_migrations("kolbe", _MIGRATE_DEP, m, None, "sha256:cafe")
-    assert any(c[4:7] == ("rm", "-sf", "backend") for c in calls)
+    assert any(tuple(c[0][4:7]) == ("rm", "-sf", "backend") for c in calls)
 
 
 def test_rollout_key_uses_the_configured_image_not_the_running_one(monkeypatch):
