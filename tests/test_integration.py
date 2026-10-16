@@ -106,16 +106,17 @@ def test_injection_attaches_real_creds_to_a_worker(provisioned, secrets_dir):
     data network.
     """
     db_env = str(secrets_dir / f"{APP}-db.env")
-    raw = {
-        "spec": {
+    spec = nuk.Spec.model_validate(
+        {
             "ingress": [{"host": "app.de", "service": "web", "port": 8080}],
             "databases": {"postgres": True, "attachTo": ["web", "worker"]},
         }
-    }
-    db_services = nuk.resolve_db_services(APP, raw, db_env)
+    )
+    db_services = nuk.resolve_db_services(APP, spec, db_env)
     assert db_services == ["web", "worker"]
-    ov = nuk.build_override(APP, raw["spec"]["ingress"], db_env=db_env, db_services=db_services)
-    assert ov["services"]["worker"] == {"networks": ["data"], "env_file": [db_env]}
+    ov = nuk.build_override(APP, spec.ingress, db_env=db_env, db_services=db_services)
+    assert ov is not None
+    assert ov.to_wire()["services"]["worker"] == {"networks": ["data"], "env_file": [db_env]}
     assert "DATABASE_URL" in nuk.read_db_env(APP)
 
 

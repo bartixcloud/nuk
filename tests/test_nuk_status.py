@@ -466,11 +466,13 @@ def test_apply_writes_provenance_json(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "_resolve_image_digest", lambda name, raw: "sha256:cafef00d")  # noqa: ARG005
     nuk.cmd_apply(manifest_path, None)
     provenance = nuk.read_provenance("app")
-    assert provenance["repo"] == "https://github.com/astrojones/app"
-    assert provenance["branch"] == "main"
-    assert provenance["commit"] == sha
-    assert provenance["imageDigest"] == "sha256:cafef00d"
-    datetime.fromisoformat(provenance["appliedAt"])
+    assert provenance is not None
+    assert provenance.repo == "https://github.com/astrojones/app"
+    assert provenance.branch == "main"
+    assert provenance.commit == sha
+    assert provenance.image_digest == "sha256:cafef00d"
+    assert provenance.applied_at is not None
+    datetime.fromisoformat(provenance.applied_at)
 
 
 def test_apply_surfaces_provenance_through_status(tmp_path, monkeypatch):

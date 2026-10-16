@@ -253,14 +253,17 @@ def test_host_port_is_the_same_number_on_the_publish_and_the_backend(tmp_path):
         }
     )
 
-    for ing in (
+    for raw_ing in (
         {"host": "app.example.com", "service": "web", "port": 8080},
         {"host": "app.example.com", "service": "web", "port": 8080, "hostPort": 18080},
     ):
-        expected = ing.get("hostPort") or ing["port"]
+        ing = nuk.Ingress.model_validate(raw_ing)
+        expected = raw_ing.get("hostPort") or raw_ing["port"]
         assert nuk.backend_address(org, manifest, ing) == f"10.0.10.107:{expected}"
         ov = nuk.build_override("app", [ing], publish_ip="10.0.10.107")
-        assert f"10.0.10.107:{expected}:{ing['port']}" in ov["services"]["web"]["ports"]
+        assert ov is not None
+        ports = ov.to_wire()["services"]["web"]["ports"]
+        assert f"10.0.10.107:{expected}:{raw_ing['port']}" in ports
 
 
 def test_published_port_is_host_port_or_port():

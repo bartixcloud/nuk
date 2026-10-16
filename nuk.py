@@ -31,7 +31,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, Self, cast
+from typing import TYPE_CHECKING, Annotated, Literal, NoReturn, Self, cast
 from urllib.parse import urlparse
 
 import typer
@@ -40,7 +40,6 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    PrivateAttr,
     StringConstraints,
     TypeAdapter,
     ValidationError,
@@ -50,9 +49,6 @@ from pydantic import (
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator, Iterable, Mapping
 
-# A parsed YAML/JSON mapping: wire-contract keys are strings, values stay untyped because
-# the manifests are validated at the edges, not here.
-type Raw = dict[str, Any]
 # The return type of every record's `to_wire()`: exactly what json.dumps / yaml.safe_dump take.
 type Json = dict[str, Json] | list[Json] | str | int | float | bool | None
 
@@ -412,24 +408,12 @@ class FacilitySpec(Spec):
 
 
 class Manifest(_NullTolerant):
-    """The fields every nuk/v1 document shares, whatever its kind.
-
-    Carries the typed view used by the command layer plus the raw parsed dict
-    (`raw`) handed unchanged to the wire-contract render functions, so their
-    YAML output never shifts shape.
-    """
+    """The fields every nuk/v1 document shares, whatever its kind."""
 
     model_config = ConfigDict(populate_by_name=True)
 
     api_version: Literal["nuk/v1"] = Field(alias="apiVersion")
     metadata: Metadata
-
-    _raw: Raw = PrivateAttr(default_factory=dict)
-
-    @property
-    def raw(self) -> Raw:
-        """The original parsed manifest dict (wire-contract input)."""
-        return self._raw
 
 
 class Deployment(Manifest):
@@ -1306,8 +1290,7 @@ def load(path: Path) -> Deployment | Facility:
         path: Path to the manifest YAML.
 
     Returns:
-        The validated manifest, carrying the raw parsed dict for the render
-        functions.
+        The validated manifest.
 
     Raises:
         NukError: If the document is not a valid nuk/v1 Deployment or Facility.
@@ -1317,7 +1300,6 @@ def load(path: Path) -> Deployment | Facility:
         manifest = _MANIFEST_ADAPTER.validate_python(raw)
     except ValidationError:
         die(f"{path}: not a nuk/v1 Deployment or Facility")
-    manifest._raw = raw  # noqa: SLF001  # stash wire-contract input on its own model
     return manifest
 
 
@@ -5224,7 +5206,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         # app-host file router to it, record it, then drain the old colour. The
         # app host owns its own router here (the edge routes stably to it), so
         # the colourless `edge_term` unlink below is deliberately bypassed.
-        persist_manifest(manifest_path, pdir / "manifest.yml", repo_path)
+        persist_manifest(manifest.spec, manifest_path, pdir / "manifest.yml", repo_path)
         _apply_blue_green(name, manifest.spec, ingress, vocab, strategy, **mesh_kwargs)
     else:
         if edge_term and not router_mode:
@@ -5235,7 +5217,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         # facilities-less re-apply — the digest-path rollback — re-decides router mode
         # from the marker rather than guessing `edge` and unlinking the app-host router.
         record_router_dialect(name, "mesh" if router_mode else "edge")
-        persist_manifest(manifest_path, pdir / "manifest.yml", repo_path)
+        persist_manifest(manifest.spec, manifest_path, pdir / "manifest.yml", repo_path)
         # No --pull here: the deploy user has no GHCR auth. Images are pre-pulled by
         # the runner (nuk-apply.yml) into the shared daemon; up -d recreates services
         # whose image id changed. A declaration-only Facility has no compose file at
