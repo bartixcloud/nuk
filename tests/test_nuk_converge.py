@@ -356,7 +356,7 @@ def test_a_deployment_consuming_a_failed_facility_is_refused(tmp_path, monkeypat
             raise SystemExit(msg)
 
     monkeypatch.setattr(nuk, "cmd_apply", flaky)
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path / "secrets")  # db env files land here
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path / "secrets")  # db env files land here
     results = nuk.apply_tree(_ctx(tree, "app"))
     by_name = {r.name: r for r in results}
     assert by_name["data-stack"].result == "failed"
@@ -405,7 +405,7 @@ def test_reap_reports_orphans_and_deletes_nothing(tmp_path, monkeypatch):
     deploys = tmp_path / "deployments"
     for name in ("hello", "app-alpha", "oauth"):
         (deploys / name).mkdir(parents=True)
-    monkeypatch.setattr(nuk, "DEPLOYS", deploys)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", deploys)
     assert nuk.reap_report(tree) == ["app-alpha", "oauth"]
     assert (deploys / "app-alpha").is_dir()
     assert (deploys / "oauth").is_dir()
@@ -421,12 +421,12 @@ def test_reap_counts_facilities_as_declared(tmp_path, monkeypatch):
     deploys = tmp_path / "deployments"
     for name in ("hello", "data-stack"):
         (deploys / name).mkdir(parents=True)
-    monkeypatch.setattr(nuk, "DEPLOYS", deploys)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", deploys)
     assert nuk.reap_report(tree) == []
 
 
 def test_reap_is_empty_when_nothing_is_deployed(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "absent")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "absent")
     assert nuk.reap_report(tmp_path / "tree") == []
 
 
@@ -483,7 +483,7 @@ def test_git_ssh_command_pins_the_deploy_key_and_the_host_key():
     assert argv[:3] == ["ssh", "-i", "/k/with space"]
     assert "IdentitiesOnly=yes" in argv
     assert "StrictHostKeyChecking=yes" in argv
-    assert f"UserKnownHostsFile={nuk.KNOWN_HOSTS}" in argv
+    assert f"UserKnownHostsFile={nuk.paths.KNOWN_HOSTS}" in argv
     assert "BatchMode=yes" in argv
 
 

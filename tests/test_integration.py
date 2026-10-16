@@ -48,7 +48,7 @@ def data_stack():
 @pytest.fixture
 def secrets_dir(tmp_path, monkeypatch):
     """Point nuk's creds store at a throwaway dir for the test."""
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
     return tmp_path
 
 

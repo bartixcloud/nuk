@@ -42,8 +42,8 @@ def applied(tmp_path, monkeypatch):
         commands.append(cmd)
 
     monkeypatch.setattr(nuk, "sh", fake_sh)
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deployments")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deployments")
     monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
     monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])

@@ -229,7 +229,7 @@ def test_edge_renders_a_router_for_every_deployment(tmp_path, monkeypatch):
     )
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     rendered = nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml"))
     assert sorted(rendered) == ["hello", "other"]
     doc = yaml.safe_load((dynamic / "hello.yml").read_text())
@@ -243,7 +243,7 @@ def test_edge_render_applies_the_gate_from_the_vocabulary(tmp_path, monkeypatch)
     tree = _tree(tmp_path, {"hello": gated}, {"basic": GATE_FACILITY})
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml"))
     doc = yaml.safe_load((dynamic / "hello.yml").read_text())
     assert doc["http"]["routers"]["hello-0"]["middlewares"] == [
@@ -261,7 +261,7 @@ def test_edge_routes_apps_through_the_app_host_router(tmp_path, monkeypatch):
     tree = _tree(tmp_path, {"hello": HELLO}, {"router": ROUTER_FACILITY})
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml"))
     doc = yaml.safe_load((dynamic / "hello.yml").read_text())
     server = doc["http"]["services"]["hello-0"]["loadBalancer"]["servers"][0]
@@ -280,7 +280,7 @@ def test_edge_uses_router_when_facility_is_in_the_platform_tree(tmp_path, monkey
     platform = _tree(tmp_path / "platform", {}, {"router": ROUTER_FACILITY})
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     ctx = nuk.TreeContext(
         tree=app_tree,
         role="edge",
@@ -302,7 +302,7 @@ def test_edge_render_skips_deployments_without_ingress(tmp_path, monkeypatch):
     tree = _tree(tmp_path, {"hello": headless}, {})
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     assert nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml")) == []
     assert not (dynamic / "hello.yml").exists()
 
@@ -320,7 +320,7 @@ def test_edge_render_skips_deployments_placed_on_an_entry_host(tmp_path, monkeyp
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
     (dynamic / "hello.yml").write_text("http: {local: true}\n", encoding="utf-8")
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     assert nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml")) == []
     assert yaml.safe_load((dynamic / "hello.yml").read_text()) == {"http": {"local": True}}
 
@@ -331,7 +331,7 @@ def test_reap_removes_only_the_legacy_worker_prefix(tmp_path, monkeypatch):
     dynamic.mkdir()
     for name in ("worker-hello.yml", "worker-other.yml", "global.yml", "hello.yml", "oauth.yml"):
         (dynamic / name).write_text("http: {}\n", encoding="utf-8")
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     reaped = nuk.reap_legacy_worker_routers()
     assert sorted(reaped) == ["worker-hello.yml", "worker-other.yml"]
     assert sorted(p.name for p in dynamic.iterdir()) == ["global.yml", "hello.yml", "oauth.yml"]
@@ -340,7 +340,7 @@ def test_reap_removes_only_the_legacy_worker_prefix(tmp_path, monkeypatch):
 def test_reap_is_idempotent(tmp_path, monkeypatch):
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     assert nuk.reap_legacy_worker_routers() == []
     assert nuk.reap_legacy_worker_routers() == []
 
@@ -355,7 +355,7 @@ def test_render_edge_routers_reaps_first(tmp_path, monkeypatch):
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
     (dynamic / "worker-hello.yml").write_text("http: {}\n", encoding="utf-8")
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml"))
     assert not (dynamic / "worker-hello.yml").exists()
     assert (dynamic / "hello.yml").exists()
@@ -371,7 +371,7 @@ def test_reap_does_not_remove_a_current_worker_named_deployment(tmp_path, monkey
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
     (dynamic / "worker-app.yml").write_text("http: {}\n", encoding="utf-8")
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     assert nuk.reap_legacy_worker_routers(protected={"worker-app.yml"}) == []
     assert (dynamic / "worker-app.yml").exists()
 
@@ -409,7 +409,7 @@ def test_render_refuses_a_host_delegated_to_another_tenant(tmp_path, monkeypatch
     tree = _tree(tmp_path, {"kolbe": KOLBE}, {})
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     result = nuk.render_routes(_edge_ctx(tree, "astrojones"), _auth(ZONE, LENT))
     assert result.rendered == []
     assert result.refused == [
@@ -423,7 +423,7 @@ def test_the_delegation_authorizes_the_target_tenant(tmp_path, monkeypatch):
     tree = _tree(tmp_path, {"kolbe": KOLBE}, {})
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     result = nuk.render_routes(_edge_ctx(tree, "kolbeapp-de"), _auth(ZONE, LENT))
     assert result.rendered == ["kolbe"]
     assert result.refused == []
@@ -441,7 +441,7 @@ def test_www_variant_needs_its_own_authorization(tmp_path, monkeypatch):
     tree = _tree(tmp_path, {"kolbe": www}, {})
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     result = nuk.render_routes(_edge_ctx(tree, "kolbeapp-de"), _auth(ZONE, LENT))
     assert result.rendered == ["kolbe"]
     assert result.refused == [
@@ -459,7 +459,7 @@ def test_www_variant_is_authorized_when_the_loan_covers_it(tmp_path, monkeypatch
     tree = _tree(tmp_path, {"kolbe": www}, {})
     dynamic = tmp_path / "dynamic"
     dynamic.mkdir()
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     lent = {
         "astrojones": [
             nuk.Delegation(host="kolbe.astrojones.guru", to="kolbeapp-de"),
@@ -488,7 +488,7 @@ def test_revocation_rewrites_the_owners_routers_without_the_lent_host(tmp_path, 
         encoding="utf-8",
     )
     (dynamic / "other.yml").write_text("http: {}\n", encoding="utf-8")
-    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
     result = nuk.render_routes(_edge_ctx(tree, "astrojones"), _auth(ZONE, LENT))
     assert result.rendered == []
     assert result.refused == [

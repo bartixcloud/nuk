@@ -21,8 +21,8 @@ def state(tmp_path, monkeypatch):
     releases = tmp_path / "releases"
     deploys = tmp_path / "deployments"
     deploys.mkdir()
-    monkeypatch.setattr(nuk, "RELEASES", releases)
-    monkeypatch.setattr(nuk, "DEPLOYS", deploys)
+    monkeypatch.setattr(nuk.paths, "RELEASES", releases)
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", deploys)
     return releases, deploys
 
 

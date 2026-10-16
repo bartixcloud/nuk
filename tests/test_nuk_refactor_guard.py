@@ -206,7 +206,7 @@ def test_pg_driver_ignores_a_non_string_value():
 
 
 def test_db_env_apps_lists_only_creds_files(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
     (tmp_path / "b-db.env").write_text("", encoding="utf-8")
     (tmp_path / "a-db.env").write_text("DATABASE_URL=x\n", encoding="utf-8")
     (tmp_path / "notes.txt").write_text("x", encoding="utf-8")
@@ -214,7 +214,7 @@ def test_db_env_apps_lists_only_creds_files(tmp_path, monkeypatch):
 
 
 def test_db_env_apps_is_empty_without_the_secrets_dir(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "SECRETS", tmp_path / "absent")
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path / "absent")
     assert nuk._db_env_apps() == []
 
 
@@ -287,7 +287,7 @@ def test_write_ingress_skips_a_byte_identical_rewrite(tmp_path, monkeypatch):
     A read-only target makes the assertion unambiguous: a second identical call
     must not attempt a write at all.
     """
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path)
     ingress = [_web("a.example.com")]
     nuk.write_ingress("app", ingress, {})
     target = tmp_path / "app.yml"
@@ -299,7 +299,7 @@ def test_write_ingress_skips_a_byte_identical_rewrite(tmp_path, monkeypatch):
 
 def test_write_ingress_still_writes_changed_content(tmp_path, monkeypatch):
     """The other half of the guard: it is content-compared, not write-once."""
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path)
     nuk.write_ingress("app", [_web("a.example.com")], {})
     target = tmp_path / "app.yml"
     first = target.read_text(encoding="utf-8")
@@ -308,7 +308,7 @@ def test_write_ingress_still_writes_changed_content(tmp_path, monkeypatch):
 
 
 def test_write_ingress_removes_the_file_when_the_render_is_empty(tmp_path, monkeypatch):
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path)
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path)
     nuk.write_ingress("app", [_web("a.example.com")], {})
     target = tmp_path / "app.yml"
     assert target.exists()
@@ -372,8 +372,8 @@ def test_annotate_routers_keeps_the_host_matching_and_the_none_case(monkeypatch)
 
 def _stub_apply(tmp_path: Path, monkeypatch, calls: list[tuple]) -> None:
     """Stub everything cmd_apply touches outside the tree, capturing sh()."""
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
     monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
     monkeypatch.setattr(nuk, "sh", lambda *a, **_k: calls.append(a))
     monkeypatch.setattr(nuk, "_is_privileged", lambda: True)

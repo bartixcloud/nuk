@@ -45,19 +45,42 @@ from pydantic import (
     model_validator,
 )
 
+from nuk import paths
 from nuk.paths import (
-    CONVERGE_STATE,
-    CONVERGE_STATUS,
-    DB_SEED_ENV,
-    DEPLOYS,
-    DYNAMIC,
-    HOST_ENV,
-    KNOWN_HOSTS,
-    RELEASES,
-    ROOT,
-    SECRETS,
-    SIGNERS_DIR,
-    SOURCES_FILE,
+    CONVERGE_STATE as CONVERGE_STATE,
+)
+from nuk.paths import (
+    CONVERGE_STATUS as CONVERGE_STATUS,
+)
+from nuk.paths import (
+    DB_SEED_ENV as DB_SEED_ENV,
+)
+from nuk.paths import (
+    DEPLOYS as DEPLOYS,
+)
+from nuk.paths import (
+    DYNAMIC as DYNAMIC,
+)
+from nuk.paths import (
+    HOST_ENV as HOST_ENV,
+)
+from nuk.paths import (
+    KNOWN_HOSTS as KNOWN_HOSTS,
+)
+from nuk.paths import (
+    RELEASES as RELEASES,
+)
+from nuk.paths import (
+    ROOT as ROOT,
+)
+from nuk.paths import (
+    SECRETS as SECRETS,
+)
+from nuk.paths import (
+    SIGNERS_DIR as SIGNERS_DIR,
+)
+from nuk.paths import (
+    SOURCES_FILE as SOURCES_FILE,
 )
 from nuk.util import (
     NukError,
@@ -1690,7 +1713,7 @@ def org_get(org: Org, dotted: str) -> object:
 
 def project_dir(name: str) -> Path:
     """Return the on-disk deployment directory for an app."""
-    return DEPLOYS / name
+    return paths.DEPLOYS / name
 
 
 def _active_colour_file(name: str) -> Path:
@@ -1820,19 +1843,19 @@ def _repo_dir(name: str) -> Path:
 
 def _router_file(name: str) -> Path:
     """An app's Traefik file-provider doc."""
-    return DYNAMIC / f"{name}.yml"
+    return paths.DYNAMIC / f"{name}.yml"
 
 
 def _db_env_path(app: str) -> Path:
     """An app's DB creds env-file — also the marker that nuk still tracks its database."""
-    return SECRETS / f"{app}-db.env"
+    return paths.SECRETS / f"{app}-db.env"
 
 
 def _db_env_apps() -> list[str]:
     """Apps with a DB creds file, deployed or retained."""
-    if not SECRETS.exists():
+    if not paths.SECRETS.exists():
         return []
-    return sorted(f.name.removesuffix("-db.env") for f in SECRETS.glob("*-db.env"))
+    return sorted(f.name.removesuffix("-db.env") for f in paths.SECRETS.glob("*-db.env"))
 
 
 def persist_manifest(spec: Spec, src_path: Path, dest: Path, repo_path: str | None) -> None:
@@ -2266,7 +2289,7 @@ def read_self() -> tuple[str, str | None]:
     locally and every existing render stays byte-identical.
     """
     try:
-        env = _read_env_file(HOST_ENV)
+        env = _read_env_file(paths.HOST_ENV)
     except OSError:
         env = {}
     return env.get("ROLE") or "all-in-one", env.get("PRIVATE_IP") or None
@@ -2278,7 +2301,7 @@ def read_tenant() -> str | None:
     None for platform VMs (`TENANT=` empty) and for hosts without the key or the file.
     """
     try:
-        env = _read_env_file(HOST_ENV)
+        env = _read_env_file(paths.HOST_ENV)
     except OSError:
         env = {}
     return env.get("TENANT") or None
@@ -2484,7 +2507,7 @@ def git_ssh_command(key: Path) -> str:
     """
     return (
         f"ssh -i {shlex.quote(str(key))} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes "
-        f"-o UserKnownHostsFile={shlex.quote(str(KNOWN_HOSTS))} -o BatchMode=yes"
+        f"-o UserKnownHostsFile={shlex.quote(str(paths.KNOWN_HOSTS))} -o BatchMode=yes"
     )
 
 
@@ -2870,12 +2893,12 @@ def reap_report(*trees: Path) -> list[str]:
     source's tree of the cycle — a host runs the platform's facilities AND its own
     tenant's deployments.
     """
-    if not DEPLOYS.is_dir():
+    if not paths.DEPLOYS.is_dir():
         return []
     declared: set[str] = set()
     for tree in trees:
         declared |= _declared_names(tree)
-    return sorted(p.name for p in DEPLOYS.iterdir() if p.is_dir() and p.name not in declared)
+    return sorted(p.name for p in paths.DEPLOYS.iterdir() if p.is_dir() and p.name not in declared)
 
 
 def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a dataclass buys nothing here
@@ -2909,7 +2932,7 @@ def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a d
     _atomic_write(path, json.dumps(status.to_wire(), indent=2) + "\n")
 
 
-def read_converge_status(path: Path = CONVERGE_STATUS) -> ConvergeStatus | None:
+def read_converge_status(path: Path = paths.CONVERGE_STATUS) -> ConvergeStatus | None:
     """The last recorded cycle, or None if absent/unreadable/malformed."""
     return ConvergeStatus.from_wire(_read_json_safe(path))
 
@@ -3690,11 +3713,11 @@ def reap_legacy_worker_routers(protected: set[str] | None = None) -> list[str]:
     Returns:
         The filenames removed, for the caller to log.
     """
-    if not DYNAMIC.is_dir():
+    if not paths.DYNAMIC.is_dir():
         return []
     protected = protected or set()
     reaped = []
-    for p in sorted(DYNAMIC.glob(f"{_LEGACY_ROUTER_PREFIX}*.yml")):
+    for p in sorted(paths.DYNAMIC.glob(f"{_LEGACY_ROUTER_PREFIX}*.yml")):
         if p.name in protected:
             continue
         p.unlink()
@@ -3790,7 +3813,7 @@ def _render_routers(
     Returns:
         The router names written and the refusal lines (one per foreign host).
     """
-    DYNAMIC.mkdir(parents=True, exist_ok=True)
+    paths.DYNAMIC.mkdir(parents=True, exist_ok=True)
     deployments = load_deployments(tree)
     protected = {f"{m.metadata.name}.yml" for m in deployments}
     for stale in reap_legacy_worker_routers(protected):
@@ -3969,7 +3992,7 @@ def read_db_env(app: str) -> dict[str, str]:
 
 def write_db_env(app: str, env: dict[str, str]) -> str:
     """Write an app's DB creds env-file (600, deploy-owned); return its path."""
-    SECRETS.mkdir(parents=True, exist_ok=True)
+    paths.SECRETS.mkdir(parents=True, exist_ok=True)
     path = _db_env_path(app)
     path.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
     path.chmod(0o600)
@@ -4107,9 +4130,9 @@ def load_db_seed() -> bytes | None:
     Absent means a legacy single-host install: callers keep the random-password
     behavior so old deploys are byte-identical.
     """
-    if not DB_SEED_ENV.exists():
+    if not paths.DB_SEED_ENV.exists():
         return None
-    seed = _read_env_file(DB_SEED_ENV).get("NUK_DB_SEED")
+    seed = _read_env_file(paths.DB_SEED_ENV).get("NUK_DB_SEED")
     return seed.encode() if seed is not None else None
 
 
@@ -4281,7 +4304,7 @@ def provision_databases(
         seed = load_db_seed()
         if seed is None:
             die(
-                f"{app}: spec.databases needs the fleet DB seed at {DB_SEED_ENV} "
+                f"{app}: spec.databases needs the fleet DB seed at {paths.DB_SEED_ENV} "
                 f"to derive remote credentials — deliver it via converge.sh"
             )
         env: dict[str, str] = {}  # remote mode derives fresh; never carry stale keys
@@ -4359,7 +4382,7 @@ def _provenance_path(name: str) -> Path:
 
 def _releases_path(name: str) -> Path:
     """On-disk path of an app's release history (spec §8)."""
-    return RELEASES / f"{name}.jsonl"
+    return paths.RELEASES / f"{name}.jsonl"
 
 
 def read_provenance_history(name: str) -> list[ReleaseEntry]:
@@ -4437,7 +4460,7 @@ def write_provenance(
         history[-1] = entry
     else:
         history.append(entry)
-    RELEASES.mkdir(parents=True, exist_ok=True)
+    paths.RELEASES.mkdir(parents=True, exist_ok=True)
     _releases_path(name).write_text(
         "".join(json.dumps(e.to_wire()) + "\n" for e in history[-RELEASE_LIMIT:]),
         encoding="utf-8",
@@ -4742,14 +4765,14 @@ def build_overview(*, probe_enabled: bool = False) -> Overview:
     """Walk DEPLOYS/*/ and build the org-wide status Overview. Degrades; never raises."""
     errors: list[str] = []
     names: list[str] = []
-    if DEPLOYS.exists():
-        names = sorted(p.name for p in DEPLOYS.iterdir() if p.is_dir())
+    if paths.DEPLOYS.exists():
+        names = sorted(p.name for p in paths.DEPLOYS.iterdir() if p.is_dir())
     else:
-        errors.append(f"cannot read {DEPLOYS} — is /opt/nuklaut mounted?")
+        errors.append(f"cannot read {paths.DEPLOYS} — is /opt/nuklaut mounted?")
     return Overview(
         apps=[_read_app_overview(n, probe_enabled=probe_enabled) for n in names],
         live_routing_available=False,  # Traefik api@internal integration is a later chapter
-        nuk_root=str(ROOT),
+        nuk_root=str(paths.ROOT),
         generated_at=_iso_utc_now(),
         errors=errors,
     )
@@ -4892,8 +4915,8 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     # Only the mesh write carries the dialect; the edge-dialect call stays
     # byte-identical to what every existing caller and test double expects.
     mesh_kwargs = {"dialect": "mesh"} if router_mode else {}
-    DYNAMIC.mkdir(parents=True, exist_ok=True)
-    DEPLOYS.mkdir(parents=True, exist_ok=True)
+    paths.DYNAMIC.mkdir(parents=True, exist_ok=True)
+    paths.DEPLOYS.mkdir(parents=True, exist_ok=True)
     source = manifest.spec.source
     if ctx.tenant is not None and source.repo and not _same_repo(source.repo, ctx.source_repo):
         # The tree is the review unit (P1): a tenant source may ship its compose payload
@@ -5640,9 +5663,11 @@ def _known_deployments() -> list[str]:
     Returns empty (never raises) off the controller, where DEPLOYS is absent, so
     shell completion degrades gracefully.
     """
-    if not DEPLOYS.exists():
+    if not paths.DEPLOYS.exists():
         return []
-    return sorted(p.name for p in DEPLOYS.iterdir() if p.is_dir() and (p / "manifest.yml").exists())
+    return sorted(
+        p.name for p in paths.DEPLOYS.iterdir() if p.is_dir() and (p / "manifest.yml").exists()
+    )
 
 
 def complete_deployment_name(incomplete: str) -> list[str]:
@@ -5728,9 +5753,9 @@ def _root(
     """
     if ctx.invoked_subcommand in {"org", "update"}:
         return
-    if not ROOT.exists():
+    if not paths.ROOT.exists():
         die(
-            f"nuk: {ROOT} does not exist — nuk runs on the controller, "
+            f"nuk: {paths.ROOT} does not exist — nuk runs on the controller, "
             f"not your workstation. Use: ./deploy.sh nuk {ctx.invoked_subcommand}"
         )
 
@@ -5839,13 +5864,13 @@ def _rollback(
 def _converge(
     sources: Annotated[
         Path, typer.Option("--sources", help="sources.yml: repos, deploy keys, what each applies")
-    ] = SOURCES_FILE,
+    ] = paths.SOURCES_FILE,
     signers_dir: Annotated[
         Path, typer.Option("--signers-dir", help="allowed_signers.d: one trust file per source")
-    ] = SIGNERS_DIR,
+    ] = paths.SIGNERS_DIR,
     state_dir: Annotated[
         Path, typer.Option("--state-dir", help="lock, per-source state, status file")
-    ] = CONVERGE_STATE,
+    ] = paths.CONVERGE_STATE,
 ) -> None:
     """Converge this host from every source to its newest verifying tag (spec §7)."""
     raise typer.Exit(

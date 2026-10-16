@@ -248,9 +248,9 @@ class Fleet:
 
 @pytest.fixture
 def fleet(tmp_path, monkeypatch, platform_files, signing_keys):
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
-    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk.paths, "HOST_ENV", tmp_path / "no-host-env")
     monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.11.10"))
     f = Fleet(tmp_path, platform_files, signing_keys)
     f.applied = []
@@ -326,7 +326,7 @@ def test_tenant_sources_are_refused_when_the_platform_does_not_verify(fleet):
 def test_a_platform_tree_without_org_is_refused_and_tenants_follow(
     tmp_path, monkeypatch, platform_files, signing_keys
 ):
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
     monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.11.10"))
     monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: pytest.fail("must not apply"))
     incomplete = {k: v for k, v in platform_files.items() if k != nuk.DEFAULT_ORG_FILE}
@@ -501,7 +501,7 @@ def test_a_tenant_route_in_its_domains_is_rendered(fleet, monkeypatch):
     block = fleet.status()["sources"]["astrojones"]
     assert block["rendered"] == ["hello"]
     assert block["refusedRoutes"] == []
-    assert (nuk.DYNAMIC / "hello.yml").is_file()
+    assert (nuk.paths.DYNAMIC / "hello.yml").is_file()
 
 
 def test_a_tenant_route_for_a_foreign_host_is_refused(fleet, monkeypatch):
@@ -520,15 +520,15 @@ def test_a_tenant_route_for_a_foreign_host_is_refused(fleet, monkeypatch):
     assert block["refusedRoutes"] == [
         "REFUSED route kolbeapp.de: owned/delegated by the platform"
     ]
-    assert not (nuk.DYNAMIC / "steal.yml").exists()
-    assert (nuk.DYNAMIC / "hello.yml").is_file()
+    assert not (nuk.paths.DYNAMIC / "steal.yml").exists()
+    assert (nuk.paths.DYNAMIC / "hello.yml").is_file()
 
 
 def test_a_tenant_missing_from_the_registry_routes_nothing(
     tmp_path, monkeypatch, platform_files, signing_keys
 ):
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
     monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
     monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
     no_tenants = {k: v for k, v in platform_files.items() if k != "tenants.yml"}
@@ -551,9 +551,9 @@ def test_delegation_from_a_later_source_is_effective_in_the_same_cycle(
     which is processed FIRST; the loan — verified later in the same cycle — must already
     authorize the render.
     """
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
-    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk.paths, "HOST_ENV", tmp_path / "no-host-env")
     monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
     monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
     platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
@@ -569,7 +569,7 @@ def test_delegation_from_a_later_source_is_effective_in_the_same_cycle(
     block = f.status()["sources"]["kolbeapp-de"]
     assert block["refusedRoutes"] == []
     assert block["rendered"] == ["kolbe"]
-    assert (nuk.DYNAMIC / "kolbe.yml").is_file()
+    assert (nuk.paths.DYNAMIC / "kolbe.yml").is_file()
 
 
 def test_failed_owner_fetch_falls_back_to_the_last_verified_delegations(
@@ -580,9 +580,9 @@ def test_failed_owner_fetch_falls_back_to_the_last_verified_delegations(
     First cycle: astrojones verifies and its loans are cached. Second cycle: its fetch
     fails, so the cached loans stand and kolbeapp-de keeps rendering kolbe.
     """
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
-    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk.paths, "HOST_ENV", tmp_path / "no-host-env")
     monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
     monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
     platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
@@ -596,7 +596,7 @@ def test_failed_owner_fetch_falls_back_to_the_last_verified_delegations(
     )
     assert f.converge() == 0
     assert f.status()["sources"]["kolbeapp-de"]["rendered"] == ["kolbe"]
-    (nuk.DYNAMIC / "kolbe.yml").unlink()
+    (nuk.paths.DYNAMIC / "kolbe.yml").unlink()
 
     shutil.rmtree(f.origins["astrojones"].bare)  # the owner's repo is unreachable now
 
@@ -606,7 +606,7 @@ def test_failed_owner_fetch_falls_back_to_the_last_verified_delegations(
     assert "git fetch failed" in sources["astrojones"]["error"]
     # …but the last verified loans still authorize the render.
     assert f.status()["sources"]["kolbeapp-de"]["rendered"] == ["kolbe"]
-    assert (nuk.DYNAMIC / "kolbe.yml").is_file()
+    assert (nuk.paths.DYNAMIC / "kolbe.yml").is_file()
 
 
 def test_a_platform_outage_does_not_turn_a_cached_loan_into_a_cycle_crash(fleet):
@@ -638,9 +638,9 @@ def test_a_bad_delegation_refuses_only_the_offending_source(
     and the other tenant must still converge, and the cycle must end not clean — a failed
     run must never be recorded as a successful one.
     """
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
-    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk.paths, "HOST_ENV", tmp_path / "no-host-env")
     monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
     monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
     platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
@@ -671,9 +671,9 @@ def test_a_malformed_delegations_manifest_refuses_only_its_source(
     the parse error, its loans are never honoured, the platform and the other tenant still
     apply, and the cycle is not clean.
     """
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
-    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk.paths, "HOST_ENV", tmp_path / "no-host-env")
     monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
     monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
     platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
@@ -696,7 +696,7 @@ def test_a_malformed_delegations_manifest_refuses_only_its_source(
     assert sources["kolbeapp-de"]["refusedRoutes"] == [
         "REFUSED route kolbe.astrojones.guru: owned/delegated by astrojones"
     ]
-    assert not (nuk.DYNAMIC / "kolbe.yml").exists()
+    assert not (nuk.paths.DYNAMIC / "kolbe.yml").exists()
 
 
 def test_a_corrupt_delegation_cache_is_a_recorded_cycle_failure(
@@ -708,9 +708,9 @@ def test_a_corrupt_delegation_cache_is_a_recorded_cycle_failure(
     authorization set is unknowable, so the cycle ends not-clean with the error in the status
     file and the apply pass does not run — rather than rendering as if the owner lent nothing.
     """
-    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
-    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
-    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk.paths, "HOST_ENV", tmp_path / "no-host-env")
     monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
     monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
     platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
@@ -723,12 +723,12 @@ def test_a_corrupt_delegation_cache_is_a_recorded_cycle_failure(
         ("astrojones", ["deployments", "routes"]),
     )
     assert f.converge() == 0  # first cycle caches astrojones's verified loans
-    assert (nuk.DYNAMIC / "kolbe.yml").is_file()
+    assert (nuk.paths.DYNAMIC / "kolbe.yml").is_file()
 
     shutil.rmtree(f.origins["astrojones"].bare)  # the owner is unreachable now
     cache = nuk.source_state_dir(f.state, "astrojones") / nuk.DELEGATIONS_CACHE_FILE
     cache.write_text("{ not json", encoding="utf-8")
-    (nuk.DYNAMIC / "kolbe.yml").unlink()
+    (nuk.paths.DYNAMIC / "kolbe.yml").unlink()
 
     assert f.converge() == 1  # not clean…
     status = f.status()
@@ -737,7 +737,7 @@ def test_a_corrupt_delegation_cache_is_a_recorded_cycle_failure(
     assert status["sources"]["astrojones"]["result"] == "refused"
     # The apply pass did not run on an unknown authorization set.
     assert status["sources"]["kolbeapp-de"]["rendered"] == []
-    assert not (nuk.DYNAMIC / "kolbe.yml").exists()
+    assert not (nuk.paths.DYNAMIC / "kolbe.yml").exists()
 
 
 # --- reap -------------------------------------------------------------------------------
