@@ -53,6 +53,17 @@ HELLO = """
         - {host: hello.example.com, service: web, port: 8080}
 """
 
+KOLBE = """
+    apiVersion: nuk/v1
+    kind: Deployment
+    metadata: {name: kolbe}
+    spec:
+      placement: {role: app}
+      source: {repo: https://github.com/kolbeapp-de/kolbe.git}
+      ingress:
+        - {host: kolbe.astrojones.guru, service: web, port: 8080}
+"""
+
 GATE_FACILITY = """
     apiVersion: nuk/v1
     kind: Facility
@@ -361,3 +372,125 @@ def test_reap_does_not_remove_a_current_worker_named_deployment(tmp_path, monkey
     monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
     assert nuk.reap_legacy_worker_routers(protected={"worker-app.yml"}) == []
     assert (dynamic / "worker-app.yml").exists()
+
+
+# --- rendering through the resolution: gate, `www.`, revocation (spec §3/§5/§6) ---------
+
+
+def _auth(tenants, delegations=None) -> nuk.HostAuth:
+    return nuk.HostAuth(nuk.TenantRegistry(tenants=tenants), delegations or {})
+
+
+# astrojones owns the zone; kolbeapp-de lists nothing and is lent one apex host.
+ZONE = [
+    {"name": "astrojones", "domains": ["astrojones.guru", "*.astrojones.guru"]},
+    {"name": "kolbeapp-de", "domains": []},
+]
+LENT = {"astrojones": [nuk.Delegation(host="kolbe.astrojones.guru", to="kolbeapp-de")]}
+
+
+def _edge_ctx(tree: Path, tenant: str) -> nuk.TreeContext:
+    return nuk.TreeContext(
+        tree=tree,
+        role="edge",
+        self_ip=None,
+        tenant=tenant,
+        apply=nuk.APPLY_ALL,
+        facilities=[],
+        org=nuk.load_org(tree / "org.yml"),
+        tenants=None,
+    )
+
+
+def test_render_refuses_a_host_delegated_to_another_tenant(tmp_path, monkeypatch):
+    """Spec §3.2/§3.3: the owner loses the lent host; it renders nothing for it."""
+    tree = _tree(tmp_path, {"kolbe": KOLBE}, {})
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    result = nuk.render_routes(_edge_ctx(tree, "astrojones"), _auth(ZONE, LENT))
+    assert result.rendered == []
+    assert result.refused == [
+        "REFUSED route kolbe.astrojones.guru: owned/delegated by kolbeapp-de"
+    ]
+    assert not (dynamic / "kolbe.yml").exists()
+
+
+def test_the_delegation_authorizes_the_target_tenant(tmp_path, monkeypatch):
+    """Spec §2: the loan — not the target's own `domains` — authorizes the render."""
+    tree = _tree(tmp_path, {"kolbe": KOLBE}, {})
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    result = nuk.render_routes(_edge_ctx(tree, "kolbeapp-de"), _auth(ZONE, LENT))
+    assert result.rendered == ["kolbe"]
+    assert result.refused == []
+    assert (dynamic / "kolbe.yml").is_file()
+
+
+def test_www_variant_needs_its_own_authorization(tmp_path, monkeypatch):
+    """Spec §6: `www.<host>` is authorized by the SAME loan; without coverage it is omitted.
+
+    The apex is lent to kolbeapp-de, but `www.kolbe.astrojones.guru` is NOT, so it still
+    resolves to the zone owner. The unauthorised redirect router — a hijack vector today —
+    must not be written, while the apex router still renders.
+    """
+    www = KOLBE.replace("port: 8080}", "port: 8080, www: true}")
+    tree = _tree(tmp_path, {"kolbe": www}, {})
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    result = nuk.render_routes(_edge_ctx(tree, "kolbeapp-de"), _auth(ZONE, LENT))
+    assert result.rendered == ["kolbe"]
+    assert result.refused == [
+        "REFUSED route www.kolbe.astrojones.guru: owned/delegated by astrojones"
+    ]
+    doc = yaml.safe_load((dynamic / "kolbe.yml").read_text())
+    assert doc["http"]["routers"]["kolbe-0"]["rule"] == "Host(`kolbe.astrojones.guru`)"
+    assert "kolbe-0-www" not in doc["http"]["routers"]
+    assert "kolbe-0-www-redirect" not in doc["http"].get("middlewares", {})
+
+
+def test_www_variant_is_authorized_when_the_loan_covers_it(tmp_path, monkeypatch):
+    """The same loan that covers `*.<host>` also authorizes the `www.` variant."""
+    www = KOLBE.replace("port: 8080}", "port: 8080, www: true}")
+    tree = _tree(tmp_path, {"kolbe": www}, {})
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    lent = {
+        "astrojones": [
+            nuk.Delegation(host="kolbe.astrojones.guru", to="kolbeapp-de"),
+            nuk.Delegation(host="*.kolbe.astrojones.guru", to="kolbeapp-de"),
+        ]
+    }
+    result = nuk.render_routes(_edge_ctx(tree, "kolbeapp-de"), _auth(ZONE, lent))
+    assert result.rendered == ["kolbe"]
+    assert result.refused == []
+    doc = yaml.safe_load((dynamic / "kolbe.yml").read_text())
+    assert doc["http"]["routers"]["kolbe-0-www"]["rule"] == "Host(`www.kolbe.astrojones.guru`)"
+
+
+def test_revocation_rewrites_the_owners_routers_without_the_lent_host(tmp_path, monkeypatch):
+    """Spec §5: the owner's router set is authoritative — a fully-refused render withdraws it.
+
+    The owner lent the only host it had, so its render yields nothing allowed. The router
+    file it wrote while it owned the host must go; nothing another owner wrote is touched
+    (the loop reports and rewrites its own set, never deletes a foreign file).
+    """
+    tree = _tree(tmp_path, {"kolbe": KOLBE}, {})
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    (dynamic / "kolbe.yml").write_text(
+        "http:\n  routers:\n    kolbe-0:\n      rule: Host(`kolbe.astrojones.guru`)\n",
+        encoding="utf-8",
+    )
+    (dynamic / "other.yml").write_text("http: {}\n", encoding="utf-8")
+    monkeypatch.setattr(nuk, "DYNAMIC", dynamic)
+    result = nuk.render_routes(_edge_ctx(tree, "astrojones"), _auth(ZONE, LENT))
+    assert result.rendered == []
+    assert result.refused == [
+        "REFUSED route kolbe.astrojones.guru: owned/delegated by kolbeapp-de"
+    ]
+    assert not (dynamic / "kolbe.yml").exists()
+    assert (dynamic / "other.yml").read_text() == "http: {}\n"

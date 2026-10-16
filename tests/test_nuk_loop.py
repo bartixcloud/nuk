@@ -10,6 +10,7 @@ HERMETICITY: git runs with GIT_CONFIG_GLOBAL/SYSTEM pointed nowhere, so a develo
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import textwrap
 
@@ -88,6 +89,38 @@ spec:
   provides:
     env: {capability: databases, bind: postgres}
   health: {containers: [nuk-postgres, nuk-redis]}
+"""
+
+KOLBE = """\
+apiVersion: nuk/v1
+kind: Deployment
+metadata: {name: kolbe}
+spec:
+  placement: {role: app}
+  ingress:
+    - {host: kolbe.astrojones.guru, service: web, port: 8080}
+"""
+
+# Two tenants that own separate zones; kolbeapp-de is the target of astrojones's loan.
+ZONE_TENANTS = """\
+tenants:
+  - name: astrojones
+    edge: shared
+    domains: [astrojones.guru, "*.astrojones.guru"]
+    signer_principal: astrojones
+  - name: kolbeapp-de
+    edge: shared
+    domains: [kolbeapp.de, "*.kolbeapp.de"]
+    signer_principal: kolbeapp-de
+"""
+
+DELEGATING = """\
+apiVersion: nuk/v1
+kind: Delegations
+metadata: {name: astrojones}
+spec:
+  delegations:
+    - {host: kolbe.astrojones.guru, to: kolbeapp-de}
 """
 
 
@@ -483,7 +516,9 @@ def test_a_tenant_route_for_a_foreign_host_is_refused(fleet, monkeypatch):
     assert fleet.converge() == 0
     block = fleet.status()["sources"]["astrojones"]
     assert block["rendered"] == ["hello"]  # only the in-domain route
-    assert block["refusedRoutes"] == ["REFUSED route kolbeapp.de: not in tenant astrojones domains"]
+    assert block["refusedRoutes"] == [
+        "REFUSED route kolbeapp.de: owned/delegated by the platform"
+    ]
     assert not (nuk.DYNAMIC / "steal.yml").exists()
     assert (nuk.DYNAMIC / "hello.yml").is_file()
 
@@ -502,8 +537,206 @@ def test_a_tenant_missing_from_the_registry_routes_nothing(
     block = f.status()["sources"]["astrojones"]
     assert block["rendered"] == []
     assert block["refusedRoutes"] == [
-        "REFUSED route hello.bitcoinalchemist.com: not in tenant astrojones domains"
+        "REFUSED route hello.bitcoinalchemist.com: owned/delegated by the platform"
     ]
+
+
+def test_delegation_from_a_later_source_is_effective_in_the_same_cycle(
+    tmp_path, monkeypatch, signing_keys
+):
+    """A delegation from a later source is effective in the same cycle (spec §3.5).
+
+    The owner astrojones (source 2) lends kolbe.astrojones.guru to kolbeapp-de (source 1),
+    which is processed FIRST; the loan — verified later in the same cycle — must already
+    authorize the render.
+    """
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
+    platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
+    f = Fleet(tmp_path, platform, signing_keys)
+    f.origins["kolbeapp-de"].release("v1.0.0", {"deployments/kolbe.yml": KOLBE})
+    f.origins["astrojones"].release("v1.1.0", {nuk.DELEGATIONS_FILE: DELEGATING})
+    f.use(
+        ("bartixcloud", ["facilities"]),
+        ("kolbeapp-de", ["deployments", "routes"]),
+        ("astrojones", ["deployments", "routes"]),
+    )
+    assert f.converge() == 0
+    block = f.status()["sources"]["kolbeapp-de"]
+    assert block["refusedRoutes"] == []
+    assert block["rendered"] == ["kolbe"]
+    assert (nuk.DYNAMIC / "kolbe.yml").is_file()
+
+
+def test_failed_owner_fetch_falls_back_to_the_last_verified_delegations(
+    tmp_path, monkeypatch, signing_keys
+):
+    """A foreign fetch failure must not pull the lent names away (spec §4).
+
+    First cycle: astrojones verifies and its loans are cached. Second cycle: its fetch
+    fails, so the cached loans stand and kolbeapp-de keeps rendering kolbe.
+    """
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
+    platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
+    f = Fleet(tmp_path, platform, signing_keys)
+    f.origins["kolbeapp-de"].release("v1.0.0", {"deployments/kolbe.yml": KOLBE})
+    f.origins["astrojones"].release("v1.1.0", {nuk.DELEGATIONS_FILE: DELEGATING})
+    f.use(
+        ("bartixcloud", ["facilities"]),
+        ("kolbeapp-de", ["deployments", "routes"]),
+        ("astrojones", ["deployments", "routes"]),
+    )
+    assert f.converge() == 0
+    assert f.status()["sources"]["kolbeapp-de"]["rendered"] == ["kolbe"]
+    (nuk.DYNAMIC / "kolbe.yml").unlink()
+
+    shutil.rmtree(f.origins["astrojones"].bare)  # the owner's repo is unreachable now
+
+    assert f.converge() == 1  # astrojones is refused this cycle…
+    sources = f.status()["sources"]
+    assert sources["astrojones"]["result"] == "refused"
+    assert "git fetch failed" in sources["astrojones"]["error"]
+    # …but the last verified loans still authorize the render.
+    assert f.status()["sources"]["kolbeapp-de"]["rendered"] == ["kolbe"]
+    assert (nuk.DYNAMIC / "kolbe.yml").is_file()
+
+
+def test_a_platform_outage_does_not_turn_a_cached_loan_into_a_cycle_crash(fleet):
+    """No platform tree, no registry to authorize against — so refuse, never die (spec §3.4).
+
+    Cached loans must not be validated against the absent registry: that would abort the
+    whole cycle instead of the fail-closed refusal every tenant source already gets.
+    """
+    nuk.store_delegations(
+        fleet.state, "astrojones", [nuk.Delegation(host="x.de", to="y")]
+    )
+    origin = fleet.origins["bartixcloud"]
+    origin.delete_tag("v1.0.0")
+    origin.release("v1.1.0", {"x": "1\n"}, sign=False)
+
+    assert fleet.converge() == 1
+    sources = fleet.status()["sources"]
+    assert sources["bartixcloud"]["result"] == "refused"
+    assert sources["astrojones"]["result"] == "refused"
+    assert "did not verify this cycle" in sources["astrojones"]["error"]
+
+
+def test_a_bad_delegation_refuses_only_the_offending_source(
+    tmp_path, monkeypatch, signing_keys
+):
+    """A delegation-validation violation refuses its source, not the whole fleet (spec §2).
+
+    astrojones lends a host it does not own. The loan must NOT be honoured, the platform
+    and the other tenant must still converge, and the cycle must end not clean — a failed
+    run must never be recorded as a successful one.
+    """
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
+    platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
+    f = Fleet(tmp_path, platform, signing_keys)
+    bad = DELEGATING.replace("kolbe.astrojones.guru", "x.other.de")
+    f.origins["kolbeapp-de"].release("v1.0.0", {"deployments/kolbe.yml": KOLBE})
+    f.origins["astrojones"].release("v1.1.0", {nuk.DELEGATIONS_FILE: bad})
+    f.use(
+        ("bartixcloud", ["facilities"]),
+        ("kolbeapp-de", ["deployments", "routes"]),
+        ("astrojones", ["deployments", "routes"]),
+    )
+    assert f.converge() == 1
+    sources = f.status()["sources"]
+    assert sources["astrojones"]["result"] == "refused"
+    assert "cannot delegate" in sources["astrojones"]["error"]
+    # The rest of the fleet is not dragged down with the offender.
+    assert sources["bartixcloud"]["result"] == "ok"
+    assert sources["kolbeapp-de"]["result"] == "ok"
+
+
+def test_a_malformed_delegations_manifest_refuses_only_its_source(
+    tmp_path, monkeypatch, signing_keys
+):
+    """A malformed `delegations.yml` refuses THAT source, not the whole fleet (spec §2).
+
+    Like any other manifest failure, it is attributable: astrojones's block is refused with
+    the parse error, its loans are never honoured, the platform and the other tenant still
+    apply, and the cycle is not clean.
+    """
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
+    platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
+    f = Fleet(tmp_path, platform, signing_keys)
+    f.origins["kolbeapp-de"].release("v1.0.0", {"deployments/kolbe.yml": KOLBE})
+    f.origins["astrojones"].release("v1.1.0", {nuk.DELEGATIONS_FILE: "kind: Delegations\n"})
+    f.use(
+        ("bartixcloud", ["facilities"]),
+        ("kolbeapp-de", ["deployments", "routes"]),
+        ("astrojones", ["deployments", "routes"]),
+    )
+    assert f.converge() == 1
+    sources = f.status()["sources"]
+    assert sources["astrojones"]["result"] == "refused"
+    assert "invalid delegations manifest" in sources["astrojones"]["error"]
+    # The rest of the fleet is not dragged down with the offender.
+    assert sources["bartixcloud"]["result"] == "ok"
+    assert sources["kolbeapp-de"]["result"] == "ok"
+    # The bad source's loans are not honoured: kolbe resolves to its owner, not the target.
+    assert sources["kolbeapp-de"]["refusedRoutes"] == [
+        "REFUSED route kolbe.astrojones.guru: owned/delegated by astrojones"
+    ]
+    assert not (nuk.DYNAMIC / "kolbe.yml").exists()
+
+
+def test_a_corrupt_delegation_cache_is_a_recorded_cycle_failure(
+    tmp_path, monkeypatch, signing_keys
+):
+    """A corrupt last-verified cache is a recorded cycle failure, never a silent success (spec §4).
+
+    Lent names must never silently vanish: when the owner's cached state cannot be read, the
+    authorization set is unknowable, so the cycle ends not-clean with the error in the status
+    file and the apply pass does not run — rather than rendering as if the owner lent nothing.
+    """
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
+    platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
+    f = Fleet(tmp_path, platform, signing_keys)
+    f.origins["kolbeapp-de"].release("v1.0.0", {"deployments/kolbe.yml": KOLBE})
+    f.origins["astrojones"].release("v1.1.0", {nuk.DELEGATIONS_FILE: DELEGATING})
+    f.use(
+        ("bartixcloud", ["facilities"]),
+        ("kolbeapp-de", ["deployments", "routes"]),
+        ("astrojones", ["deployments", "routes"]),
+    )
+    assert f.converge() == 0  # first cycle caches astrojones's verified loans
+    assert (nuk.DYNAMIC / "kolbe.yml").is_file()
+
+    shutil.rmtree(f.origins["astrojones"].bare)  # the owner is unreachable now
+    cache = nuk.source_state_dir(f.state, "astrojones") / nuk.DELEGATIONS_CACHE_FILE
+    cache.write_text("{ not json", encoding="utf-8")
+    (nuk.DYNAMIC / "kolbe.yml").unlink()
+
+    assert f.converge() == 1  # not clean…
+    status = f.status()
+    assert status["error"] is not None  # …and the failure is recorded, not silent
+    assert "invalid cached delegations" in status["error"]
+    assert status["sources"]["astrojones"]["result"] == "refused"
+    # The apply pass did not run on an unknown authorization set.
+    assert status["sources"]["kolbeapp-de"]["rendered"] == []
+    assert not (nuk.DYNAMIC / "kolbe.yml").exists()
 
 
 # --- reap -------------------------------------------------------------------------------

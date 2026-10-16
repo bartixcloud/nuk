@@ -48,7 +48,7 @@ from pydantic import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterable, Iterator
 
 __version__ = "2.4.1"  # bumped on release by .github/workflows/release.yml
 
@@ -681,21 +681,6 @@ class Org(BaseModel):
         return None
 
 
-def validate_ingress_hosts(org: Org, manifest: Deployment | Facility) -> None:
-    """Assert every ingress host in `manifest` ends on one of the org's domains.
-
-    Args:
-        org: The validated Org (its `domains` are the managed set).
-        manifest: A deployment manifest whose ingress hosts must be covered.
-
-    Raises:
-        NukError: If any ingress host is not under a managed domain.
-    """
-    for ing in manifest.spec.ingress:
-        if not any(ing.host == d or ing.host.endswith(f".{d}") for d in org.domains):
-            die(f"nuk: ingress host {ing.host!r} is not under a managed domain {org.domains}")
-
-
 def sh(
     *cmd: str,
     cwd: Path | None = None,
@@ -771,9 +756,11 @@ def load_org(path: Path) -> Org:
 # --- tenant registry (bartixcloud/infra/tenants.yml, contracts C2) ------------------
 # The platform repo owns the schema and its validator. nuk models only the fields it
 # consumes and re-checks the invariant its own isolation depends on: unique names and
-# no two tenants claiming the same domain (spec §4 anti-hijack).
+# no two tenants claiming the same domain pattern (spec §1/§3).
 
 TENANTS_FILE = "tenants.yml"
+DELEGATIONS_FILE = "delegations.yml"
+DELEGATIONS_CACHE_FILE = "delegations.json"
 
 
 class TenantRow(BaseModel):
@@ -792,16 +779,16 @@ class TenantRow(BaseModel):
     signer_principal: str | None = None
 
 
-def _domains_overlap(x: str, y: str) -> bool:
-    """Whether two domain entries can name the same host (`*.` = any depth, never the apex)."""
-    x, y = x.lower(), y.lower()
-    if x.startswith("*.") and y.startswith("*."):
-        return x.endswith(y[1:]) or y.endswith(x[1:])
-    if x.startswith("*."):
-        return y.endswith(x[1:])
-    if y.startswith("*."):
-        return x.endswith(y[1:])
-    return x == y
+def specificity(pattern: str) -> int:
+    """The pattern's specificity: its number of literal labels (spec §3).
+
+    A `*.` label is not literal, so `*.c` ranks like `c`. Neither this function nor the
+    resolver breaks a tie: a specificity tie between two tenants is structurally
+    impossible, because `TenantRegistry._check_unique` already rejects a pattern two
+    tenants both list, and two distinct patterns that both cover one host cannot share a
+    rank.
+    """
+    return len([label for label in pattern.lower().split(".") if label != "*"])
 
 
 class TenantRegistry(BaseModel):
@@ -811,7 +798,11 @@ class TenantRegistry(BaseModel):
 
     @model_validator(mode="after")
     def _check_unique(self) -> TenantRegistry:
-        """Refuse duplicate tenant names and any domain two tenants could both match.
+        """Refuse duplicate tenant names and any domain pattern two tenants both claim.
+
+        Overlap between tenants is allowed (spec §1: one owns a zone, another may be
+        lent a subdomain); only the *same* pattern — compared case-insensitively — is
+        a conflict.
 
         Raises:
             ValueError: On either violation.
@@ -820,21 +811,108 @@ class TenantRegistry(BaseModel):
         if len(names) != len(set(names)):
             msg = "tenants[].name must be unique"
             raise ValueError(msg)
-        for i, a in enumerate(self.tenants):
-            for b in self.tenants[i + 1 :]:
-                for da in a.domains:
-                    for db in b.domains:
-                        if _domains_overlap(da, db):
-                            msg = (
-                                f"domains overlap between tenants {a.name!r} and {b.name!r}: "
-                                f"{da!r} / {db!r}"
-                            )
-                            raise ValueError(msg)
+        seen: set[str] = set()
+        for t in self.tenants:
+            for domain in t.domains:
+                key = domain.lower()
+                if key in seen:
+                    msg = f"domain pattern {domain!r} is claimed by more than one tenant"
+                    raise ValueError(msg)
+                seen.add(key)
         return self
 
     def get(self, name: str) -> TenantRow | None:
         """The row for tenant `name`, or None."""
         return next((t for t in self.tenants if t.name == name), None)
+
+
+class Delegation(_NullTolerant):
+    """One borrowed host: `host` (a §1 pattern) is lent to tenant `to` (spec §2).
+
+    Lives in the owner's `delegations.yml`; the loader (Task 3) fills it. Both
+    fields are trimmed and non-empty.
+    """
+
+    host: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+    to: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
+
+
+class DelegationsSpec(_NullTolerant):
+    """`spec` of a `Delegations` document — the hosts the owner lends out."""
+
+    delegations: list[Delegation] = []
+
+
+class Delegations(_NullTolerant):
+    """The `<tenant-tree>/delegations.yml` document (spec §2): one tenant's loans."""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    api_version: Literal["nuk/v1"] = Field(alias="apiVersion")
+    kind: Literal["Delegations"]
+    metadata: Metadata
+    spec: DelegationsSpec = DelegationsSpec()
+
+
+def load_delegations(tree: Path) -> list[Delegation]:
+    """Parse `<tree>/delegations.yml`, the owner's loans (spec §2).
+
+    A tree without the file lends nothing (returns `[]`); a malformed one is a
+    refusal, not a silent skip.
+
+    Raises:
+        NukError: If the file is unreadable or invalid.
+    """
+    path = tree / DELEGATIONS_FILE
+    if not path.is_file():
+        return []
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except OSError as e:
+        die(f"{path}: {e}")
+    try:
+        return Delegations.model_validate(raw).spec.delegations
+    except ValidationError as e:
+        die(f"{path}: invalid delegations manifest\n{e}")
+
+
+def store_delegations(state_dir: Path, owner: str, dels: list[Delegation]) -> None:
+    """Persist `owner`'s last verified loans under its source state (spec §4).
+
+    Overwritten on every successful fetch, so the cache always holds the newest
+    VERIFIED state and never a merely fetched one.
+    """
+    path = source_state_dir(state_dir, owner) / DELEGATIONS_CACHE_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    doc = Delegations(
+        apiVersion="nuk/v1",
+        kind="Delegations",
+        metadata=Metadata(name=owner),
+        spec=DelegationsSpec(delegations=dels),
+    )
+    path.write_text(doc.model_dump_json(by_alias=True) + "\n", encoding="utf-8")
+
+
+def load_cached_delegations(state_dir: Path, owner: str) -> list[Delegation]:
+    """The last verified loans of `owner`, or `[]` when none are cached (spec §4).
+
+    A missing cache lends nothing (fail-closed: the first run has no loans yet); a
+    corrupt one is a refusal, like a malformed `delegations.yml`.
+
+    Raises:
+        NukError: If the cache exists but is unreadable or invalid.
+    """
+    path = source_state_dir(state_dir, owner) / DELEGATIONS_CACHE_FILE
+    if not path.is_file():
+        return []
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError as e:
+        die(f"{path}: {e}")
+    try:
+        return Delegations.model_validate_json(raw).spec.delegations
+    except ValidationError as e:
+        die(f"{path}: invalid cached delegations\n{e}")
 
 
 def load_tenants(tree: Path) -> TenantRegistry:
@@ -868,6 +946,158 @@ def host_in_domains(host: str, domains: list[str]) -> bool:
         elif h == d:
             return True
     return False
+
+
+def _owner_of(host: str, claims: Iterable[tuple[str, list[str]]]) -> tuple[str, int] | None:
+    """The `(tenant, specificity)` of the most specific claim covering `host`: its zone owner.
+
+    `claims` is a stream of `(tenant name, owned patterns)`. This is spec §3.1's zone
+    owner — the tenant `resolve_host_owner` starts from and then subtracts delegations
+    from. A tie between two tenants is structurally impossible once
+    `TenantRegistry._check_unique` rejects duplicate patterns; `die` anyway rather than
+    pick a winner (spec §3.5: the resolution must never be non-deterministic).
+    """
+    best: tuple[str, int] | None = None
+    for name, domains in claims:
+        for pattern in domains:
+            if not host_in_domains(host, [pattern]):
+                continue
+            rank = specificity(pattern)
+            if best is None or rank > best[1]:
+                best = (name, rank)
+            elif rank == best[1] and name != best[0]:
+                die(f"nuk: host {host!r} is claimed by both {best[0]!r} and {name!r}")
+    return best
+
+
+def _claims(registry: TenantRegistry) -> list[tuple[str, list[str]]]:
+    """Each tenant's `(name, owned patterns)` pairs, in registry order."""
+    return [(t.name, t.domains) for t in registry.tenants]
+
+
+def _resolve(
+    host: str,
+    claims: Iterable[tuple[str, list[str]]],
+    delegations: dict[str, list[Delegation]],
+) -> str | None:
+    """The authorized tenant for `host`: its zone owner, minus the most specific covering loan.
+
+    A delegation transfers only when its `host` covers `host` **and** is at least as
+    specific as the owned pattern that made its owner the zone owner — a delegation
+    broader than the owner's winning claim does not reach this host (spec §3.2). Among
+    several qualifying loans the most specific wins, so a loan is not shadowed by a
+    broader one earlier in the owner's `delegations.yml`.
+    """
+    match = _owner_of(host, claims)
+    if match is None:
+        return None
+    owner, owner_rank = match
+    best: Delegation | None = None
+    best_rank = -1
+    for delegation in delegations.get(owner, []):
+        if not host_in_domains(host, [delegation.host]):
+            continue
+        rank = specificity(delegation.host)
+        if rank < owner_rank or rank <= best_rank:
+            continue
+        best, best_rank = delegation, rank
+    return best.to if best is not None else owner
+
+
+def resolve_host_owner(
+    host: str,
+    registry: TenantRegistry,
+    delegations: dict[str, list[Delegation]],
+) -> str | None:
+    """The tenant authorized to render `host`: its zone owner minus delegations (spec §3).
+
+    Returns None when no tenant owns `host` (a platform name, spec §6).
+    """
+    return _resolve(host, _claims(registry), delegations)
+
+
+def check_cross_zone_patterns(
+    tenant: str,
+    registry: TenantRegistry,
+    delegations: dict[str, list[Delegation]],
+) -> None:
+    """Refuse a pattern of `tenant` that falls into another tenant's zone without a delegation.
+
+    A `domains` entry lying in another tenant's zone is not an authorization — it is the
+    very overlap that must not grant rights (spec §3.3). The owning tenant must delegate it
+    to `tenant`. The check excludes `tenant`'s own patterns when deciding whose zone a
+    pattern falls in (otherwise the pattern would "own itself" by specificity). Judging one
+    tenant at a time lets the cycle refuse the offending source rather than the whole run.
+
+    Raises:
+        NukError: For the first such undelegated foreign pattern.
+    """
+    row = registry.get(tenant)
+    if row is None:
+        return
+    others = [(t.name, t.domains) for t in registry.tenants if t.name != tenant]
+    for pattern in row.domains:
+        owner = _owner_of(pattern, others)
+        if owner is None:
+            continue
+        if _resolve(pattern, others, delegations) != tenant:
+            die(
+                f"nuk: tenant {tenant!r} lists {pattern!r}, which falls in "
+                f"{owner[0]!r}'s zone and is not delegated to it"
+            )
+
+
+def validate_delegations(owner: str, dels: list[Delegation], registry: TenantRegistry) -> None:
+    """Check one owner's loans before they are honoured (spec §2).
+
+    Four refusals: the owner must be the *zone owner* of the lent host — not merely list a
+    broader pattern covering it, which would make the loan a no-op (coverage), no host may
+    be lent twice (a specificity tie the resolver must not have to break), the target
+    tenant must exist, and the target must not list the host itself — listing it would make
+    the target a competing owner and let it lend the host on (one-level rule).
+
+    Raises:
+        NukError: On any of the four.
+    """
+    row = registry.get(owner)
+    if row is None:
+        die(f"nuk: tenant {owner!r} has delegations but is not in the registry")
+    seen: set[str] = set()
+    for d in dels:
+        key = d.host.lower()
+        if key in seen:
+            die(f"nuk: tenant {owner!r} delegates {d.host!r} more than once")
+        seen.add(key)
+        zone = _owner_of(d.host, _claims(registry))
+        if zone is None or zone[0] != owner:
+            die(f"nuk: tenant {owner!r} cannot delegate {d.host!r}, which it does not own")
+        target = registry.get(d.to)
+        if target is None:
+            die(f"nuk: tenant {owner!r} delegates {d.host!r} to unknown tenant {d.to!r}")
+        if d.to != owner and host_in_domains(d.host, target.domains):
+            die(
+                f"nuk: tenant {d.to!r} lists {d.host!r} itself; a delegated host may be "
+                f"listed only by its owner {owner!r} (no re-delegation)"
+            )
+
+
+@dataclass(frozen=True)
+class HostAuth:
+    """Who may render which host: the delegation-aware resolution (spec §3).
+
+    Built once per cycle from the platform registry plus every owner's loans, so a
+    delegation committed by another source is already honoured in the same run (spec
+    §3.5). A tenant source renders a host only when `resolve` names it; the platform
+    source is ungated and never consults this. Both fields are inputs to
+    `resolve_host_owner` — the resolution itself lives there, not here.
+    """
+
+    registry: TenantRegistry
+    delegations: dict[str, list[Delegation]]
+
+    def resolve(self, host: str) -> str | None:
+        """The tenant allowed to render `host`, or None (nobody / the platform)."""
+        return resolve_host_owner(host, self.registry, self.delegations)
 
 
 def org_get(org: Org, dotted: str) -> object:
@@ -2290,11 +2520,13 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
     )
 
 
-def _apply_source(src: SourceEntry, ctx: TreeContext, block: dict, state_dir: Path) -> None:
+def _apply_source(
+    src: SourceEntry, ctx: TreeContext, block: dict, state_dir: Path, auth: HostAuth
+) -> None:
     """Apply a prepared source: manifests, then routes; record it applied only if all went well."""
     block["manifests"] = apply_tree(ctx)
     if "routes" in src.apply and ctx.role in _ENTRY_ROLES:
-        routes = render_routes(ctx)
+        routes = render_routes(ctx, auth)
         block["rendered"] = routes.rendered
         block["refusedRoutes"] = routes.refused
     record_applied(
@@ -2318,15 +2550,15 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
     scratch: Path,
     platform: Path | None,
 ) -> tuple[dict, TreeContext | None]:
-    """Converge ONE source; never raises for a source-level failure.
+    """PREPARE one source (sync/verify/archive); never raises for a source-level failure.
+
+    The apply step moved to `_run_cycle`'s second pass so every source's tree is known
+    before any renders (a delegation must be honoured in the cycle it lands, spec §3.5).
 
     Returns:
         The source's status block, and its TreeContext once the tree is verified and archived
         (None when that failed, or when the platform tree is incomplete) — the platform's
-        context is what tenant sources build on. `result` is "refused" on any failure here;
-        manifests that fail individually inside `apply_tree` are recorded in `manifests` and do
-        not refuse the source (spec §7.5). `last-applied-tag` moves only when the whole source
-        succeeded.
+        context is what tenant sources build on. `result` is "refused" on any failure here.
     """
     block: dict = {
         "result": "ok",
@@ -2358,11 +2590,152 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
     except _SOURCE_FAILURES as e:
         _refuse(src, block, e)
         return block, None
-    try:
-        _apply_source(src, ctx, block, state_dir)
-    except _SOURCE_FAILURES as e:
-        _refuse(src, block, e)
     return block, ctx
+
+
+class _UnknownAuthorizationError(NukError):
+    """The cycle's authorization set could not be built, so it must not apply (spec §4).
+
+    Raised when a refused owner's last-verified cache is unreadable: the loan set is
+    unknown, so silently dropping it would let lent names vanish. The cycle records the
+    failure and does not run the apply pass.
+    """
+
+
+def _load_prepared_delegations(
+    prepared: list[tuple[SourceEntry, TreeContext]],
+    *,
+    blocks: dict[str, dict],
+) -> tuple[dict[str, list[Delegation]], list[tuple[SourceEntry, TreeContext]]]:
+    """Load each routable prepared owner's `delegations.yml`, refusing a malformed one (spec §2).
+
+    Only sources with `routes` in `apply` contribute (spec §2). A malformed manifest is
+    attributable, so it refuses THAT source alone: its loans are never added to the returned
+    map, it drops out of the caller's authorization set, and the rest of the fleet proceeds.
+
+    Returns:
+        The owner loans loaded so far and the prepared sources still in play.
+    """
+    delegations: dict[str, list[Delegation]] = {}
+    keep: list[tuple[SourceEntry, TreeContext]] = []
+    for src, ctx in prepared:
+        if ctx.tenant is None or "routes" not in src.apply:
+            keep.append((src, ctx))
+            continue
+        try:
+            delegations[ctx.tenant] = load_delegations(ctx.tree)
+        except _SOURCE_FAILURES as e:
+            _refuse(src, blocks[src.name], e)
+            continue
+        keep.append((src, ctx))
+    return delegations, keep
+
+
+def _cached_delegations(state_dir: Path, owner: str) -> list[Delegation]:
+    """`owner`'s last-verified loans; a corrupt cache is a recorded cycle failure (spec §4).
+
+    A refused owner lends its cache so a foreign fetch failure cannot pull a lent name away.
+    If that cache is unreadable the loan set is UNKNOWN — dropping it would silently withdraw
+    lent names — so this raises `_UnknownAuthorizationError` (carrying the reason) for the caller
+    to record, rather than degrading to an empty loan set.
+    """
+    try:
+        return load_cached_delegations(state_dir, owner)
+    except NukError as e:
+        raise _UnknownAuthorizationError(_exit_reason(e, "cached delegations unreadable")) from e
+
+
+def _refuse_bad_declarations(
+    prepared: list[tuple[SourceEntry, TreeContext]],
+    refused: list[SourceEntry],
+    registry: TenantRegistry,
+    delegations: dict[str, list[Delegation]],
+    *,
+    blocks: dict[str, dict],
+) -> list[tuple[SourceEntry, TreeContext]]:
+    """Refuse each source whose declarations do not validate; return the survivors.
+
+    `validate_delegations` and `check_cross_zone_patterns` judge one tenant at a time, so
+    a violation refuses THAT source — its loans are dropped from `delegations` and the rest
+    of the fleet proceeds — instead of aborting the whole cycle (spec §2). A loan judged
+    against a bad declaration is therefore never honoured, so fail-closed holds. An
+    already-refused source whose cached loan is invalid is simply not honoured, never a
+    second refusal.
+    """
+    surviving: list[tuple[SourceEntry, TreeContext]] = []
+    for src, ctx in prepared:
+        if ctx.tenant is None:
+            surviving.append((src, ctx))
+            continue
+        dels = delegations.get(ctx.tenant, [])
+        try:
+            if dels:
+                validate_delegations(ctx.tenant, dels, registry)
+            check_cross_zone_patterns(ctx.tenant, registry, delegations)
+        except _SOURCE_FAILURES as e:
+            _refuse(src, blocks[src.name], e)
+            delegations.pop(ctx.tenant, None)
+            continue
+        surviving.append((src, ctx))
+    for src in refused:
+        if src.is_platform or "routes" not in src.apply:
+            continue
+        dels = delegations.get(src.name, [])
+        if not dels:
+            continue
+        try:
+            validate_delegations(src.name, dels, registry)
+        except _SOURCE_FAILURES:
+            delegations.pop(src.name, None)
+    return surviving
+
+
+def _host_auth(
+    platform_ctx: TreeContext | None,
+    prepared: list[tuple[SourceEntry, TreeContext]],
+    *,
+    state_dir: Path,
+    refused: list[SourceEntry],
+    blocks: dict[str, dict],
+) -> tuple[HostAuth, list[tuple[SourceEntry, TreeContext]]]:
+    """Build the cycle's host authorization from the registry and every owner's loans.
+
+    The registry is the platform tree's `tenants.yml`; without one no tenant owns
+    anything and every tenant render is refused (fail-closed, spec §3.4). Only sources
+    with `routes` in `apply` contribute loans (spec §2). Each such prepared tenant source
+    lends from its own `delegations.yml`; a REFUSED one instead lends its last VERIFIED
+    loans from the cache, so a foreign fetch failure cannot pull a lent name away (spec §4).
+
+    Validation is per source (`_refuse_bad_declarations`): a violation refuses THAT source
+    — its loans are dropped and the rest of the fleet proceeds — instead of aborting the
+    whole cycle (spec §2). A malformed `delegations.yml` refuses its source the same way
+    (`_load_prepared_delegations`); only an unreadable cache for a refused owner — which
+    would make the loan set unknown — raises `_UnknownAuthorizationError` for the caller.
+
+    Returns:
+        The authorization and the prepared sources that survived validation (the ones the
+        caller may apply). A validation-refused source's block is filled via `_refuse`.
+        Only surviving, routable owners have their verified state written back to the cache.
+
+    Raises:
+        _UnknownAuthorizationError: When a refused owner's cached loans cannot be read (spec §4).
+    """
+    registry = platform_ctx.tenants if platform_ctx is not None else None
+    if registry is None:
+        registry = TenantRegistry(tenants=[])
+    delegations, prepared_ok = _load_prepared_delegations(prepared, blocks=blocks)
+    for src in refused:
+        # Without a verified platform tree there is no registry to authorize against, so
+        # the cache would add nothing but a spurious "not in the registry" refusal.
+        if not src.is_platform and "routes" in src.apply and platform_ctx is not None:
+            delegations[src.name] = _cached_delegations(state_dir, src.name)
+    surviving = _refuse_bad_declarations(
+        prepared_ok, refused, registry, delegations, blocks=blocks
+    )
+    for src, ctx in surviving:
+        if ctx.tenant is not None and "routes" in src.apply:
+            store_delegations(state_dir, ctx.tenant, delegations[ctx.tenant])
+    return HostAuth(registry, delegations), surviving
 
 
 def _logging_status(role: str, platform_ctx: TreeContext | None) -> dict | None:
@@ -2384,15 +2757,27 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
     self_ip: str | None,
     signers_dir: Path,
     state_dir: Path,
-) -> tuple[list[str], dict | None, bool]:
+) -> tuple[list[str], dict | None, bool, str | None]:
     """Converge every source, platform first; fill `blocks`.
 
+    Two passes: first PREPARE every source (fetch/verify/archive) and keep its context, so
+    all of a cycle's trees — and thus every owner's delegations.yml — are known before any
+    render; then build the host authorization (spec §3) and APPLY each prepared source
+    against it. A delegation declared by a later source is therefore effective in the same
+    cycle (spec §3.5). Building the authorization also validates each source's declarations
+    and refuses the offending source alone — a bad loan or malformed manifest never halts
+    the fleet, but the cycle still ends not clean (spec §2). An unreadable cache for a
+    refused owner instead makes the authorization set unknown: the apply pass is skipped
+    and the failure is returned so the caller records it (spec §4).
+
     Returns:
-        (orphan warnings, logging status, whether every source converged).
+        (orphan warnings, logging status, whether every source converged, cycle-level error
+        — non-None only when the authorization set could not be built).
     """
     with tempfile.TemporaryDirectory(dir=state_dir, prefix="run.") as scratch:
+        prepared: list[tuple[SourceEntry, TreeContext]] = []
+        refused: list[SourceEntry] = []
         platform_ctx: TreeContext | None = None
-        trees: list[Path] = []
         for src in sources:
             blocks[src.name], ctx = _converge_source(
                 src,
@@ -2404,13 +2789,33 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
                 platform=platform_ctx.tree if platform_ctx else None,
             )
             if ctx is not None:
-                trees.append(ctx.tree)
+                prepared.append((src, ctx))
                 platform_ctx = ctx if src.is_platform else platform_ctx
-        clean = all(b["result"] == "ok" for b in blocks.values())
+            else:
+                refused.append(src)
+        auth: HostAuth | None = None
+        applied: list[tuple[SourceEntry, TreeContext]] = []
+        cycle_error: str | None = None
+        try:
+            auth, applied = _host_auth(
+                platform_ctx, prepared, state_dir=state_dir, refused=refused, blocks=blocks
+            )
+        except _UnknownAuthorizationError as e:
+            # The loan set is unknown; running the apply pass on it would be unsound.
+            cycle_error = _exit_reason(e, "authorization unavailable")
+            print(f"REFUSING cycle: {cycle_error}", file=sys.stderr)
+        if auth is not None:
+            for src, ctx in applied:
+                try:
+                    _apply_source(src, ctx, blocks[src.name], state_dir, auth)
+                except _SOURCE_FAILURES as e:
+                    _refuse(src, blocks[src.name], e)
+        trees = [ctx.tree for _src, ctx in applied]
+        clean = cycle_error is None and all(b["result"] == "ok" for b in blocks.values())
         # A refused source has no tree this cycle, so its apps would all read as orphans;
         # only a clean cycle can tell what is really undeclared.
         warnings = reap_report(*trees) if clean else []
-        return warnings, _logging_status(role, platform_ctx), clean
+        return warnings, _logging_status(role, platform_ctx), clean, cycle_error
 
 
 def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> int:
@@ -2443,7 +2848,7 @@ def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> i
             print(f"REFUSING: {error}", file=sys.stderr)
         try:
             if sources:
-                warnings, logging_status, clean = _run_cycle(
+                warnings, logging_status, clean, cycle_error = _run_cycle(
                     sources,
                     blocks,
                     role=role,
@@ -2452,6 +2857,7 @@ def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> i
                     state_dir=state_dir,
                 )
                 code = 0 if clean else 1
+                error = cycle_error or error
         finally:
             write_converge_status(
                 state_dir / "converge-status.json",
@@ -2861,12 +3267,47 @@ class RouteResult:
     refused: list[str]
 
 
+def _refuse_route(host: str, owner: str | None, refused: list[str]) -> None:
+    """Record and announce a host this source is not authorized to render (spec §3/§6)."""
+    line = f"REFUSED route {host}: owned/delegated by {owner or 'the platform'}"
+    refused.append(line)
+    print(line, file=sys.stderr)
+
+
+def _authorized_ingress(
+    ingress: list[dict], tenant: str, auth: HostAuth | None, refused: list[str]
+) -> list[dict]:
+    """The ingress entries a tenant source may render, `www.` included (spec §3/§6).
+
+    A host resolving to anyone but `tenant` is refused. `www.<host>` is a second,
+    independently-resolved host: the same loan that authorizes `<host>` must cover it
+    too, or the redirect router is an unauthenticated hijack vector. Without that
+    coverage the variant is dropped — the apex router still renders.
+    """
+    allowed: list[dict] = []
+    for ing in ingress:
+        host = str(ing.get("host", ""))
+        owner = auth.resolve(host) if auth is not None else None
+        if owner != tenant:
+            _refuse_route(host, owner, refused)
+            continue
+        entry = ing
+        if ing.get("www"):
+            www_host = f"www.{host}"
+            www_owner = auth.resolve(www_host) if auth is not None else None
+            if www_owner != tenant:
+                _refuse_route(www_host, www_owner, refused)
+                entry = {k: v for k, v in ing.items() if k != "www"}
+        allowed.append(entry)
+    return allowed
+
+
 def _render_routers(
     tree: Path,
     org: Org,
     *,
     tenant: str | None,
-    domains: list[str] | None,
+    auth: HostAuth | None,
     platform_facilities: list[Facility] | None = None,
 ) -> RouteResult:
     """On the edge: render a router for EVERY Deployment with ingress (spec §6).
@@ -2879,13 +3320,23 @@ def _render_routers(
     from git is destructive, and the loop reports rather than deletes (spec §7.4).
     The one bounded exception is the legacy `worker-` prefix (reap_legacy_worker_routers).
 
+    A tenant source's router set is authoritative (spec §5): a render that allows none
+    of a deployment's hosts withdraws the file it wrote before, rather than leaving a
+    lent host live — revocation. The withdrawal is keyed by the deployment's NAME (the
+    router file name), not by source: a fleet-wide deployment-name collision would
+    therefore touch a file another source wrote. The surrounding system discourages
+    cross-source name collisions, but this path does not itself detect them.
+
     Args:
         tree: Root of the manifest tree the loop pulled.
         org: The validated org manifest, source of every backend private IP.
         tenant: The source's tenant name, or None for the platform source.
-        domains: The tenant allowlist (spec §4 anti-hijack). When set, an ingress
-            whose host is in no allowed domain is REFUSED — recorded, never written.
-            None (the platform source) writes every host.
+        auth: The cycle's host authorization (spec §3), consulted only for a tenant
+            source: an ingress whose host resolves to anyone but `tenant` is REFUSED —
+            recorded, never written. The `www.<host>` variant (spec §6) is resolved the
+            same way and is omitted when it is not covered, leaving the apex router. None
+            with a tenant present refuses every host (fail-closed); None with tenant None
+            is the ungated platform render.
         platform_facilities: The PLATFORM tree's facilities, when the caller has
             them (a tenant source ships none). The fleet-wide `router` lives in
             the platform source, so `router_present` must be read from here — not
@@ -2917,17 +3368,15 @@ def _render_routers(
         placement = manifest.spec.placement
         if placement is not None and placement.role in _ENTRY_ROLES:
             continue
-        if domains is not None:
-            allowed = []
-            for ing in ingress:
-                host = str(ing.get("host", ""))
-                if host_in_domains(host, domains):
-                    allowed.append(ing)
-                else:
-                    line = f"REFUSED route {host}: not in tenant {tenant} domains"
-                    refused.append(line)
-                    print(line, file=sys.stderr)
+        if tenant is not None:
+            allowed = _authorized_ingress(ingress, tenant, auth, refused)
             if not allowed:
+                # Revocation (spec §5): the owner's router set is authoritative, so a
+                # render that allows none of the deployment's hosts withdraws the file
+                # it wrote before. The withdrawal is keyed by the deployment's name, so a
+                # fleet-wide name collision would touch another source's router — the
+                # system discourages that, but this path does not detect it.
+                write_ingress(manifest.metadata.name, [], vocab)
                 continue
             ingress = allowed
         resolved = [
@@ -2942,27 +3391,25 @@ def _render_routers(
 
 
 def render_edge_routers(tree: Path, org: Org) -> list[str]:
-    """The platform edge render: every host, no tenant allowlist. Returns the names written."""
-    return _render_routers(tree, org, tenant=None, domains=None).rendered
+    """The platform edge render: every host, no tenant gate. Returns the names written."""
+    return _render_routers(tree, org, tenant=None, auth=None).rendered
 
 
-def render_routes(ctx: TreeContext) -> RouteResult:
-    """On the edge: render ONE source's routers, applying the tenant domain allowlist.
+def render_routes(ctx: TreeContext, auth: HostAuth | None = None) -> RouteResult:
+    """On the edge: render ONE source's routers through the host authorization (spec §3).
 
     The platform source (ctx.tenant is None) is unconstrained — it owns the platform
-    domains. A tenant source may only route hosts in its own `domains` from the
-    platform tenants.yml (spec §4 anti-hijack); a tenant missing from the registry, or
-    a platform tree with no tenants.yml, gets an empty allowlist and routes nothing
-    (fail-closed).
+    domains. A tenant source renders only the hosts `auth` names as its own; without an
+    authorization it renders nothing (fail-closed).
     """
     if ctx.org is None:
         return RouteResult([], [])
-    domains: list[str] | None = None
-    if ctx.tenant is not None:
-        row = ctx.tenants.get(ctx.tenant) if ctx.tenants is not None else None
-        domains = row.domains if row is not None else []
     return _render_routers(
-        ctx.tree, ctx.org, tenant=ctx.tenant, domains=domains, platform_facilities=ctx.facilities
+        ctx.tree,
+        ctx.org,
+        tenant=ctx.tenant,
+        auth=auth,
+        platform_facilities=ctx.facilities,
     )
 
 
