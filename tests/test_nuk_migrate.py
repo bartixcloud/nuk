@@ -68,26 +68,26 @@ def test_migrated_digest_defaults_none_and_round_trips(tmp_path, monkeypatch):
     assert nuk.migrated_digest("kolbe") == "sha256:deadbeef"
 
 
-_MIGRATE_DEP = {
-    "metadata": {"name": "kolbe"},
-    "spec": {
+_MIGRATE = {"service": "backend", "command": "alembic upgrade head", "timeout": 7}
+_MIGRATE_SPEC = nuk.Spec.model_validate(
+    {
         "source": {"repo": "git@github.com:kolbeapp-de/lernstanderfassung.git"},
-        "migrate": {"service": "backend", "command": "alembic upgrade head", "timeout": 7},
-    },
-}
+        "migrate": _MIGRATE,
+    }
+)
 
 
 def _migrate(tmp_path, monkeypatch, sh):
     monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
     monkeypatch.setattr(nuk, "compose_args", lambda *a: ["docker", "compose", "-p", "kolbe"])
     monkeypatch.setattr(nuk, "sh", sh)
-    return nuk.Migrate.model_validate(_MIGRATE_DEP["spec"]["migrate"])
+    return nuk.Migrate.model_validate(_MIGRATE)
 
 
 def test_run_migrations_runs_compose_run_and_records(tmp_path, monkeypatch):
     calls: list = []
     m = _migrate(tmp_path, monkeypatch, lambda *cmd, **kw: calls.append((cmd, kw)))
-    nuk._run_migrations("kolbe", _MIGRATE_DEP, m, None, "sha256:cafe")
+    nuk._run_migrations("kolbe", _MIGRATE_SPEC, m, None, "sha256:cafe")
     assert calls[0][0] == (
         "docker",
         "compose",
@@ -116,7 +116,7 @@ def test_run_migrations_suffixes_the_idle_colour_for_blue_green(tmp_path, monkey
     strategy = nuk.Strategy.model_validate(
         {"type": "blue-green", "health": {"service": "backend", "path": "/health"}}
     )
-    nuk._run_migrations("kolbe", _MIGRATE_DEP, m, strategy, "sha256:cafe")
+    nuk._run_migrations("kolbe", _MIGRATE_SPEC, m, strategy, "sha256:cafe")
     argv = calls[0][0]
     assert _after(argv, "--profile") == "green"
     assert _after(argv, "--no-deps") == "backend-green"
@@ -128,7 +128,7 @@ def test_run_migrations_failure_is_fail_closed(tmp_path, monkeypatch):
 
     m = _migrate(tmp_path, monkeypatch, boom)
     with pytest.raises(SystemExit):
-        nuk._run_migrations("kolbe", _MIGRATE_DEP, m, None, "sha256:cafe")
+        nuk._run_migrations("kolbe", _MIGRATE_SPEC, m, None, "sha256:cafe")
     assert nuk.migrated_digest("kolbe") is None
 
 
@@ -146,7 +146,7 @@ def test_run_migrations_timeout_stops_the_container(tmp_path, monkeypatch):
     m = _migrate(tmp_path, monkeypatch, slow)
     monkeypatch.setattr(nuk.subprocess, "run", fake_run)
     with pytest.raises(SystemExit):
-        nuk._run_migrations("kolbe", _MIGRATE_DEP, m, None, "sha256:cafe")
+        nuk._run_migrations("kolbe", _MIGRATE_SPEC, m, None, "sha256:cafe")
     assert any(tuple(c[0][4:7]) == ("rm", "-sf", "backend") for c in calls)
 
 
@@ -305,7 +305,7 @@ def test_migrate_strips_surrounding_whitespace():
 def test_run_migrations_without_a_strategy_carries_no_profile(tmp_path, monkeypatch):
     calls: list = []
     m = _migrate(tmp_path, monkeypatch, lambda *cmd, **kw: calls.append((cmd, kw)))
-    nuk._run_migrations("kolbe", _MIGRATE_DEP, m, None, "sha256:cafe")
+    nuk._run_migrations("kolbe", _MIGRATE_SPEC, m, None, "sha256:cafe")
     assert "--profile" not in calls[0][0]
 
 
@@ -320,7 +320,7 @@ def test_run_migrations_enables_the_idle_profile(tmp_path, monkeypatch):
     strategy = nuk.Strategy.model_validate(
         {"type": "blue-green", "health": {"service": "backend", "path": "/health"}}
     )
-    nuk._run_migrations("kolbe", _MIGRATE_DEP, m, strategy, "sha256:cafe")
+    nuk._run_migrations("kolbe", _MIGRATE_SPEC, m, strategy, "sha256:cafe")
     assert _after(calls[0][0], "--profile") == "green"
 
 
