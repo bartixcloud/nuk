@@ -402,7 +402,7 @@ def test_pin_image_pulls_and_retags_the_matching_compose_ref(monkeypatch):
         lambda name, raw: ["ghcr.io/astrojones/hello:main", "ghcr.io/astrojones/hello:sidecar"],
     )
     monkeypatch.setattr(nuk, "sh", lambda *cmd: commands.append(cmd))
-    nuk._pin_image("hello", {"spec": {}}, "ghcr.io/astrojones/hello@sha256:abc")
+    nuk._pin_image("hello", nuk.Spec(), "ghcr.io/astrojones/hello@sha256:abc")
     assert ("docker", "pull", "ghcr.io/astrojones/hello@sha256:abc") in commands
     assert (
         "docker",
@@ -422,7 +422,7 @@ def test_pin_image_refuses_when_no_compose_ref_matches(monkeypatch):
     monkeypatch.setattr(nuk, "_compose_images", lambda name, raw: ["quay.io/other/app:main"])
     monkeypatch.setattr(nuk, "sh", lambda *cmd: pytest.fail("must not pull"))
     with pytest.raises(SystemExit, match="references no image"):
-        nuk._pin_image("hello", {"spec": {}}, "ghcr.io/astrojones/hello@sha256:abc")
+        nuk._pin_image("hello", nuk.Spec(), "ghcr.io/astrojones/hello@sha256:abc")
 
 
 def test_pin_image_fails_closed_when_the_digest_is_gone(monkeypatch):
@@ -438,5 +438,5 @@ def test_pin_image_fails_closed_when_the_digest_is_gone(monkeypatch):
     monkeypatch.setattr(nuk, "_compose_images", lambda name, raw: ["ghcr.io/astrojones/hello:main"])
     monkeypatch.setattr(nuk, "sh", sh)
     with pytest.raises(subprocess.CalledProcessError):
-        nuk._pin_image("hello", {"spec": {}}, "ghcr.io/astrojones/hello@sha256:abc")
+        nuk._pin_image("hello", nuk.Spec(), "ghcr.io/astrojones/hello@sha256:abc")
     assert len(pulled) == 1
