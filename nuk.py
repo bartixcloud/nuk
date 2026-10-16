@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 # The return type of every record's `to_wire()`: exactly what json.dumps / yaml.safe_dump take.
 type Json = dict[str, Json] | list[Json] | str | int | float | bool | None
 
-__version__ = "2.6.0"  # bumped on release by .github/workflows/release.yml
+__version__ = "2.6.1"  # bumped on release by .github/workflows/release.yml
 
 ROOT = Path("/opt/nuklaut")
 DEPLOYS = ROOT / "deployments"
@@ -800,11 +800,18 @@ class ComposeImage:
 
     repository: str | None
     tag: str | None
+    container_name: str | None = None
+    image_id: str | None = None
 
     @classmethod
     def from_wire(cls, row: Mapping[str, object]) -> Self:
         """Non-string values read as None."""
-        return cls(_str_or_none(row.get("Repository")), _str_or_none(row.get("Tag")))
+        return cls(
+            _str_or_none(row.get("Repository")),
+            _str_or_none(row.get("Tag")),
+            _str_or_none(row.get("ContainerName")),
+            _str_or_none(row.get("ID")),
+        )
 
 
 @dataclass(frozen=True)
@@ -4630,8 +4637,26 @@ def _parse_compose_images_json(text: str) -> list[ComposeImage]:
     return [ComposeImage.from_wire(row) for row in rows if isinstance(row, dict)]
 
 
+def _primary_container(name: str, spec: Spec) -> str | None:
+    """Container name of the deployment's primary service, or None if it names none.
+
+    The probe service of a blue-green strategy (in the active colour), else the
+    first ingress backend: the service whose image IS the release.
+    """
+    if spec.strategy is not None and spec.strategy.type == "blue-green":
+        return _container_name(name, spec.strategy.health.service, active_colour(name))
+    service = spec.ingress[0].service if spec.ingress else None
+    return _container_name(name, service) if service else None
+
+
 def _resolve_image_digest(name: str, spec: Spec) -> str | None:
-    """Best-effort digest of the app's first compose image, or None if unresolvable."""
+    """Best-effort digest of the app's primary compose image, or None if unresolvable.
+
+    `compose images` lists rows in no stable order, so the row is the primary
+    service's (`_primary_container`), else the first by container name. A tagged
+    image is looked up by `repo:tag`; a digest-pinned one (Compose reports Tag
+    "") has no tag to look up, so it is resolved by its image ID.
+    """
     try:
         proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
             [*compose_args(name, spec), "images", "--format", "json"],
@@ -4645,11 +4670,19 @@ def _resolve_image_digest(name: str, spec: Spec) -> str | None:
     rows = _parse_compose_images_json(proc.stdout)
     if not rows or not rows[0].repository:
         return None
-    image = rows[0]
-    ref = f"{image.repository}:{image.tag or 'latest'}"
+    primary = _primary_container(name, spec)
+    image = next(
+        (r for r in rows if primary and r.container_name == primary),
+        min(rows, key=lambda r: r.container_name or ""),
+    )
+    if not image.repository:
+        return None
+    reference = f"{image.repository}:{image.tag}" if image.tag else image.image_id
+    if not reference:
+        return None
     try:
         digest = subprocess.run(  # noqa: S603  # fixed argv, no shell
-            ["docker", "inspect", "--format", "{{index .RepoDigests 0}}", ref],  # noqa: S607  # docker on PATH
+            ["docker", "inspect", "--format", "{{index .RepoDigests 0}}", reference],  # noqa: S607  # docker on PATH
             capture_output=True,
             text=True,
             check=True,
@@ -5197,7 +5230,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         # `cmd_rollback`) never migrates — forward-only, and the recorded
         # revision it restores may predate the current migration head. A
         # blue-green colour flip never reaches here at all.
-        key = _rollout_key(name, manifest.spec)
+        key = _rollout_key(name, manifest.spec, migrate, strategy)
         if key is None or key != migrated_digest(name):
             _run_migrations(name, manifest.spec, migrate, strategy, key)
     if strategy is not None and strategy.type == "blue-green":
@@ -5374,10 +5407,18 @@ def _rollback_blue_green(
     the restart when the last apply drained it), gate on the same health probe,
     flip the app-host file router back to it, and record it as active. No image
     change is needed — the previous colour's bits are still on the host.
+
+    `--no-recreate` is what makes that true. The previous colour is brought up
+    against the CURRENT tree, and when both colours share one image ref (a bumped
+    env value) a plain `up -d` would recreate the kept container on the NEW image,
+    so the "rollback" would serve the bad release. With it, a kept container
+    (`keepPrevious`) runs exactly the image it had. A drained colour (no
+    `keepPrevious`) has no container left to preserve: it is created from the
+    current tree, so only `keepPrevious: true` makes the flip a real rollback.
     """
     previous = idle_colour(active_colour(name))
     health = strategy.health
-    sh(*compose_args(name, spec), "--profile", previous, "up", "-d")
+    sh(*compose_args(name, spec), "--profile", previous, "up", "-d", "--no-recreate")
     await_healthy(
         _container_name(name, health.service, previous),
         health.path,
@@ -5413,19 +5454,49 @@ def cmd_get() -> None:
         print(f"{name:24} {ps:32} {hosts}")
 
 
-def _configured_image_digest(name: str, spec: Spec) -> str | None:
-    """Digest of the image the compose file CONFIGURES, or None if unresolvable.
+def _configured_service_image(name: str, spec: Spec, service: str, colour: str | None) -> str | None:
+    """The image reference compose CONFIGURES for `service`, or None if unresolvable.
+
+    Resolved per service, with the colour's profile enabled: a blue-green
+    deployment's services sit behind colour profiles, so a profile-less
+    `config --images` lists only the profile-less ones (and in no stable order).
+    """
+    profile = ["--profile", colour] if colour else []
+    try:
+        proc = subprocess.run(  # noqa: S603  # fixed argv, no shell
+            [*compose_args(name, spec), *profile, "config", "--format", "json"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        services = json.loads(proc.stdout).get("services") or {}
+    except (subprocess.SubprocessError, OSError, ValueError, AttributeError):
+        return None
+    entry = services.get(service)
+    image = entry.get("image") if isinstance(entry, dict) else None
+    return image or None
+
+
+def _configured_image_digest(
+    name: str, spec: Spec, service: str, colour: str | None = None
+) -> str | None:
+    """Digest of the image the compose file CONFIGURES for `service`, or None.
 
     `docker compose images` reports the RUNNING containers — the previous release
-    before a rollout — so it cannot answer "is this a new rollout". The
-    configured reference (`compose config --images`) is the new tree's.
+    before a rollout — so it cannot answer "is this a new rollout"; the configured
+    reference is the new tree's. A digest-pinned reference (`repo@sha256:...`) is
+    its own identity and needs no daemon lookup (or local image); a tag resolves
+    through the daemon's RepoDigests.
     """
-    images = _compose_images(name, spec)
-    if not images:
+    image = _configured_service_image(name, spec, service, colour)
+    if image is None:
         return None
+    if "@sha256:" in image:
+        return image
     try:
         digest = subprocess.run(  # noqa: S603  # fixed argv, no shell
-            ["docker", "inspect", "--format", "{{index .RepoDigests 0}}", images[0]],  # noqa: S607  # docker on PATH
+            ["docker", "inspect", "--format", "{{index .RepoDigests 0}}", image],  # noqa: S607  # docker on PATH
             capture_output=True,
             text=True,
             check=True,
@@ -5436,15 +5507,18 @@ def _configured_image_digest(name: str, spec: Spec) -> str | None:
     return digest or None
 
 
-def _rollout_key(name: str, spec: Spec) -> str | None:
-    """The key a rollout is compared by: the configured image digest, else the revision.
+def _rollout_key(name: str, spec: Spec, migrate: Migrate, strategy: Strategy | None) -> str | None:
+    """The key a rollout is compared by: the migrate service's image digest, else the revision.
 
     The converge loop re-applies every cycle, so `spec.migrate` must key off what
-    actually changes on a new rollout. `None` means neither resolved: the caller
+    actually changes on a new rollout — the image of the very service the
+    migration runs in (`_migrate_service`), resolved under the idle colour's
+    profile like the migration itself. `None` means neither resolved: the caller
     re-runs the (idempotent) migration rather than recording a sentinel that would
     collide across releases.
     """
-    digest = _configured_image_digest(name, spec)
+    service = _migrate_service(name, migrate, strategy)
+    digest = _configured_image_digest(name, spec, service, _migrate_colour(name, strategy))
     if digest:
         return digest
     revision = _applied_revision(name)

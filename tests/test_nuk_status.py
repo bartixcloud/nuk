@@ -563,3 +563,66 @@ def test_parse_compose_images_json_parses_json_lines_skipping_blanks():
 
 def test_parse_compose_images_json_invalid_json_is_empty():
     assert nuk._parse_compose_images_json("not json") == []
+
+
+# --- _resolve_image_digest: digest-pinned refs and the primary service ----------
+# Compose v5.6 reports Tag "" for a container created from `repo@sha256:...` (and
+# there is no repo:latest), so the old `Tag or "latest"` lookup resolved nothing and
+# `nuk rollback` refused every digest-pinned release. Rows also come in no stable
+# order, so the digest must be the deployment's primary service's, not rows[0].
+
+_KOLBE_DIGEST_ROWS = [
+    {
+        "ContainerName": "kolbe-latex-1",
+        "Repository": "ghcr.io/x/latex",
+        "Tag": "",
+        "ID": "sha256:1a",
+    },
+    {
+        "ContainerName": "kolbe-backend-green-1",
+        "Repository": "ghcr.io/x/backend",
+        "Tag": "",
+        "ID": "sha256:2b",
+    },
+    {
+        "ContainerName": "kolbe-frontend-green-1",
+        "Repository": "ghcr.io/x/frontend",
+        "Tag": "",
+        "ID": "sha256:3c",
+    },
+]
+_KOLBE_SPEC = nuk.Spec.model_validate(
+    {
+        "strategy": {"type": "blue-green", "health": {"service": "backend", "path": "/health"}},
+        "ingress": [{"host": "k.example", "service": "frontend", "port": 80}],
+    }
+)
+
+
+def _digest_docker(monkeypatch, rows, inspected: list[str]) -> None:
+    def fake_run(cmd, **kwargs):  # noqa: ARG001
+        if "images" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(rows))
+        assert cmd[:2] == ["docker", "inspect"], cmd
+        inspected.append(cmd[-1])
+        repo = {"sha256:1a": "latex", "sha256:2b": "backend", "sha256:3c": "frontend"}[cmd[-1]]
+        return subprocess.CompletedProcess(cmd, 0, stdout=f"ghcr.io/x/{repo}@sha256:{repo}\n")
+
+    monkeypatch.setattr(nuk.subprocess, "run", fake_run)
+    monkeypatch.setattr(nuk, "active_colour", lambda _name: "green")
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_resolve_image_digest_resolves_a_digest_pinned_container(monkeypatch, reverse):
+    inspected: list[str] = []
+    rows = list(reversed(_KOLBE_DIGEST_ROWS)) if reverse else list(_KOLBE_DIGEST_ROWS)
+    _digest_docker(monkeypatch, rows, inspected)
+    digest = nuk._resolve_image_digest("kolbe", _KOLBE_SPEC)
+    assert digest == "ghcr.io/x/backend@sha256:backend"
+    assert inspected == ["sha256:2b"]  # looked up by image ID: there is no tag
+
+
+def test_resolve_image_digest_prefers_the_health_service_over_row_order(monkeypatch):
+    inspected: list[str] = []
+    _digest_docker(monkeypatch, [_KOLBE_DIGEST_ROWS[0], _KOLBE_DIGEST_ROWS[1]], inspected)
+    assert nuk._resolve_image_digest("kolbe", _KOLBE_SPEC) == "ghcr.io/x/backend@sha256:backend"

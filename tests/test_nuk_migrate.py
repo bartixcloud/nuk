@@ -5,6 +5,7 @@ Spec: docs/superpowers/specs/2026-10-16-nuk-migrate-hook-design.md
 
 from __future__ import annotations
 
+import json
 import subprocess
 import textwrap
 from typing import TYPE_CHECKING
@@ -150,24 +151,33 @@ def test_run_migrations_timeout_stops_the_container(tmp_path, monkeypatch):
     assert any(tuple(c[0][4:7]) == ("rm", "-sf", "backend") for c in calls)
 
 
-def test_rollout_key_uses_the_configured_image_not_the_running_one(monkeypatch):
-    """`compose images` reports the running (old) release — the gate must not use it."""
-    monkeypatch.setattr(nuk, "_compose_images", lambda name, raw: ["ghcr.io/x/backend:v_new"])
-    monkeypatch.setattr(
-        nuk.subprocess,
-        "run",
-        lambda *a, **k: type("P", (), {"stdout": "sha256:new\n", "returncode": 0})(),
-    )
-    assert nuk._rollout_key("kolbe", nuk.Spec()) == "sha256:new"
+def test_rollout_key_is_the_digest_ref_itself(monkeypatch):
+    """A digest ref IS its identity: no daemon lookup, and it needs no local image."""
+    monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["compose", "-p", "kolbe"])
+
+    def run(cmd, **_kw):
+        assert "config" in cmd, cmd  # `compose images` would be the running release
+        stdout = json.dumps({"services": {"backend": {"image": "ghcr.io/x/backend@sha256:new"}}})
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout)
+
+    monkeypatch.setattr(nuk.subprocess, "run", run)
+    migrate = nuk.Migrate.model_validate(_MIGRATE)
+    assert nuk._rollout_key("kolbe", nuk.Spec(), migrate, None) == "ghcr.io/x/backend@sha256:new"
 
 
 def test_rollout_key_is_none_when_unresolvable(monkeypatch):
     """An unresolvable key must not collapse to the `-` revision sentinel."""
-    monkeypatch.setattr(nuk, "_compose_images", lambda name, raw: [])
+    monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["compose", "-p", "kolbe"])
+    monkeypatch.setattr(
+        nuk.subprocess,
+        "run",
+        lambda cmd, **_kw: subprocess.CompletedProcess(cmd, 0, stdout='{"services": {}}'),
+    )
+    migrate = nuk.Migrate.model_validate(_MIGRATE)
     monkeypatch.setattr(nuk, "_applied_revision", lambda name: "-")
-    assert nuk._rollout_key("kolbe", nuk.Spec()) is None
+    assert nuk._rollout_key("kolbe", nuk.Spec(), migrate, None) is None
     monkeypatch.setattr(nuk, "_applied_revision", lambda name: "abc1234")
-    assert nuk._rollout_key("kolbe", nuk.Spec()) == "abc1234"
+    assert nuk._rollout_key("kolbe", nuk.Spec(), migrate, None) == "abc1234"
 
 
 # --- cmd_apply wiring (Tasks 4) ---------------------------------------------
@@ -204,7 +214,7 @@ def _profile_ups(lines: list[tuple[str, ...]]) -> list[tuple[str, ...]]:
 def test_cmd_apply_runs_migration_before_idle_up(tmp_path, monkeypatch):
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
-    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw, *_a, **_k: "sha256:cafe")
     nuk.cmd_apply(_write(tmp_path, _bg_yml(migrate=True)), None)
     runs = _migrate_calls(lines)
     assert len(runs) == 1
@@ -215,7 +225,7 @@ def test_cmd_apply_runs_migration_before_idle_up(tmp_path, monkeypatch):
 def test_cmd_apply_skips_migration_when_digest_unchanged(tmp_path, monkeypatch):
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
-    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw, *_a, **_k: "sha256:cafe")
     doc = _write(tmp_path, _bg_yml(migrate=True))
     nuk.cmd_apply(doc, None)
     lines.clear()
@@ -231,7 +241,7 @@ def test_cmd_apply_skips_migration_on_a_digest_rollback(tmp_path, monkeypatch):
     """
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
-    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw, *_a, **_k: "sha256:cafe")
     monkeypatch.setattr(nuk, "_pin_image", lambda *_a, **_k: None)
     nuk.cmd_apply(
         _write(tmp_path, _bg_yml(migrate=True)),
@@ -245,7 +255,7 @@ def test_cmd_apply_runs_migration_on_a_signed_apply(tmp_path, monkeypatch):
     """A signed deployment is applied with `pin_commit` set and STILL migrates."""
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
-    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw, *_a, **_k: "sha256:cafe")
     nuk.cmd_apply(_write(tmp_path, _bg_yml(migrate=True)), None, pin_commit="0" * 40)
     assert len(_migrate_calls(lines)) == 1
 
@@ -253,7 +263,7 @@ def test_cmd_apply_runs_migration_on_a_signed_apply(tmp_path, monkeypatch):
 def test_cmd_apply_without_migrate_never_runs(tmp_path, monkeypatch):
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
-    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw, *_a, **_k: "sha256:cafe")
     nuk.cmd_apply(_write(tmp_path, _bg_yml(migrate=False)), None)
     assert _migrate_calls(lines) == []
 
@@ -270,7 +280,7 @@ def test_cmd_apply_migration_failure_aborts_before_the_idle_up(tmp_path, monkeyp
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
     monkeypatch.setattr(nuk, "sh", sh)
-    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw, *_a, **_k: "sha256:cafe")
     with pytest.raises(SystemExit):
         nuk.cmd_apply(_write(tmp_path, _bg_yml(migrate=True)), None)
     assert _profile_ups(lines) == []
@@ -328,6 +338,92 @@ def test_cmd_apply_ignores_migrate_on_a_facility(tmp_path, monkeypatch):
     """`spec.migrate` is a Deployment concern (spec §3); a Facility never migrates."""
     lines: list[tuple[str, ...]] = []
     _stub_apply(tmp_path, monkeypatch, lines)
-    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw: "sha256:cafe")
+    monkeypatch.setattr(nuk, "_configured_image_digest", lambda name, raw, *_a, **_k: "sha256:cafe")
     nuk.cmd_apply(_write(tmp_path, _bg_yml(migrate=True, kind="Facility")), None)
     assert _migrate_calls(lines) == []
+
+
+# --- the gate keys on the migrate service's image, resolved with the idle profile ---
+# Kolbe's blue-green compose puts backend/frontend behind colour profiles; only latex
+# and maintenance are profile-less. `compose config --images` WITHOUT a profile lists
+# just those two, in non-deterministic order, so the old gate (images[0]) never saw the
+# backend digest and re-fired on about half of the unchanged cycles.
+
+_LATEX = "ghcr.io/kolbeapp-de/lernstanderfassung/latex@sha256:" + "1" * 64
+_MAINT = "ghcr.io/kolbeapp-de/lernstanderfassung/maintenance@sha256:" + "2" * 64
+
+
+def _backend_ref(digit: str) -> str:
+    return "ghcr.io/kolbeapp-de/lernstanderfassung/backend@sha256:" + digit * 64
+
+
+def _fake_kolbe_compose(monkeypatch, state: dict) -> list[list[str]]:
+    """Emulate the compose CLI for a profiled stack; flips the profile-less order per call."""
+    seen: list[list[str]] = []
+
+    def run(cmd, **_kw):
+        cmd = list(cmd)
+        seen.append(cmd)
+        if "images" in cmd:  # `compose images`: provenance, irrelevant here
+            return subprocess.CompletedProcess(cmd, 0, stdout="")
+        if "config" in cmd and "--images" in cmd:
+            state["n"] = state.get("n", 0) + 1
+            order = [_LATEX, _MAINT] if state["n"] % 2 else [_MAINT, _LATEX]
+            return subprocess.CompletedProcess(cmd, 0, stdout="\n".join(order) + "\n")
+        if "config" in cmd and "--format" in cmd:
+            services = {"latex": {"image": _LATEX}, "maintenance": {"image": _MAINT}}
+            if "--profile" in cmd:
+                colour = cmd[cmd.index("--profile") + 1]
+                services[f"backend-{colour}"] = {"image": state["backend"]}
+                services[f"frontend-{colour}"] = {"image": "ghcr.io/x/frontend:1"}
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"services": services}))
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(nuk.subprocess, "run", run)
+    return seen
+
+
+def test_gate_reruns_the_migration_on_a_backend_only_bump(tmp_path, monkeypatch):
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    state = {"backend": _backend_ref("a")}
+    _fake_kolbe_compose(monkeypatch, state)
+    doc = _write(tmp_path, _bg_yml(migrate=True))
+    nuk.cmd_apply(doc, None)
+    assert len(_migrate_calls(lines)) == 1
+    state["backend"] = _backend_ref("b")
+    nuk.cmd_apply(doc, None)
+    assert len(_migrate_calls(lines)) == 2
+
+
+def test_gate_stays_quiet_on_unchanged_cycles(tmp_path, monkeypatch):
+    """Repeated applies of an unchanged stack must not re-fire, whatever the listing order."""
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines)
+    _fake_kolbe_compose(monkeypatch, {"backend": _backend_ref("a")})
+    doc = _write(tmp_path, _bg_yml(migrate=True))
+    for _ in range(6):
+        nuk.cmd_apply(doc, None)
+    assert len(_migrate_calls(lines)) == 1
+
+
+def test_rollout_key_resolves_a_tag_ref_through_the_daemon(tmp_path, monkeypatch):
+    """A tag ref has no digest of its own: the daemon's RepoDigest is the identity."""
+    monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["compose", "-p", "kolbe"])
+
+    def run(cmd, **_kw):
+        cmd = list(cmd)
+        if "config" in cmd:
+            services = {"backend-green": {"image": "ghcr.io/x/backend:v2"}}
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps({"services": services}))
+        assert cmd[:2] == ["docker", "inspect"]
+        assert cmd[-1] == "ghcr.io/x/backend:v2"
+        return subprocess.CompletedProcess(cmd, 0, stdout="ghcr.io/x/backend@sha256:cafe\n")
+
+    monkeypatch.setattr(nuk.subprocess, "run", run)
+    migrate = nuk.Migrate.model_validate(_MIGRATE)
+    strategy = nuk.Strategy.model_validate(
+        {"type": "blue-green", "health": {"service": "backend", "path": "/health"}}
+    )
+    monkeypatch.setattr(nuk, "active_colour", lambda _n: "blue")
+    assert nuk._rollout_key("kolbe", nuk.Spec(), migrate, strategy) == "ghcr.io/x/backend@sha256:cafe"
