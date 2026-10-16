@@ -939,7 +939,7 @@ def await_healthy(  # noqa: PLR0913  # one keyword per probe input; all read, no
     Raises:
         ValueError: If the container never answered within `timeout` seconds.
     """
-    probe = f"urllib.request.urlopen('http://localhost:{port}{path}')"
+    probe = f"import urllib.request; urllib.request.urlopen('http://localhost:{port}{path}')"
     deadline = time.monotonic() + timeout
     while True:
         try:
