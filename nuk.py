@@ -31,7 +31,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, cast
+from typing import TYPE_CHECKING, Annotated, Any, Literal, NoReturn, Self, cast
 from urllib.parse import urlparse
 
 import typer
@@ -48,11 +48,13 @@ from pydantic import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Iterable
+    from collections.abc import Callable, Generator, Iterable, Mapping
 
 # A parsed YAML/JSON mapping: wire-contract keys are strings, values stay untyped because
 # the manifests are validated at the edges, not here.
 type Raw = dict[str, Any]
+# The return type of every record's `to_wire()`: exactly what json.dumps / yaml.safe_dump take.
+type Json = dict[str, Json] | list[Json] | str | int | float | bool | None
 
 __version__ = "2.6.0"  # bumped on release by .github/workflows/release.yml
 
@@ -244,6 +246,23 @@ class Databases(_NullTolerant):
     attach_to: list[str] = Field(default=[], alias="attachTo")
     attach_all: bool = Field(default=False, alias="attachAll")
 
+    @property
+    def wants_postgres(self) -> bool:
+        """Whether postgres is requested; the object form `{}` is not (a raw `{}` was falsy)."""
+        if isinstance(self.postgres, Postgres):
+            return bool(self.postgres.model_fields_set)
+        return self.postgres
+
+    @property
+    def wants_redis(self) -> bool:
+        """Whether redis is requested."""
+        return self.redis
+
+    @property
+    def postgres_driver(self) -> str | None:
+        """The URL-scheme driver of the object form; bare `true` has none."""
+        return self.postgres.driver if isinstance(self.postgres, Postgres) else None
+
 
 # The host roles a placement can target and an org host can carry (spec §3.1).
 Role = Literal["edge", "data", "app", "hypervisor", "all-in-one"]
@@ -431,6 +450,588 @@ class Facility(Manifest):
 # typo in `kind` is a validation error rather than a silently-skipped document.
 AnyManifest = Annotated[Deployment | Facility, Field(discriminator="kind")]
 _MANIFEST_ADAPTER = TypeAdapter(AnyManifest)
+
+
+# --- wire records -------------------------------------------------------------
+# Everything nuk writes to disk or prints is a closed schema. These records own the exact
+# key set, key order and present-vs-absent rules, so no call site re-spells them. yaml.safe_dump
+# sorts keys, so for the two YAML outputs only the key set and presence matter; the JSON ones
+# (converge status, provenance, overview) keep insertion order, which is the documented order.
+# `from_wire` is tolerant wherever the source can be stale or half-written (overview,
+# provenance): a value of the wrong type degrades to None/default instead of raising.
+
+
+def _str_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _str_list(value: object) -> list[str]:
+    return [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+
+
+def _int_or_none(value: object) -> int | None:
+    # bool is an int subclass; `port: true` is not a port.
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+# Compose override (write-only)
+
+
+@dataclass(frozen=True)
+class ServiceWiring:
+    """One service's entry in `compose.override.yml`."""
+
+    networks: list[str]
+    ports: list[str] = field(default_factory=list)
+    env_file: list[str] = field(default_factory=list)
+
+    def to_wire(self) -> dict[str, Json]:
+        """`networks` is always present (even empty); `ports`/`env_file` only when non-empty."""
+        out: dict[str, Json] = {"networks": [*self.networks]}
+        if self.ports:
+            out["ports"] = [*self.ports]
+        if self.env_file:
+            out["env_file"] = [*self.env_file]
+        return out
+
+
+@dataclass(frozen=True)
+class ComposeOverride:
+    """The whole `compose.override.yml` document."""
+
+    services: dict[str, ServiceWiring]
+    external_networks: list[str]
+
+    def to_wire(self) -> dict[str, Json]:
+        """`networks` is always present, even as `{}`."""
+        return {
+            "services": {k: v.to_wire() for k, v in self.services.items()},
+            "networks": {n: {"external": True} for n in self.external_networks},
+        }
+
+
+# Traefik dynamic config (write-only)
+
+
+@dataclass(frozen=True)
+class TraefikRouter:
+    """One file-provider router."""
+
+    rule: str
+    entry_points: list[str]
+    service: str
+    tls_cert_resolver: str | None = None
+    middlewares: list[str] = field(default_factory=list)
+    priority: int | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """`tls`, `middlewares` and `priority` are omitted unless set / non-empty."""
+        out: dict[str, Json] = {
+            "rule": self.rule,
+            "entryPoints": [*self.entry_points],
+            "service": self.service,
+        }
+        if self.tls_cert_resolver is not None:
+            out["tls"] = {"certResolver": self.tls_cert_resolver}
+        if self.middlewares:
+            out["middlewares"] = [*self.middlewares]
+        if self.priority is not None:
+            out["priority"] = self.priority
+        return out
+
+
+@dataclass(frozen=True)
+class TraefikService:
+    """A single-backend load balancer."""
+
+    url: str
+
+    def to_wire(self) -> dict[str, Json]:
+        """The `loadBalancer.servers[]` shape Traefik expects."""
+        return {"loadBalancer": {"servers": [{"url": self.url}]}}
+
+
+@dataclass(frozen=True)
+class StripPrefix:
+    """The `stripPrefix` middleware."""
+
+    prefixes: list[str]
+
+    def to_wire(self) -> dict[str, Json]:
+        """Wrap the prefixes under the middleware's type key."""
+        return {"stripPrefix": {"prefixes": [*self.prefixes]}}
+
+
+@dataclass(frozen=True)
+class RedirectRegex:
+    """The `redirectRegex` middleware (the www -> apex 301)."""
+
+    regex: str
+    replacement: str
+    permanent: bool
+
+    def to_wire(self) -> dict[str, Json]:
+        """Wrap the three fields under the middleware's type key."""
+        return {
+            "redirectRegex": {
+                "regex": self.regex,
+                "replacement": self.replacement,
+                "permanent": self.permanent,
+            }
+        }
+
+
+type TraefikMiddleware = StripPrefix | RedirectRegex
+
+
+@dataclass(frozen=True)
+class TraefikConfig:
+    """The whole Traefik dynamic file (`http:` only)."""
+
+    routers: dict[str, TraefikRouter]
+    services: dict[str, TraefikService]
+    middlewares: dict[str, TraefikMiddleware] = field(default_factory=dict)
+
+    def to_wire(self) -> dict[str, Json]:
+        """`middlewares` is omitted when there are none."""
+        http: dict[str, Json] = {
+            "routers": {k: v.to_wire() for k, v in self.routers.items()},
+            "services": {k: v.to_wire() for k, v in self.services.items()},
+        }
+        if self.middlewares:
+            http["middlewares"] = {k: v.to_wire() for k, v in self.middlewares.items()}
+        return {"http": http}
+
+
+# Converge status (JSON; written each cycle and read back by `nuk status` / drift.sh)
+
+type ManifestKind = Literal["Facility", "Deployment", "Database"]
+type ManifestOutcome = Literal["ok", "failed", "refused"]
+
+
+@dataclass(frozen=True)
+class ManifestResult:
+    """One applied manifest's outcome (spec §7.6)."""
+
+    name: str
+    kind: ManifestKind
+    result: ManifestOutcome = "ok"
+    error: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """All four keys, always; `error` is an explicit null on success."""
+        return {"name": self.name, "kind": self.kind, "result": self.result, "error": self.error}
+
+    @classmethod
+    def from_wire(cls, obj: object) -> Self | None:
+        """None for anything that is not a well-formed entry."""
+        if not isinstance(obj, dict):
+            return None
+        name, error = obj.get("name"), obj.get("error")
+        if not isinstance(name, str) or not (error is None or isinstance(error, str)):
+            return None
+        match obj.get("kind"), obj.get("result"):
+            case ("Facility" | "Deployment" | "Database") as kind, (
+                "ok" | "failed" | "refused"
+            ) as result:
+                return cls(name, kind, result, error)
+        return None
+
+
+@dataclass(frozen=True)
+class LoggingStatus:
+    """The logging pipeline's own health; info-only (spec §14.3)."""
+
+    healthy: bool
+    detail: str
+
+    def to_wire(self) -> dict[str, Json]:
+        """Both keys, always."""
+        return {"healthy": self.healthy, "detail": self.detail}
+
+    @classmethod
+    def from_wire(cls, obj: object) -> Self | None:
+        """None for anything that is not a well-formed block."""
+        if not isinstance(obj, dict):
+            return None
+        healthy, detail = obj.get("healthy"), obj.get("detail")
+        if isinstance(healthy, bool) and isinstance(detail, str):
+            return cls(healthy, detail)
+        return None
+
+
+# Not frozen: _prepare_source/_apply_source/_refuse fill the block in place, and the cycle
+# holds the same object in `blocks` while they do.
+@dataclass
+class SourceBlock:
+    """One source's block in the converge status."""
+
+    result: Literal["ok", "refused"] = "ok"
+    error: str | None = None
+    tag: str | None = None
+    commit: str | None = None
+    apply: list[str] = field(default_factory=list)
+    manifests: list[ManifestResult] = field(default_factory=list)
+    rendered: list[str] = field(default_factory=list)
+    refused_routes: list[str] = field(default_factory=list)
+
+    def to_wire(self) -> dict[str, Json]:
+        """All eight keys, always, in this order."""
+        return {
+            "result": self.result,
+            "error": self.error,
+            "tag": self.tag,
+            "commit": self.commit,
+            "apply": [*self.apply],
+            "manifests": [m.to_wire() for m in self.manifests],
+            "rendered": [*self.rendered],
+            "refusedRoutes": [*self.refused_routes],
+        }
+
+    @classmethod
+    def from_wire(cls, obj: object) -> Self | None:
+        """None for a non-conforming block; a missing list reads as empty."""
+        if not isinstance(obj, dict):
+            return None
+        raw_manifests = obj.get("manifests")
+        manifests = [
+            ManifestResult.from_wire(m)
+            for m in (raw_manifests if isinstance(raw_manifests, list) else [])
+        ]
+        error = obj.get("error")
+        if None in manifests or not (error is None or isinstance(error, str)):
+            return None
+        match obj.get("result"):
+            case "ok" | "refused" as result:
+                return cls(
+                    result,
+                    error,
+                    _str_or_none(obj.get("tag")),
+                    _str_or_none(obj.get("commit")),
+                    _str_list(obj.get("apply")),
+                    [m for m in manifests if m is not None],
+                    _str_list(obj.get("rendered")),
+                    _str_list(obj.get("refusedRoutes")),
+                )
+        return None
+
+
+@dataclass(frozen=True)
+class ConvergeStatus:
+    """`converge-status.json`: the last cycle's outcome."""
+
+    role: str
+    tenant: str | None
+    applied_at: str
+    reap_warnings: list[str]
+    sources: dict[str, SourceBlock]
+    logging: LoggingStatus | None = None
+    error: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """`logging` and `error` are absent (never null) unless set."""
+        out: dict[str, Json] = {
+            "role": self.role,
+            "tenant": self.tenant,
+            "appliedAt": self.applied_at,
+            "reapWarnings": [*self.reap_warnings],
+            "sources": {k: v.to_wire() for k, v in self.sources.items()},
+        }
+        if self.logging is not None:
+            out["logging"] = self.logging.to_wire()
+        if self.error is not None:
+            out["error"] = self.error
+        return out
+
+    @classmethod
+    def from_wire(cls, obj: object) -> Self | None:
+        """None when the document is not a converge status (the reader treats it as absent)."""
+        if not isinstance(obj, dict):
+            return None
+        role, raw_sources = obj.get("role"), obj.get("sources")
+        if not isinstance(role, str) or not isinstance(raw_sources, dict):
+            return None
+        sources = {str(k): SourceBlock.from_wire(v) for k, v in raw_sources.items()}
+        parsed = {k: b for k, b in sources.items() if b is not None}
+        if len(parsed) != len(sources):
+            return None
+        return cls(
+            role,
+            _str_or_none(obj.get("tenant")),
+            _str_or_none(obj.get("appliedAt")) or "",
+            _str_list(obj.get("reapWarnings")),
+            parsed,
+            LoggingStatus.from_wire(obj.get("logging")),
+            _str_or_none(obj.get("error")),
+        )
+
+
+# Provenance / docker
+
+
+@dataclass(frozen=True)
+class ReleaseEntry:
+    """One line of `releases/<name>.jsonl`."""
+
+    repo: str | None = None
+    branch: str | None = None
+    commit: str | None = None
+    image_digest: str | None = None
+    applied_at: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """All five keys, always, in this order."""
+        return {
+            "repo": self.repo,
+            "branch": self.branch,
+            "commit": self.commit,
+            "imageDigest": self.image_digest,
+            "appliedAt": self.applied_at,
+        }
+
+    @classmethod
+    def from_wire(cls, data: Mapping[str, object]) -> Self:
+        """Non-string values read as None; legacy entries with fewer keys read fine."""
+        return cls(
+            _str_or_none(data.get("repo")),
+            _str_or_none(data.get("branch")),
+            _str_or_none(data.get("commit")),
+            _str_or_none(data.get("imageDigest")),
+            _str_or_none(data.get("appliedAt")),
+        )
+
+    def same_release(self, other: Self) -> bool:
+        """Same repo/branch/commit/digest: a re-apply refreshes the entry, not the history."""
+        return (self.repo, self.branch, self.commit, self.image_digest) == (
+            other.repo,
+            other.branch,
+            other.commit,
+            other.image_digest,
+        )
+
+
+@dataclass(frozen=True)
+class ComposeImage:
+    """One row of `docker compose images --format json` (docker's PascalCase keys)."""
+
+    repository: str | None
+    tag: str | None
+
+    @classmethod
+    def from_wire(cls, row: Mapping[str, object]) -> Self:
+        """Non-string values read as None."""
+        return cls(_str_or_none(row.get("Repository")), _str_or_none(row.get("Tag")))
+
+
+@dataclass(frozen=True)
+class GitProvenance:
+    """HEAD's full sha, committer date and web URL; the empty instance means no checkout."""
+
+    full_commit: str | None = None
+    last_commit: str | None = None
+    repo_url: str | None = None
+
+
+# Overview (printed by `nuk status`). The AppSource/AppIngress/AppFeatures readers are NOT the
+# pydantic models: the overview reads a possibly stale, unvalidated manifest.yml and must
+# degrade, not raise (e.g. `Source.branch` defaults to "main", the overview prints null).
+
+
+@dataclass(frozen=True)
+class AppSource:
+    """`spec.source` as the overview shows it."""
+
+    repo: str | None = None
+    branch: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """Both keys, always."""
+        return {"repo": self.repo, "branch": self.branch}
+
+    @classmethod
+    def from_wire(cls, obj: object) -> Self:
+        """Non-string values read as None."""
+        data = obj if isinstance(obj, dict) else {}
+        return cls(_str_or_none(data.get("repo")), _str_or_none(data.get("branch")))
+
+
+@dataclass(frozen=True)
+class AppIngress:
+    """One `spec.ingress[]` entry as the overview shows it."""
+
+    host: str
+    service: str | None = None
+    port: int | None = None
+    path: str | None = None
+    auth: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """All five keys, always."""
+        return {
+            "host": self.host,
+            "service": self.service,
+            "port": self.port,
+            "path": self.path,
+            "auth": self.auth,
+        }
+
+    @classmethod
+    def from_wire(cls, obj: object) -> Self | None:
+        """None for an entry without a usable host (the overview skips those)."""
+        if not isinstance(obj, dict):
+            return None
+        host = obj.get("host")
+        if not isinstance(host, str) or not host:
+            return None
+        return cls(
+            host,
+            _str_or_none(obj.get("service")),
+            _int_or_none(obj.get("port")),
+            _str_or_none(obj.get("path")),
+            _str_or_none(obj.get("auth")),
+        )
+
+
+@dataclass(frozen=True)
+class AppFeatures:
+    """The declared backing services."""
+
+    postgres: bool = False
+    redis: bool = False
+    postgres_driver: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """All three keys, always."""
+        return {
+            "postgres": self.postgres,
+            "redis": self.redis,
+            "postgresDriver": self.postgres_driver,
+        }
+
+    @classmethod
+    def from_databases(cls, obj: object) -> Self:
+        """Read a raw `spec.databases` value; same truthiness the manifest has always had."""
+        data = obj if isinstance(obj, dict) else {}
+        pg = data.get("postgres")
+        driver = pg.get("driver") if isinstance(pg, dict) else None
+        return cls(bool(pg), bool(data.get("redis")), _str_or_none(driver))
+
+
+@dataclass(frozen=True)
+class Workflow:
+    """A GitHub Actions workflow file."""
+
+    file: str
+    name: str
+    triggers: list[str] = field(default_factory=list)
+
+    def to_wire(self) -> dict[str, Json]:
+        """All three keys, always."""
+        return {"file": self.file, "name": self.name, "triggers": [*self.triggers]}
+
+
+@dataclass(frozen=True)
+class RouterStatus:
+    """A router nuk rendered, with the optional live probe."""
+
+    id: str
+    rule: str
+    live: str | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """All three keys, always; `live` is null unless probed."""
+        return {"id": self.id, "rule": self.rule, "live": self.live}
+
+
+@dataclass(frozen=True)
+class AppOverview:
+    """One app's entry in the overview."""
+
+    name: str
+    hosts: list[str]
+    source: AppSource | None
+    repo_url: str | None
+    commit: str | None
+    commit_url: str | None
+    last_commit: str | None
+    version: str | None
+    routers: list[RouterStatus]
+    drift: Literal["in-sync", "drift", "unknown"]
+    features: AppFeatures
+    workflows: list[Workflow]
+    ingress: list[AppIngress]
+    notes: list[str]
+    image_digest: str | None
+
+    def to_wire(self) -> dict[str, Json]:
+        """Every key, always (null, never omitted), in the order `nukview` has been reading."""
+        return {
+            "name": self.name,
+            "hosts": [*self.hosts],
+            "source": self.source.to_wire() if self.source is not None else None,
+            "repoUrl": self.repo_url,
+            "commit": self.commit,
+            "commitUrl": self.commit_url,
+            "lastCommit": self.last_commit,
+            "version": self.version,
+            "routers": [r.to_wire() for r in self.routers],
+            "drift": self.drift,
+            "features": self.features.to_wire(),
+            "workflows": [w.to_wire() for w in self.workflows],
+            "ingress": [i.to_wire() for i in self.ingress],
+            "notes": [*self.notes],
+            "imageDigest": self.image_digest,
+        }
+
+
+@dataclass(frozen=True)
+class SollVsIst:
+    """`status --all`: declared org hosts against what this command observed."""
+
+    declared_hosts: int
+    observed_hosts: int
+    declared_apps: int | None
+    observed_apps: int
+
+    def to_wire(self) -> dict[str, Json]:
+        """All four keys, always; `declaredApps` is null (nukorg/v1 declares no apps)."""
+        return {
+            "declaredHosts": self.declared_hosts,
+            "observedHosts": self.observed_hosts,
+            "declaredApps": self.declared_apps,
+            "observedApps": self.observed_apps,
+        }
+
+
+@dataclass(frozen=True)
+class Overview:
+    """The org-wide document `nuk status` prints."""
+
+    apps: list[AppOverview]
+    live_routing_available: bool
+    nuk_root: str
+    generated_at: str
+    errors: list[str]
+    converge: ConvergeStatus | None = None
+    hosts: list[Host] | None = None
+    soll_vs_ist: SollVsIst | None = None
+
+    def to_wire(self) -> dict[str, Json]:
+        """`converge`, `hosts` and `sollVsIst` are absent unless set (the last two: `--all`)."""
+        out: dict[str, Json] = {
+            "apps": [a.to_wire() for a in self.apps],
+            "liveRoutingAvailable": self.live_routing_available,
+            "nukRoot": self.nuk_root,
+            "generatedAt": self.generated_at,
+            "errors": [*self.errors],
+        }
+        if self.converge is not None:
+            out["converge"] = self.converge.to_wire()
+        if self.hosts is not None:
+            out["hosts"] = [h.model_dump(by_alias=True) for h in self.hosts]
+        if self.soll_vs_ist is not None:
+            out["sollVsIst"] = self.soll_vs_ist.to_wire()
+        return out
 
 
 # --- org capability manifest (nukorg/v1) --------------------------------------
