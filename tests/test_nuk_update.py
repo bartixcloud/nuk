@@ -63,3 +63,19 @@ def test_update_exits_without_latest(monkeypatch):
     monkeypatch.setattr(nuk, "latest_release_tag", lambda repo=nuk.NUK_REPO: None)
     with pytest.raises(SystemExit):
         nuk.cmd_update(to=None, check=False)
+
+
+def test_update_pins_the_install_to_the_running_shim_dir(monkeypatch):
+    """`uv tool install` must write its shim where the running `nuk` already is.
+
+    uv's default tool bin dir is `~/.local/bin`, off PATH, while the fleet units
+    run `/usr/local/bin/nuk converge` — so a bare update moves the shim and breaks
+    the timer (observed live on the three hosts). Pin UV_TOOL_BIN_DIR to the shim's
+    own directory so the command that invoked us stays correct.
+    """
+    monkeypatch.setattr(nuk, "latest_release_tag", lambda repo=nuk.NUK_REPO: "v9.9.9")
+    monkeypatch.setattr(nuk.shutil, "which", lambda _name: "/usr/local/bin/nuk")
+    calls: list[tuple] = []
+    monkeypatch.setattr(nuk, "sh", lambda *a, **k: calls.append((a, k)))
+    nuk.cmd_update(to=None, check=False)
+    assert calls[0][1]["env"]["UV_TOOL_BIN_DIR"] == "/usr/local/bin"
