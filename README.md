@@ -181,10 +181,31 @@ apply (wrap a compound command as `sh -c '…'`).
 
 nuk runs `docker compose … run --rm --no-deps <service> <command>`. It fails the
 deploy on a non-zero exit or timeout (the previous colour keeps serving), runs only
-when the **configured** image digest changes (the converge loop re-applies every
-cycle, and a plain `docker compose images` reports the previous release), and never
-runs on a rollback. **Migrations must be expand/contract** — the old colour serves
-while the migration runs.
+when the **configured** image of the migrate service changes (the converge loop
+re-applies every cycle, and a plain `docker compose images` reports the previous
+release), and never runs on a rollback. That image is resolved with the idle colour's
+profile enabled (`docker compose --profile <idle> config --format json`), so a
+backend-only bump re-runs the migration and an unchanged stack never does.
+**Migrations must be expand/contract** — the old colour serves while the migration
+runs.
+
+## Digest-pinned images
+
+A compose image may be pinned by digest (`ghcr.io/org/app/backend@sha256:…`, no tag),
+which makes an env-file bump the only release path. nuk supports it throughout:
+
+- **Migrate gate**: a digest ref is its own identity — no local image or daemon lookup
+  is needed; a tag ref still resolves through the daemon's `RepoDigests`.
+- **Provenance** (`imageDigest`, which `nuk rollback` needs): Compose reports an empty
+  tag for a digest-pinned container, so the digest is resolved by image ID. The row is
+  the deployment's primary service (the blue-green `health.service` in the active
+  colour, else the first ingress service), not whichever row Compose lists first.
+- **Blue-green rollback** (`nuk rollback <name>`, the colour flip) brings the previous
+  colour up with `--no-recreate`. When both colours share one image ref, a bumped ref
+  would otherwise make Compose recreate the kept previous container on the **new**
+  image and the rollback would serve the release it escapes. Set
+  `strategy.keepPrevious: true`: a drained colour has no container left to preserve and
+  is created from the current tree.
 
 ## Development
 

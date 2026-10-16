@@ -458,7 +458,7 @@ def test_blue_green_rollback_flips_the_router_back_and_brings_the_colour_up(
 
     ups = _profile_up(rolled)
     execs = [c for c in rolled if c[:2] == ("docker", "exec")]
-    assert ups == [("compose", "-p", "kolbe", "--profile", "blue", "up", "-d")]
+    assert ups == [("compose", "-p", "kolbe", "--profile", "blue", "up", "-d", "--no-recreate")]
     assert execs[0][:3] == ("docker", "exec", "kolbe-backend-blue-1")
     assert rolled.index(ups[0]) < rolled.index(execs[0])  # up precedes the health probe
     assert nuk.active_colour("kolbe") == "blue"
@@ -644,8 +644,41 @@ def test_blue_green_rollback_flips_back_even_when_keep_previous_kept_it(tmp_path
 
     nuk.cmd_rollback("kolbe", to=None, show=False)
 
-    assert _profile_up(rolled) == [("compose", "-p", "kolbe", "--profile", "blue", "up", "-d")]
+    assert _profile_up(rolled) == [
+        ("compose", "-p", "kolbe", "--profile", "blue", "up", "-d", "--no-recreate")
+    ]
     assert nuk.active_colour("kolbe") == "blue"
     router = yaml.safe_load((tmp_path / "dynamic" / "kolbe.yml").read_text(encoding="utf-8"))
     url = router["http"]["services"]["kolbe-0"]["loadBalancer"]["servers"][0]["url"]
     assert url == "http://kolbe-frontend-blue-1:80"
+
+
+def test_blue_green_rollback_never_recreates_the_previous_colour(tmp_path, monkeypatch):
+    """The flip must serve the kept container's image, not whatever the tree now configures.
+
+    When both colours share one image ref (env files set the same ref for both), a
+    bumped ref makes a plain `compose --profile <previous> up -d` RECREATE the kept
+    previous container on the NEW image — the rollback would then serve the very
+    release it was meant to escape. `--no-recreate` leaves an existing container
+    as it is (verified with `docker compose --dry-run`: Recreated vs Running).
+    """
+    deployments = tmp_path / "deploys"
+    (deployments / "kolbe").mkdir(parents=True)
+    (deployments / "kolbe" / "manifest.yml").write_text(
+        _blue_green_yml(keep_previous=True), encoding="utf-8"
+    )
+    monkeypatch.setattr(nuk, "RELEASES", tmp_path / "releases")
+    monkeypatch.setattr(nuk, "DEPLOYS", deployments)
+    (tmp_path / "dynamic").mkdir()
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "project_dir", lambda name: deployments / name)
+    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
+    monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["compose", "-p", "kolbe"])
+    nuk.record_active_colour("kolbe", "green")
+    rolled: list[tuple[str, ...]] = []
+    monkeypatch.setattr(nuk, "sh", lambda *cmd, **_k: rolled.append(cmd))
+
+    nuk.cmd_rollback("kolbe", to=None, show=False)
+
+    (up,) = _profile_up(rolled)
+    assert up[up.index("up") :] == ("up", "-d", "--no-recreate")
