@@ -2593,28 +2593,56 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
     return block, ctx
 
 
-def _cycle_delegations(
-    prepared: list[tuple[SourceEntry, TreeContext]],
-    refused: list[SourceEntry],
-    *,
-    state_dir: Path,
-    platform_present: bool,
-) -> dict[str, list[Delegation]]:
-    """Every owner's loans for this cycle, keyed by owner (spec §2/§4).
+class _UnknownAuthorizationError(NukError):
+    """The cycle's authorization set could not be built, so it must not apply (spec §4).
 
-    Only sources with `routes` in `apply` contribute (spec §2). A prepared owner lends
-    its `delegations.yml`; a REFUSED one lends its last VERIFIED cache instead, so a
-    foreign fetch failure cannot pull a lent name away (spec §4). Without a verified
-    platform tree there is no registry to authorize against, so no cache is read.
+    Raised when a refused owner's last-verified cache is unreadable: the loan set is
+    unknown, so silently dropping it would let lent names vanish. The cycle records the
+    failure and does not run the apply pass.
+    """
+
+
+def _load_prepared_delegations(
+    prepared: list[tuple[SourceEntry, TreeContext]],
+    *,
+    blocks: dict[str, dict],
+) -> tuple[dict[str, list[Delegation]], list[tuple[SourceEntry, TreeContext]]]:
+    """Load each routable prepared owner's `delegations.yml`, refusing a malformed one (spec §2).
+
+    Only sources with `routes` in `apply` contribute (spec §2). A malformed manifest is
+    attributable, so it refuses THAT source alone: its loans are never added to the returned
+    map, it drops out of the caller's authorization set, and the rest of the fleet proceeds.
+
+    Returns:
+        The owner loans loaded so far and the prepared sources still in play.
     """
     delegations: dict[str, list[Delegation]] = {}
+    keep: list[tuple[SourceEntry, TreeContext]] = []
     for src, ctx in prepared:
-        if ctx.tenant is not None and "routes" in src.apply:
+        if ctx.tenant is None or "routes" not in src.apply:
+            keep.append((src, ctx))
+            continue
+        try:
             delegations[ctx.tenant] = load_delegations(ctx.tree)
-    for src in refused:
-        if not src.is_platform and "routes" in src.apply and platform_present:
-            delegations[src.name] = load_cached_delegations(state_dir, src.name)
-    return delegations
+        except _SOURCE_FAILURES as e:
+            _refuse(src, blocks[src.name], e)
+            continue
+        keep.append((src, ctx))
+    return delegations, keep
+
+
+def _cached_delegations(state_dir: Path, owner: str) -> list[Delegation]:
+    """`owner`'s last-verified loans; a corrupt cache is a recorded cycle failure (spec §4).
+
+    A refused owner lends its cache so a foreign fetch failure cannot pull a lent name away.
+    If that cache is unreadable the loan set is UNKNOWN — dropping it would silently withdraw
+    lent names — so this raises `_UnknownAuthorizationError` (carrying the reason) for the caller
+    to record, rather than degrading to an empty loan set.
+    """
+    try:
+        return load_cached_delegations(state_dir, owner)
+    except NukError as e:
+        raise _UnknownAuthorizationError(_exit_reason(e, "cached delegations unreadable")) from e
 
 
 def _refuse_bad_declarations(
@@ -2680,23 +2708,30 @@ def _host_auth(
 
     Validation is per source (`_refuse_bad_declarations`): a violation refuses THAT source
     — its loans are dropped and the rest of the fleet proceeds — instead of aborting the
-    whole cycle (spec §2).
+    whole cycle (spec §2). A malformed `delegations.yml` refuses its source the same way
+    (`_load_prepared_delegations`); only an unreadable cache for a refused owner — which
+    would make the loan set unknown — raises `_UnknownAuthorizationError` for the caller.
 
     Returns:
         The authorization and the prepared sources that survived validation (the ones the
         caller may apply). A validation-refused source's block is filled via `_refuse`.
         Only surviving, routable owners have their verified state written back to the cache.
+
+    Raises:
+        _UnknownAuthorizationError: When a refused owner's cached loans cannot be read (spec §4).
     """
     registry = platform_ctx.tenants if platform_ctx is not None else None
     if registry is None:
         registry = TenantRegistry(tenants=[])
-    delegations = _cycle_delegations(
-        prepared,
-        refused,
-        state_dir=state_dir,
-        platform_present=platform_ctx is not None,
+    delegations, prepared_ok = _load_prepared_delegations(prepared, blocks=blocks)
+    for src in refused:
+        # Without a verified platform tree there is no registry to authorize against, so
+        # the cache would add nothing but a spurious "not in the registry" refusal.
+        if not src.is_platform and "routes" in src.apply and platform_ctx is not None:
+            delegations[src.name] = _cached_delegations(state_dir, src.name)
+    surviving = _refuse_bad_declarations(
+        prepared_ok, refused, registry, delegations, blocks=blocks
     )
-    surviving = _refuse_bad_declarations(prepared, refused, registry, delegations, blocks=blocks)
     for src, ctx in surviving:
         if ctx.tenant is not None and "routes" in src.apply:
             store_delegations(state_dir, ctx.tenant, delegations[ctx.tenant])
@@ -2722,7 +2757,7 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
     self_ip: str | None,
     signers_dir: Path,
     state_dir: Path,
-) -> tuple[list[str], dict | None, bool]:
+) -> tuple[list[str], dict | None, bool, str | None]:
     """Converge every source, platform first; fill `blocks`.
 
     Two passes: first PREPARE every source (fetch/verify/archive) and keep its context, so
@@ -2730,11 +2765,14 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
     render; then build the host authorization (spec §3) and APPLY each prepared source
     against it. A delegation declared by a later source is therefore effective in the same
     cycle (spec §3.5). Building the authorization also validates each source's declarations
-    and refuses the offending source alone — a bad loan never halts the fleet, but the
-    cycle still ends not clean (spec §2).
+    and refuses the offending source alone — a bad loan or malformed manifest never halts
+    the fleet, but the cycle still ends not clean (spec §2). An unreadable cache for a
+    refused owner instead makes the authorization set unknown: the apply pass is skipped
+    and the failure is returned so the caller records it (spec §4).
 
     Returns:
-        (orphan warnings, logging status, whether every source converged).
+        (orphan warnings, logging status, whether every source converged, cycle-level error
+        — non-None only when the authorization set could not be built).
     """
     with tempfile.TemporaryDirectory(dir=state_dir, prefix="run.") as scratch:
         prepared: list[tuple[SourceEntry, TreeContext]] = []
@@ -2755,20 +2793,29 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
                 platform_ctx = ctx if src.is_platform else platform_ctx
             else:
                 refused.append(src)
-        auth, applied = _host_auth(
-            platform_ctx, prepared, state_dir=state_dir, refused=refused, blocks=blocks
-        )
-        for src, ctx in applied:
-            try:
-                _apply_source(src, ctx, blocks[src.name], state_dir, auth)
-            except _SOURCE_FAILURES as e:
-                _refuse(src, blocks[src.name], e)
+        auth: HostAuth | None = None
+        applied: list[tuple[SourceEntry, TreeContext]] = []
+        cycle_error: str | None = None
+        try:
+            auth, applied = _host_auth(
+                platform_ctx, prepared, state_dir=state_dir, refused=refused, blocks=blocks
+            )
+        except _UnknownAuthorizationError as e:
+            # The loan set is unknown; running the apply pass on it would be unsound.
+            cycle_error = _exit_reason(e, "authorization unavailable")
+            print(f"REFUSING cycle: {cycle_error}", file=sys.stderr)
+        if auth is not None:
+            for src, ctx in applied:
+                try:
+                    _apply_source(src, ctx, blocks[src.name], state_dir, auth)
+                except _SOURCE_FAILURES as e:
+                    _refuse(src, blocks[src.name], e)
         trees = [ctx.tree for _src, ctx in applied]
-        clean = all(b["result"] == "ok" for b in blocks.values())
+        clean = cycle_error is None and all(b["result"] == "ok" for b in blocks.values())
         # A refused source has no tree this cycle, so its apps would all read as orphans;
         # only a clean cycle can tell what is really undeclared.
         warnings = reap_report(*trees) if clean else []
-        return warnings, _logging_status(role, platform_ctx), clean
+        return warnings, _logging_status(role, platform_ctx), clean, cycle_error
 
 
 def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> int:
@@ -2801,7 +2848,7 @@ def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> i
             print(f"REFUSING: {error}", file=sys.stderr)
         try:
             if sources:
-                warnings, logging_status, clean = _run_cycle(
+                warnings, logging_status, clean, cycle_error = _run_cycle(
                     sources,
                     blocks,
                     role=role,
@@ -2810,6 +2857,7 @@ def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> i
                     state_dir=state_dir,
                 )
                 code = 0 if clean else 1
+                error = cycle_error or error
         finally:
             write_converge_status(
                 state_dir / "converge-status.json",

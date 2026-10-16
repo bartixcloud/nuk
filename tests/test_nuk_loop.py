@@ -661,11 +661,51 @@ def test_a_bad_delegation_refuses_only_the_offending_source(
     assert sources["kolbeapp-de"]["result"] == "ok"
 
 
-def test_a_corrupt_delegation_cache_refuses_the_cycle(tmp_path, monkeypatch, signing_keys):
-    """A corrupt last-verified cache is a cycle refusal (spec §4).
+def test_a_malformed_delegations_manifest_refuses_only_its_source(
+    tmp_path, monkeypatch, signing_keys
+):
+    """A malformed `delegations.yml` refuses THAT source, not the whole fleet (spec §2).
 
-    Lent names must never silently vanish: when the cached state cannot be read, the loop
-    fails loudly instead of rendering as if the owner had lent nothing.
+    Like any other manifest failure, it is attributable: astrojones's block is refused with
+    the parse error, its loans are never honoured, the platform and the other tenant still
+    apply, and the cycle is not clean.
+    """
+    monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "HOST_ENV", tmp_path / "no-host-env")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("edge", "10.0.10.241"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
+    platform = {nuk.DEFAULT_ORG_FILE: ORG, "tenants.yml": ZONE_TENANTS}
+    f = Fleet(tmp_path, platform, signing_keys)
+    f.origins["kolbeapp-de"].release("v1.0.0", {"deployments/kolbe.yml": KOLBE})
+    f.origins["astrojones"].release("v1.1.0", {nuk.DELEGATIONS_FILE: "kind: Delegations\n"})
+    f.use(
+        ("bartixcloud", ["facilities"]),
+        ("kolbeapp-de", ["deployments", "routes"]),
+        ("astrojones", ["deployments", "routes"]),
+    )
+    assert f.converge() == 1
+    sources = f.status()["sources"]
+    assert sources["astrojones"]["result"] == "refused"
+    assert "invalid delegations manifest" in sources["astrojones"]["error"]
+    # The rest of the fleet is not dragged down with the offender.
+    assert sources["bartixcloud"]["result"] == "ok"
+    assert sources["kolbeapp-de"]["result"] == "ok"
+    # The bad source's loans are not honoured: kolbe resolves to its owner, not the target.
+    assert sources["kolbeapp-de"]["refusedRoutes"] == [
+        "REFUSED route kolbe.astrojones.guru: owned/delegated by astrojones"
+    ]
+    assert not (nuk.DYNAMIC / "kolbe.yml").exists()
+
+
+def test_a_corrupt_delegation_cache_is_a_recorded_cycle_failure(
+    tmp_path, monkeypatch, signing_keys
+):
+    """A corrupt last-verified cache is a recorded cycle failure, never a silent success (spec §4).
+
+    Lent names must never silently vanish: when the owner's cached state cannot be read, the
+    authorization set is unknowable, so the cycle ends not-clean with the error in the status
+    file and the apply pass does not run — rather than rendering as if the owner lent nothing.
     """
     monkeypatch.setattr(nuk, "DYNAMIC", tmp_path / "dynamic")
     monkeypatch.setattr(nuk, "DEPLOYS", tmp_path / "deploys")
@@ -682,13 +722,21 @@ def test_a_corrupt_delegation_cache_refuses_the_cycle(tmp_path, monkeypatch, sig
         ("astrojones", ["deployments", "routes"]),
     )
     assert f.converge() == 0  # first cycle caches astrojones's verified loans
+    assert (nuk.DYNAMIC / "kolbe.yml").is_file()
 
     shutil.rmtree(f.origins["astrojones"].bare)  # the owner is unreachable now
     cache = nuk.source_state_dir(f.state, "astrojones") / nuk.DELEGATIONS_CACHE_FILE
     cache.write_text("{ not json", encoding="utf-8")
+    (nuk.DYNAMIC / "kolbe.yml").unlink()
 
-    with pytest.raises(SystemExit, match="invalid cached delegations"):
-        f.converge()
+    assert f.converge() == 1  # not clean…
+    status = f.status()
+    assert status["error"] is not None  # …and the failure is recorded, not silent
+    assert "invalid cached delegations" in status["error"]
+    assert status["sources"]["astrojones"]["result"] == "refused"
+    # The apply pass did not run on an unknown authorization set.
+    assert status["sources"]["kolbeapp-de"]["rendered"] == []
+    assert not (nuk.DYNAMIC / "kolbe.yml").exists()
 
 
 # --- reap -------------------------------------------------------------------------------
