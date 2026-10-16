@@ -48,3 +48,10 @@ def test_load_parses_migrate(tmp_path):
 def test_load_without_migrate_is_none(tmp_path):
     dep = nuk.load(_write(tmp_path, NO_MIGRATE_YML))
     assert dep.spec.migrate is None
+
+
+def test_migrated_digest_defaults_none_and_round_trips(tmp_path, monkeypatch):
+    monkeypatch.setattr(nuk, "project_dir", lambda name: tmp_path / "proj" / name)
+    assert nuk.migrated_digest("kolbe") is None
+    nuk.record_migrated_digest("kolbe", "sha256:deadbeef")
+    assert nuk.migrated_digest("kolbe") == "sha256:deadbeef"

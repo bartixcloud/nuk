@@ -901,6 +901,26 @@ def record_active_colour(name: str, colour: str) -> None:
     path.write_text(f"{colour}\n", encoding="utf-8")
 
 
+def _migrated_digest_file(name: str) -> Path:
+    """The file recording the image digest the last migration ran against."""
+    return project_dir(name) / "migrated-digest"
+
+
+def migrated_digest(name: str) -> str | None:
+    """Return the digest the last migration ran against, or `None` if never run."""
+    try:
+        return _migrated_digest_file(name).read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def record_migrated_digest(name: str, digest: str) -> None:
+    """Persist `digest` as the image digest the last migration ran against."""
+    path = _migrated_digest_file(name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"{digest}\n", encoding="utf-8")
+
+
 def _router_dialect_file(name: str) -> Path:
     """The file recording an app's deployed router dialect."""
     return project_dir(name) / "router-dialect"
