@@ -331,13 +331,13 @@ def test_deployment_apply_is_not_gated_by_privilege(tmp_path, monkeypatch):
 
 
 def test_is_privileged_true_for_root(monkeypatch):
-    monkeypatch.setattr(nuk.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(nuk.rollout.os, "geteuid", lambda: 0)
     assert nuk._is_privileged() is True
 
 
 def test_is_privileged_false_without_group(monkeypatch):
-    monkeypatch.setattr(nuk.os, "geteuid", lambda: 1000)
-    monkeypatch.setattr(nuk.os, "getgroups", lambda: [1000])
+    monkeypatch.setattr(nuk.rollout.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(nuk.rollout.os, "getgroups", lambda: [1000])
     monkeypatch.setattr(nuk.rollout.grp, "getgrnam", _raise_keyerror)
     assert nuk._is_privileged() is False
 

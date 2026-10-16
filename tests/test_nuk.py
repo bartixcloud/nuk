@@ -974,7 +974,7 @@ def test_version_flag_prints_version_and_exits_zero(capsys, monkeypatch):
     works on any machine.
     """
     assert isinstance(nuk.__version__, str) and nuk.__version__
-    monkeypatch.setattr(nuk.sys, "argv", ["nuk", "--version"])
+    monkeypatch.setattr(nuk.cli.sys, "argv", ["nuk", "--version"])
     with pytest.raises(SystemExit) as exc:
         nuk.main()
     assert exc.value.code == 0

@@ -11,6 +11,7 @@ import shutil
 import subprocess  # noqa: S404
 import sys
 from dataclasses import replace
+from pathlib import Path  # noqa: TC003
 
 import typer
 import yaml
@@ -66,7 +67,7 @@ def _same_repo(left: str | None, right: str | None) -> bool:
 
 
 def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline; splitting it would scatter the reconcile order
-    manifest_path: nuk.Path,
+    manifest_path: Path,
     repo_path: str | None,
     *,
     ctx: nuk.TreeContext | None = None,
@@ -76,7 +77,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
     """Create or update a deployment from a manifest.
 
     Args:
-        manifest_path: nuk.Path to the nuk/v1 manifest.
+        manifest_path: Path to the nuk/v1 manifest.
         repo_path: Local checkout to mirror instead of cloning spec.source.repo.
         ctx: The converge loop's prepared context; a hand-run apply builds its own
             from the manifest's tree and this host's identity.
@@ -166,7 +167,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             "--delete",
             "--exclude",
             ".git",
-            f"{nuk.Path(repo_path).resolve()}/",
+            f"{Path(repo_path).resolve()}/",
             str(repo) + "/",
         )
     elif source.repo:
@@ -636,14 +637,14 @@ def cmd_status(name: str) -> None:
 
 
 def cmd_status_overview(
-    *, pretty: bool, show_all: bool, org_file: nuk.Path | None, probe: bool
+    *, pretty: bool, show_all: bool, org_file: Path | None, probe: bool
 ) -> None:
     """Print the org-wide status Overview as JSON (walks DEPLOYS/*/; see nuk.build_overview).
 
     Args:
         pretty: Indent the JSON for human scanning; compact (single-line) otherwise.
         show_all: Also emit the `--all` soll-vs-ist block (needs `org_file`).
-        org_file: nuk.Path to `nuklaut.org.yml`, required when `show_all` is set.
+        org_file: Path to `nuklaut.org.yml`, required when `show_all` is set.
         probe: Best-effort outbound HTTPS probe per ingress host (off by default).
     """
     overview = nuk.build_overview(probe_enabled=probe)
