@@ -9,29 +9,21 @@ state lives in /opt/nuklaut/, the convergence loop's state and release history i
 
 from __future__ import annotations
 
-import fcntl
-import io
-import json
 import os
 import re
 import shutil
 import subprocess  # noqa: S404  # all calls use fixed argv, no shell (see per-call S603/S607)
 import sys
-import tarfile
-import tempfile
 import time
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Self, cast
 
 import typer
 import yaml
-from pydantic import (
-    ValidationError,
-)
 
 from nuk import compose as compose
+from nuk import converge as converge
 from nuk import databases as databases
 from nuk import facility as facility
 from nuk import ingress as ingress
@@ -71,6 +63,87 @@ from nuk.compose import (
 )
 from nuk.compose import (
     write_override as write_override,
+)
+from nuk.converge import (
+    _apply_source as _apply_source,
+)
+from nuk.converge import (
+    _cached_delegations as _cached_delegations,
+)
+from nuk.converge import (
+    _converge_source as _converge_source,
+)
+from nuk.converge import (
+    _declared_names as _declared_names,
+)
+from nuk.converge import (
+    _deployment_tree as _deployment_tree,
+)
+from nuk.converge import (
+    _exit_reason as _exit_reason,
+)
+from nuk.converge import (
+    _host_auth as _host_auth,
+)
+from nuk.converge import (
+    _load_prepared_delegations as _load_prepared_delegations,
+)
+from nuk.converge import (
+    _logging_status as _logging_status,
+)
+from nuk.converge import (
+    _prepare_source as _prepare_source,
+)
+from nuk.converge import (
+    _provided_capabilities as _provided_capabilities,
+)
+from nuk.converge import (
+    _refuse as _refuse,
+)
+from nuk.converge import (
+    _refuse_bad_declarations as _refuse_bad_declarations,
+)
+from nuk.converge import (
+    _render_routers as _render_routers,
+)
+from nuk.converge import (
+    _run_cycle as _run_cycle,
+)
+from nuk.converge import (
+    _UnknownAuthorizationError as _UnknownAuthorizationError,
+)
+from nuk.converge import (
+    apply_tree as apply_tree,
+)
+from nuk.converge import (
+    archive_tree as archive_tree,
+)
+from nuk.converge import (
+    cmd_converge,
+)
+from nuk.converge import (
+    consumes as consumes,
+)
+from nuk.converge import (
+    converge_lock as converge_lock,
+)
+from nuk.converge import (
+    placement_matches as placement_matches,
+)
+from nuk.converge import (
+    provision_remote_databases as provision_remote_databases,
+)
+from nuk.converge import (
+    read_converge_status as read_converge_status,
+)
+from nuk.converge import (
+    reap_report as reap_report,
+)
+from nuk.converge import (
+    render_routes as render_routes,
+)
+from nuk.converge import (
+    write_converge_status as write_converge_status,
 )
 from nuk.databases import (
     _container_state as _container_state,
@@ -124,7 +197,7 @@ from nuk.databases import (
     preflight_data_stack as preflight_data_stack,
 )
 from nuk.databases import (
-    provision_databases,
+    provision_databases as provision_databases,
 )
 from nuk.databases import (
     purge_databases as purge_databases,
@@ -139,38 +212,64 @@ from nuk.facility import (
     APPLY_ALL as APPLY_ALL,
 )
 from nuk.facility import (
-    DEPLOYMENT_DIR,
-    FACILITY_DIR,
-    TreeContext,
-    _router_present,
-    env_facility,
-    facility_health,
-    load_deployments,
-    load_facilities,
-    route_vocabulary,
+    DEPLOYMENT_DIR as DEPLOYMENT_DIR,
+)
+from nuk.facility import (
+    FACILITY_DIR as FACILITY_DIR,
 )
 from nuk.facility import (
     ROUTER_PORT as ROUTER_PORT,
 )
 from nuk.facility import (
+    TreeContext as TreeContext,
+)
+from nuk.facility import (
+    _router_present as _router_present,
+)
+from nuk.facility import (
     _tree_root as _tree_root,
 )
+from nuk.facility import (
+    env_facility as env_facility,
+)
+from nuk.facility import (
+    facility_health as facility_health,
+)
+from nuk.facility import (
+    load_deployments as load_deployments,
+)
+from nuk.facility import (
+    load_facilities as load_facilities,
+)
+from nuk.facility import (
+    route_vocabulary as route_vocabulary,
+)
 from nuk.ingress import (
-    RouteResult,
-    _authorized_ingress,
-    _rule,
-    backend_address,
-    reap_legacy_worker_routers,
-    write_ingress,
+    RouteResult as RouteResult,
+)
+from nuk.ingress import (
+    _authorized_ingress as _authorized_ingress,
 )
 from nuk.ingress import (
     _refuse_route as _refuse_route,
 )
 from nuk.ingress import (
+    _rule,
+)
+from nuk.ingress import (
+    backend_address as backend_address,
+)
+from nuk.ingress import (
     build_override as build_override,
 )
 from nuk.ingress import (
+    reap_legacy_worker_routers as reap_legacy_worker_routers,
+)
+from nuk.ingress import (
     render_edge_routers as render_edge_routers,
+)
+from nuk.ingress import (
+    write_ingress as write_ingress,
 )
 from nuk.models import (
     _MANIFEST_ADAPTER as _MANIFEST_ADAPTER,
@@ -185,11 +284,7 @@ from nuk.models import (
     Databases as Databases,
 )
 from nuk.models import (
-    Deployment,
-    Facility,
-    Ingress,
-    Spec,
-    load,
+    Deployment as Deployment,
 )
 from nuk.models import (
     EnvFrom as EnvFrom,
@@ -198,10 +293,17 @@ from nuk.models import (
     EnvProvide as EnvProvide,
 )
 from nuk.models import (
+    Facility as Facility,
+)
+from nuk.models import (
     FacilitySpec as FacilitySpec,
 )
 from nuk.models import (
     Health as Health,
+)
+from nuk.models import (
+    Ingress,  # noqa: TC001
+    Spec,  # noqa: TC001
 )
 from nuk.models import (
     Metadata as Metadata,
@@ -234,21 +336,16 @@ from nuk.models import (
     StrategyHealth as StrategyHealth,
 )
 from nuk.models import (
+    ValidationError as ValidationError,  # noqa: TC001
+)
+from nuk.models import (
     _NullTolerant as _NullTolerant,
 )
+from nuk.models import (
+    load as load,
+)
 from nuk.org import (
-    _ENTRY_ROLES,
-    Delegation,
-    Host,
-    Org,
-    TenantRegistry,
-    check_cross_zone_patterns,
-    load_cached_delegations,
-    load_delegations,
-    load_org,
-    resolve_host_owner,
-    store_delegations,
-    validate_delegations,
+    _ENTRY_ROLES as _ENTRY_ROLES,
 )
 from nuk.org import (
     DELEGATIONS_CACHE_FILE as DELEGATIONS_CACHE_FILE,
@@ -260,13 +357,30 @@ from nuk.org import (
     TENANTS_FILE as TENANTS_FILE,
 )
 from nuk.org import (
+    Delegation,
+    Host,
+    Org,
+    TenantRegistry,
+    load_org,
+    resolve_host_owner,
+)
+from nuk.org import (
     Delegations as Delegations,
 )
 from nuk.org import (
     Facilities as Facilities,
 )
 from nuk.org import (
+    check_cross_zone_patterns as check_cross_zone_patterns,
+)
+from nuk.org import (
     host_in_domains as host_in_domains,
+)
+from nuk.org import (
+    load_cached_delegations as load_cached_delegations,
+)
+from nuk.org import (
+    load_delegations as load_delegations,
 )
 from nuk.org import (
     load_tenants as load_tenants,
@@ -276,6 +390,12 @@ from nuk.org import (
 )
 from nuk.org import (
     specificity as specificity,
+)
+from nuk.org import (
+    store_delegations as store_delegations,
+)
+from nuk.org import (
+    validate_delegations as validate_delegations,
 )
 from nuk.paths import (
     CONVERGE_STATE as CONVERGE_STATE,
@@ -328,16 +448,21 @@ from nuk.provenance import (
 from nuk.provenance import (
     write_provenance as write_provenance,
 )
+from nuk.records import ConvergeStatus  # noqa: TC001
 from nuk.records import (
-    ConvergeStatus,
-    Json,
-    LoggingStatus,
-    ManifestKind,
-    ManifestResult,
-    SourceBlock,
+    LoggingStatus as LoggingStatus,
+)
+from nuk.records import (
+    ManifestKind as ManifestKind,
 )
 from nuk.records import (
     ManifestOutcome as ManifestOutcome,
+)
+from nuk.records import (
+    ManifestResult as ManifestResult,
+)
+from nuk.records import (
+    SourceBlock as SourceBlock,
 )
 from nuk.rollout import (
     _FACILITY_GROUP as _FACILITY_GROUP,
@@ -400,11 +525,7 @@ from nuk.sources import (
     SOURCE_BRANCH as SOURCE_BRANCH,
 )
 from nuk.sources import (
-    SourceEntry,
-    load_sources,
-    record_applied,
-    source_state_dir,
-    sync_source,
+    SourceEntry as SourceEntry,
 )
 from nuk.sources import (
     SourcesFile as SourcesFile,
@@ -416,7 +537,19 @@ from nuk.sources import (
     git_ssh_command as git_ssh_command,
 )
 from nuk.sources import (
+    load_sources as load_sources,
+)
+from nuk.sources import (
+    record_applied as record_applied,
+)
+from nuk.sources import (
     resolve_signed_tag as resolve_signed_tag,
+)
+from nuk.sources import (
+    source_state_dir as source_state_dir,
+)
+from nuk.sources import (
+    sync_source as sync_source,
 )
 from nuk.sources import (
     verify_tag as verify_tag,
@@ -464,19 +597,10 @@ from nuk.status import (
     build_overview as build_overview,
 )
 from nuk.util import (
-    NukError,
-    _atomic_write,
-    _int_or_none,
-    _iso_utc_now,
-    _read_env_file,
-    _read_json_safe,
-    _read_yaml_safe,
-    _str_or_none,
-    die,
-    git_origin,
-    norm_ver,
-    origin_org,
-    sh,
+    NukError as NukError,
+)
+from nuk.util import (
+    _atomic_write as _atomic_write,
 )
 from nuk.util import (
     _chown_deploy as _chown_deploy,
@@ -491,7 +615,26 @@ from nuk.util import (
     _git_try as _git_try,
 )
 from nuk.util import (
+    _int_or_none,
+    _read_env_file,
+    _str_or_none,
+    die,
+    git_origin,
+    norm_ver,
+    origin_org,
+    sh,
+)
+from nuk.util import (
     _is_ancestor as _is_ancestor,
+)
+from nuk.util import (
+    _iso_utc_now as _iso_utc_now,
+)
+from nuk.util import (
+    _read_json_safe as _read_json_safe,
+)
+from nuk.util import (
+    _read_yaml_safe as _read_yaml_safe,
 )
 from nuk.util import (
     _safe_ident as _safe_ident,
@@ -504,7 +647,11 @@ from nuk.util import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Generator, Mapping
+    from collections.abc import Callable, Mapping
+
+    from nuk.records import (
+        Json,
+    )
 
 __version__ = "2.6.1"  # bumped on release by .github/workflows/release.yml
 
@@ -1337,937 +1484,6 @@ def read_tenant() -> str | None:
     except OSError:
         env = {}
     return env.get("TENANT") or None
-
-
-# --- the convergence loop ------------------------------------------------------
-# One per host, started by the poke (seconds) and by a 6-12 h liveness floor. The
-# floor is a LIVENESS GUARANTEE, not a control loop: without it a single lost poke
-# — host down during a deploy, service crash, network blip — leaves a host
-# silently stale forever (spec §7.2).
-
-
-@contextmanager
-def converge_lock(state_dir: Path) -> Generator[bool]:
-    """Hold the whole-cycle lock, yielding False if another run already holds it.
-
-    Non-blocking, and contention is exit 0: a skipped cycle is harmless because
-    the next poke or floor picks it up, while a blocking wait would pile up
-    systemd jobs. A hand-run `nuk apply` mid-cycle is exactly the race this
-    closes — enabling a timer fires its service immediately, which collided with
-    a hand-run cycle during layer-1 verification (spec §7 step 1).
-    """
-    state_dir.mkdir(parents=True, exist_ok=True)
-    fd = os.open(state_dir / ".lock", os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            yield False
-            return
-        yield True
-    finally:
-        os.close(fd)
-
-
-def archive_tree(repo: Path, commit: str, dest: Path) -> None:
-    """Extract `commit` into `dest` — never the live worktree.
-
-    The worktree can carry uncommitted edits mid-session; applying WIP against
-    real state on an unattended timer is a landmine (spec §7 step 4). Extraction
-    uses tarfile's `data` filter: a tenant repo is untrusted input to a root
-    process, and a symlink or `..` member that leaves `dest` must not be created.
-
-    Raises:
-        ValueError: If the archive holds a member the `data` filter refuses.
-    """
-    dest.mkdir(parents=True, exist_ok=True)
-    archive = subprocess.run(  # noqa: S603  # fixed argv, no shell
-        ["git", "-C", str(repo), "archive", commit],  # noqa: S607  # git on PATH
-        check=True,
-        capture_output=True,
-    )
-    try:
-        with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as tar:
-            tar.extractall(dest, filter="data")
-    except tarfile.TarError as e:
-        msg = f"unsafe archive member: {e}"
-        raise ValueError(msg) from None
-
-
-def _provided_capabilities(manifest: Facility) -> set[str]:
-    """The capabilities a Facility hands out (its `provides` block)."""
-    provides = manifest.spec.provides
-    return {p.capability for p in (provides.route, provides.env) if p is not None}
-
-
-def provision_remote_databases(
-    tree: Path,
-    role: str,
-    facilities: list[Facility],
-    *,
-    self_ip: str | None = None,
-    org: Org | None = None,
-) -> list[ManifestResult]:
-    """Provision every deployment's databases on this host IF it owns the capability.
-
-    The placement-gate exception (spec §3.1): a deployment placed `app` is a
-    no-op on the `data` host for containers and ingress, but its `spec.databases`
-    fragment must still be provisioned HERE — this is the only host with a local
-    `nuk-postgres`. Scoped to provisioning: nothing else about the manifest runs.
-
-    Deterministic derivation makes this loop-stable: the same seed yields the
-    same password, so re-running converges to a no-op rather than rotating.
-    """
-    provider = env_facility(facilities, _DATABASES_CAPABILITY)
-    if provider is None or not placement_matches(provider, role, self_ip=self_ip, org=org):
-        return []
-    out: list[ManifestResult] = []
-    for path in sorted((tree / DEPLOYMENT_DIR).glob("*.yml")):
-        try:
-            manifest = load(path)
-        except SystemExit as e:
-            out.append(
-                ManifestResult(path.name, "Database", "failed", _exit_reason(e, "load failed"))
-            )
-            continue
-        if manifest.kind != "Deployment":
-            continue
-        dbs = manifest.spec.databases
-        if not (dbs.wants_postgres or dbs.wants_redis):
-            continue
-        name = manifest.metadata.name
-        try:
-            # remote_ip=None → the LOCAL data stack is provisioned, on this host.
-            provision_databases(name, dbs, facilities, remote_ip=None)
-        except (SystemExit, subprocess.CalledProcessError) as e:
-            # One app's provisioning failure must not abort the cycle (spec §7.5):
-            # `_psql` uses check=True, so a SQL failure (disk full, role/db
-            # conflict, container hiccup) surfaces as CalledProcessError, not
-            # SystemExit. The data host still writes converge-status.json.
-            error = (
-                _exit_reason(e, "provision failed")
-                if isinstance(e, SystemExit)
-                else f"provision failed: {e}"
-            )
-            out.append(ManifestResult(name, "Database", "failed", error))
-            continue
-        out.append(ManifestResult(name, "Database"))
-    return out
-
-
-def _exit_reason(e: SystemExit, default: str) -> str:
-    """The message a SystemExit carried, or `default` for a bare exit."""
-    return str(e.code) if e.code else default
-
-
-def _deployment_tree(ctx: TreeContext, manifest: Deployment, path: Path) -> Path:
-    """The tree one Deployment applies from (Task 11).
-
-    `spec.source.unsigned` opts a non-prod deployment into the branch head, so it
-    applies from `ctx.trees["branch"]`; every other deployment keeps the signed tag
-    tree (`ctx.tree`). A hand-run apply carries only a tag tree, so a missing branch
-    key falls back to `path` rather than raising.
-    """
-    if not manifest.spec.source.unsigned:
-        return path
-    branch = ctx.trees.get("branch")
-    if branch is None:
-        return path
-    return branch / path.relative_to(ctx.tree)
-
-
-def apply_tree(ctx: TreeContext) -> list[ManifestResult]:  # noqa: C901  # placement ambiguity is recorded per manifest, not raised out of the loop
-    """Apply this host's Facilities, then its Deployments (spec §7 steps 6-7).
-
-    Facilities first within a cycle (§7.1): effect VOCABULARY is git-derived and
-    always resolvable regardless of order, but facility HEALTH needs the facility
-    up, and that is same-host. Cross-host ordering is eventual and covered by
-    `maintenance-errors@file`.
-
-    One failing manifest never stops the rest (§7.5). `cmd_apply` and `load` both
-    signal failure with SystemExit, so each manifest is isolated and its message
-    recorded for the status file — a malformed manifest must not take down the
-    cycle for every other manifest on the host.
-
-    A facility that fails this cycle POISONS the capabilities it declares:
-    a Deployment whose static `consumes()` (§5.3) intersects them is recorded
-    "refused" and never applied (§7.5: "Deployments consuming it refuse"). A
-    facility placed on another host is skipped before it can fail, and this host
-    cannot verify another host's liveness (§13) — only same-host failures refuse.
-
-    Only the kinds named in `ctx.apply` run: a tenant source's `facilities/` is
-    never looked at, whatever it contains.
-
-    Args:
-        ctx: The source's tree, this host's identity and what the source may change.
-
-    Returns:
-        One ManifestResult per manifest this host owns, facilities first, each
-        directory in filename order. `result` is "ok", "failed", or "refused".
-    """
-    tree, role = ctx.tree, ctx.role
-    results: list[ManifestResult] = []
-    failed_caps: set[str] = set()
-    kinds: tuple[tuple[ManifestKind, str], ...] = (
-        ("Facility", FACILITY_DIR),
-        ("Deployment", DEPLOYMENT_DIR),
-    )
-    for kind, directory in kinds:
-        if directory not in ctx.apply:
-            continue
-        for path in sorted((tree / directory).glob("*.yml")):
-            try:
-                manifest = load(path)
-            except SystemExit as e:
-                results.append(
-                    ManifestResult(path.name, kind, "failed", _exit_reason(e, "load failed"))
-                )
-                continue
-            if manifest.kind != kind:
-                continue
-            try:
-                matches = placement_matches(manifest, role, self_ip=ctx.self_ip, org=ctx.org)
-            except ValueError as e:
-                results.append(ManifestResult(manifest.metadata.name, kind, "failed", str(e)))
-                continue
-            if not matches:
-                continue
-            apply_path = path
-            if isinstance(manifest, Deployment):
-                poisoned = consumes(manifest) & failed_caps
-                if poisoned:
-                    reason = (
-                        f"consumes {sorted(poisoned)} from a facility that "
-                        f"failed its health gate this cycle (spec §7.5)"
-                    )
-                    results.append(ManifestResult(manifest.metadata.name, kind, "refused", reason))
-                    continue
-                apply_path = _deployment_tree(ctx, manifest, path)
-            # A signed (non-unsigned) deployment must BUILD the signed tag, not the
-            # branch head its clone would otherwise follow: pin the clone to the
-            # tag commit. An unsigned deployment stays on the branch head. A context
-            # without a recorded tag commit (hand-run `for_path`, or Task 10's
-            # `build()` asymmetry with `commits={}`) degrades to today's behaviour —
-            # no pin — rather than raising. (`cmd_apply` refuses a TENANT deployment
-            # whose payload repo is not the source's own, so this pin always has the
-            # commit it names: a tenant ships its payload in its own repo or in the
-            # tree.)
-            pin_commit = (
-                ctx.commits.get("tag")
-                if isinstance(manifest, Deployment) and not manifest.spec.source.unsigned
-                else None
-            )
-            try:
-                cmd_apply(apply_path, None, ctx=ctx, pin_commit=pin_commit)
-            except (SystemExit, ValueError, subprocess.CalledProcessError, OSError) as e:
-                error = _exit_reason(e, "apply failed") if isinstance(e, SystemExit) else str(e)
-                results.append(ManifestResult(manifest.metadata.name, kind, "failed", error))
-                if isinstance(manifest, Facility):
-                    failed_caps |= _provided_capabilities(manifest)
-                continue
-            results.append(ManifestResult(manifest.metadata.name, kind))
-    # The placement exception (spec §3.1) runs in addition to the filter above: a
-    # `{placement: app}` deployment is a container/ingress no-op here but its
-    # `spec.databases` fragment is still this host's job when it owns the
-    # facility. A deployment the loop already produced (applied, refused, failed)
-    # was provisioned by `cmd_apply` itself — the sweep must not double it.
-    handled = {r.name for r in results if r.kind == "Deployment"}
-    results.extend(
-        r
-        for r in provision_remote_databases(
-            tree, role, ctx.facilities, self_ip=ctx.self_ip, org=ctx.org
-        )
-        if r.name not in handled
-    )
-    return results
-
-
-def _declared_names(tree: Path) -> set[str]:
-    """`metadata.name` of every manifest file under `tree`, tolerating unreadable ones."""
-    names: set[str] = set()
-    for directory in (FACILITY_DIR, DEPLOYMENT_DIR):
-        for path in (tree / directory).glob("*.yml"):
-            raw = _read_yaml_safe(path)
-            meta = raw.get("metadata") if isinstance(raw, dict) else None
-            if isinstance(meta, dict) and meta.get("name"):
-                names.add(str(meta["name"]))
-    return names
-
-
-def reap_report(*trees: Path) -> list[str]:
-    """Names deployed on this host but declared by none of `trees` (spec §7.4).
-
-    Reports; never deletes. Auto-prune would make an accidental `git rm hello.yml`
-    an outage, while an orphan stays visible via `nuk status` and `drift.sh` and
-    is recoverable — a pruned production app is not.
-
-    Facilities count as declared: a facility's project dir sits in DEPLOYS beside
-    the deployments, and calling it an orphan would warn on every cycle. Pass every
-    source's tree of the cycle — a host runs the platform's facilities AND its own
-    tenant's deployments.
-    """
-    if not paths.DEPLOYS.is_dir():
-        return []
-    declared: set[str] = set()
-    for tree in trees:
-        declared |= _declared_names(tree)
-    return sorted(p.name for p in paths.DEPLOYS.iterdir() if p.is_dir() and p.name not in declared)
-
-
-def write_converge_status(  # noqa: PLR0913  # one status field per keyword; a dataclass buys nothing here
-    path: Path,
-    *,
-    role: str,
-    tenant: str | None,
-    sources: dict[str, SourceBlock],
-    warnings: list[str],
-    logging: LoggingStatus | None = None,
-    error: str | None = None,
-) -> None:
-    """Record the cycle's outcome (spec §7.6, contracts C3).
-
-    `sources` maps each source name to its block. `logging` is the LOGGING pipeline's own health —
-    info-only (spec §14.3): recorded, never a per-manifest result, never a failure
-    condition; absent for non-edge cycles. `error` is set when the cycle could not even
-    start (an unreadable sources.yml), so a failure is still a status, not silence.
-
-    Consumed by `drift.sh` and by `nuk status`.
-    """
-    status = ConvergeStatus(
-        role=role,
-        tenant=tenant,
-        applied_at=_iso_utc_now(),
-        reap_warnings=warnings,
-        sources=sources,
-        logging=logging,
-        error=error,
-    )
-    _atomic_write(path, json.dumps(status.to_wire(), indent=2) + "\n")
-
-
-def read_converge_status(path: Path = paths.CONVERGE_STATUS) -> ConvergeStatus | None:
-    """The last recorded cycle, or None if absent/unreadable/malformed."""
-    return ConvergeStatus.from_wire(_read_json_safe(path))
-
-
-_SOURCE_FAILURES = (ValueError, SystemExit, subprocess.CalledProcessError, OSError)
-
-
-def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are all read, none derived
-    src: SourceEntry,
-    block: SourceBlock,
-    *,
-    role: str,
-    self_ip: str | None,
-    signers_dir: Path,
-    state_dir: Path,
-    scratch: Path,
-    platform: Path | None,
-) -> TreeContext:
-    """Sync, verify and archive one source and build its context; fill tag/commit in `block`.
-
-    Both refs are archived: the signed tag's tree under `tag` and the branch head's
-    under `branch`. `ctx.tree` remains the tag tree (what a signed deployment
-    applies); Task 11's per-deployment selection reads `ctx.trees`. Only the tag
-    path is downgrade-guarded (`sync_source`).
-
-    Raises:
-        ValueError: With the refusal reason (also CalledProcessError/OSError/SystemExit from
-            the git and manifest layers — `_SOURCE_FAILURES`).
-    """
-    if not src.is_platform and platform is None:
-        msg = (
-            "the platform source did not verify this cycle — no facilities or org to apply against"
-        )
-        raise ValueError(msg)
-    tag, tag_sha, branch_sha = sync_source(src, signers_dir, state_dir)
-    block.tag, block.commit = tag, tag_sha
-    print(f"target: {src.name} {tag} ({tag_sha[:12]}) role={role}")
-    repo = source_state_dir(state_dir, src.name) / "repo"
-    tag_tree = scratch / src.name / "tag"
-    branch_tree = scratch / src.name / "branch"
-    archive_tree(repo, tag_sha, tag_tree)
-    archive_tree(repo, branch_sha, branch_tree)
-    tenant = None if src.is_platform else src.name
-    return TreeContext.build(
-        tag_tree,
-        role,
-        self_ip,
-        tenant,
-        frozenset(src.apply),
-        platform=platform,
-        trees={"tag": tag_tree, "branch": branch_tree},
-        commits={"tag": tag_sha, "branch": branch_sha},
-        source_repo=src.repo,
-    )
-
-
-def _apply_source(
-    src: SourceEntry, ctx: TreeContext, block: SourceBlock, state_dir: Path, auth: HostAuth
-) -> None:
-    """Apply a prepared source: manifests, then routes; record it applied only if all went well."""
-    block.manifests = apply_tree(ctx)
-    if "routes" in src.apply and ctx.role in _ENTRY_ROLES:
-        routes = render_routes(ctx, auth)
-        block.rendered = routes.rendered
-        block.refused_routes = routes.refused
-    # _prepare_source always sets both before a source reaches the apply pass.
-    assert block.tag is not None  # noqa: S101  # narrows the union for ty
-    assert block.commit is not None  # noqa: S101  # narrows the union for ty
-    record_applied(
-        block.tag, block.commit, source_state_dir(state_dir, src.name) / "last-applied-tag"
-    )
-
-
-def _refuse(src: SourceEntry, block: SourceBlock, e: BaseException) -> None:
-    block.result = "refused"
-    block.error = _exit_reason(e, "converge refused") if isinstance(e, SystemExit) else str(e)
-    print(f"REFUSING source {src.name}: {block.error}", file=sys.stderr)
-
-
-def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are all read, none derived
-    src: SourceEntry,
-    *,
-    role: str,
-    self_ip: str | None,
-    signers_dir: Path,
-    state_dir: Path,
-    scratch: Path,
-    platform: Path | None,
-) -> tuple[SourceBlock, TreeContext | None]:
-    """PREPARE one source (sync/verify/archive); never raises for a source-level failure.
-
-    The apply step moved to `_run_cycle`'s second pass so every source's tree is known
-    before any renders (a delegation must be honoured in the cycle it lands, spec §3.5).
-
-    Returns:
-        The source's status block, and its TreeContext once the tree is verified and archived
-        (None when that failed, or when the platform tree is incomplete) — the platform's
-        context is what tenant sources build on. `result` is "refused" on any failure here.
-    """
-    block = SourceBlock(apply=[str(a) for a in src.apply])
-    try:
-        ctx = _prepare_source(
-            src,
-            block,
-            role=role,
-            self_ip=self_ip,
-            signers_dir=signers_dir,
-            state_dir=state_dir,
-            scratch=scratch,
-            platform=platform,
-        )
-        if src.is_platform and ctx.org is None:
-            msg = (
-                f"the platform tree at {block.tag} lacks {DEFAULT_ORG_FILE} — "
-                f"backends and routes resolve from it and cannot be guessed"
-            )
-            raise ValueError(msg)  # noqa: TRY301  # same refusal path as every other failure here
-    except _SOURCE_FAILURES as e:
-        _refuse(src, block, e)
-        return block, None
-    return block, ctx
-
-
-class _UnknownAuthorizationError(NukError):
-    """The cycle's authorization set could not be built, so it must not apply (spec §4).
-
-    Raised when a refused owner's last-verified cache is unreadable: the loan set is
-    unknown, so silently dropping it would let lent names vanish. The cycle records the
-    failure and does not run the apply pass.
-    """
-
-
-def _load_prepared_delegations(
-    prepared: list[tuple[SourceEntry, TreeContext]],
-    *,
-    blocks: dict[str, SourceBlock],
-) -> tuple[dict[str, list[Delegation]], list[tuple[SourceEntry, TreeContext]]]:
-    """Load each routable prepared owner's `delegations.yml`, refusing a malformed one (spec §2).
-
-    Only sources with `routes` in `apply` contribute (spec §2). A malformed manifest is
-    attributable, so it refuses THAT source alone: its loans are never added to the returned
-    map, it drops out of the caller's authorization set, and the rest of the fleet proceeds.
-
-    Returns:
-        The owner loans loaded so far and the prepared sources still in play.
-    """
-    delegations: dict[str, list[Delegation]] = {}
-    keep: list[tuple[SourceEntry, TreeContext]] = []
-    for src, ctx in prepared:
-        if ctx.tenant is None or "routes" not in src.apply:
-            keep.append((src, ctx))
-            continue
-        try:
-            delegations[ctx.tenant] = load_delegations(ctx.tree)
-        except _SOURCE_FAILURES as e:
-            _refuse(src, blocks[src.name], e)
-            continue
-        keep.append((src, ctx))
-    return delegations, keep
-
-
-def _cached_delegations(state_dir: Path, owner: str) -> list[Delegation]:
-    """`owner`'s last-verified loans; a corrupt cache is a recorded cycle failure (spec §4).
-
-    A refused owner lends its cache so a foreign fetch failure cannot pull a lent name away.
-    If that cache is unreadable the loan set is UNKNOWN — dropping it would silently withdraw
-    lent names — so this raises `_UnknownAuthorizationError` (carrying the reason) for the caller
-    to record, rather than degrading to an empty loan set.
-    """
-    try:
-        return load_cached_delegations(state_dir, owner)
-    except NukError as e:
-        raise _UnknownAuthorizationError(_exit_reason(e, "cached delegations unreadable")) from e
-
-
-def _refuse_bad_declarations(
-    prepared: list[tuple[SourceEntry, TreeContext]],
-    refused: list[SourceEntry],
-    registry: TenantRegistry,
-    delegations: dict[str, list[Delegation]],
-    *,
-    blocks: dict[str, SourceBlock],
-) -> list[tuple[SourceEntry, TreeContext]]:
-    """Refuse each source whose declarations do not validate; return the survivors.
-
-    `validate_delegations` and `check_cross_zone_patterns` judge one tenant at a time, so
-    a violation refuses THAT source — its loans are dropped from `delegations` and the rest
-    of the fleet proceeds — instead of aborting the whole cycle (spec §2). A loan judged
-    against a bad declaration is therefore never honoured, so fail-closed holds. An
-    already-refused source whose cached loan is invalid is simply not honoured, never a
-    second refusal.
-    """
-    surviving: list[tuple[SourceEntry, TreeContext]] = []
-    for src, ctx in prepared:
-        if ctx.tenant is None:
-            surviving.append((src, ctx))
-            continue
-        dels = delegations.get(ctx.tenant, [])
-        try:
-            if dels:
-                validate_delegations(ctx.tenant, dels, registry)
-            check_cross_zone_patterns(ctx.tenant, registry, delegations)
-        except _SOURCE_FAILURES as e:
-            _refuse(src, blocks[src.name], e)
-            delegations.pop(ctx.tenant, None)
-            continue
-        surviving.append((src, ctx))
-    for src in refused:
-        if src.is_platform or "routes" not in src.apply:
-            continue
-        dels = delegations.get(src.name, [])
-        if not dels:
-            continue
-        try:
-            validate_delegations(src.name, dels, registry)
-        except _SOURCE_FAILURES:
-            delegations.pop(src.name, None)
-    return surviving
-
-
-def _host_auth(
-    platform_ctx: TreeContext | None,
-    prepared: list[tuple[SourceEntry, TreeContext]],
-    *,
-    state_dir: Path,
-    refused: list[SourceEntry],
-    blocks: dict[str, SourceBlock],
-) -> tuple[HostAuth, list[tuple[SourceEntry, TreeContext]]]:
-    """Build the cycle's host authorization from the registry and every owner's loans.
-
-    The registry is the platform tree's `tenants.yml`; without one no tenant owns
-    anything and every tenant render is refused (fail-closed, spec §3.4). Only sources
-    with `routes` in `apply` contribute loans (spec §2). Each such prepared tenant source
-    lends from its own `delegations.yml`; a REFUSED one instead lends its last VERIFIED
-    loans from the cache, so a foreign fetch failure cannot pull a lent name away (spec §4).
-
-    Validation is per source (`_refuse_bad_declarations`): a violation refuses THAT source
-    — its loans are dropped and the rest of the fleet proceeds — instead of aborting the
-    whole cycle (spec §2). A malformed `delegations.yml` refuses its source the same way
-    (`_load_prepared_delegations`); only an unreadable cache for a refused owner — which
-    would make the loan set unknown — raises `_UnknownAuthorizationError` for the caller.
-
-    Returns:
-        The authorization and the prepared sources that survived validation (the ones the
-        caller may apply). A validation-refused source's block is filled via `_refuse`.
-        Only surviving, routable owners have their verified state written back to the cache.
-
-    Raises:
-        _UnknownAuthorizationError: When a refused owner's cached loans cannot be read (spec §4).
-    """
-    registry = platform_ctx.tenants if platform_ctx is not None else None
-    if registry is None:
-        registry = TenantRegistry(tenants=[])
-    delegations, prepared_ok = _load_prepared_delegations(prepared, blocks=blocks)
-    for src in refused:
-        # Without a verified platform tree there is no registry to authorize against, so
-        # the cache would add nothing but a spurious "not in the registry" refusal.
-        if not src.is_platform and "routes" in src.apply and platform_ctx is not None:
-            delegations[src.name] = _cached_delegations(state_dir, src.name)
-    surviving = _refuse_bad_declarations(prepared_ok, refused, registry, delegations, blocks=blocks)
-    for src, ctx in surviving:
-        if ctx.tenant is not None and "routes" in src.apply:
-            store_delegations(state_dir, ctx.tenant, delegations[ctx.tenant])
-    return HostAuth(registry, delegations), surviving
-
-
-def _logging_status(role: str, platform_ctx: TreeContext | None) -> LoggingStatus | None:
-    """The LOGGING pipeline's own health (spec §14.3): info-only, edge cycles only."""
-    if role != "edge" or platform_ctx is None:
-        return None
-    facility = env_facility(platform_ctx.facilities, "logs")
-    if facility is None:
-        return None
-    reason = facility_health(facility)
-    return LoggingStatus(healthy=reason is None, detail=reason or "ok")
-
-
-def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
-    sources: list[SourceEntry],
-    blocks: dict[str, SourceBlock],
-    *,
-    role: str,
-    self_ip: str | None,
-    signers_dir: Path,
-    state_dir: Path,
-) -> tuple[list[str], LoggingStatus | None, bool, str | None]:
-    """Converge every source, platform first; fill `blocks`.
-
-    Two passes: first PREPARE every source (fetch/verify/archive) and keep its context, so
-    all of a cycle's trees — and thus every owner's delegations.yml — are known before any
-    render; then build the host authorization (spec §3) and APPLY each prepared source
-    against it. A delegation declared by a later source is therefore effective in the same
-    cycle (spec §3.5). Building the authorization also validates each source's declarations
-    and refuses the offending source alone — a bad loan or malformed manifest never halts
-    the fleet, but the cycle still ends not clean (spec §2). An unreadable cache for a
-    refused owner instead makes the authorization set unknown: the apply pass is skipped
-    and the failure is returned so the caller records it (spec §4).
-
-    Returns:
-        (orphan warnings, logging status, whether every source converged, cycle-level error
-        — non-None only when the authorization set could not be built).
-    """
-    with tempfile.TemporaryDirectory(dir=state_dir, prefix="run.") as scratch:
-        prepared: list[tuple[SourceEntry, TreeContext]] = []
-        refused: list[SourceEntry] = []
-        platform_ctx: TreeContext | None = None
-        for src in sources:
-            blocks[src.name], ctx = _converge_source(
-                src,
-                role=role,
-                self_ip=self_ip,
-                signers_dir=signers_dir,
-                state_dir=state_dir,
-                scratch=Path(scratch),
-                platform=platform_ctx.tree if platform_ctx else None,
-            )
-            if ctx is not None:
-                prepared.append((src, ctx))
-                platform_ctx = ctx if src.is_platform else platform_ctx
-            else:
-                refused.append(src)
-        auth: HostAuth | None = None
-        applied: list[tuple[SourceEntry, TreeContext]] = []
-        cycle_error: str | None = None
-        try:
-            auth, applied = _host_auth(
-                platform_ctx, prepared, state_dir=state_dir, refused=refused, blocks=blocks
-            )
-        except _UnknownAuthorizationError as e:
-            # The loan set is unknown; running the apply pass on it would be unsound.
-            cycle_error = _exit_reason(e, "authorization unavailable")
-            print(f"REFUSING cycle: {cycle_error}", file=sys.stderr)
-        if auth is not None:
-            for src, ctx in applied:
-                try:
-                    _apply_source(src, ctx, blocks[src.name], state_dir, auth)
-                except _SOURCE_FAILURES as e:
-                    _refuse(src, blocks[src.name], e)
-        trees = [ctx.tree for _src, ctx in applied]
-        clean = cycle_error is None and all(b.result == "ok" for b in blocks.values())
-        # A refused source has no tree this cycle, so its apps would all read as orphans;
-        # only a clean cycle can tell what is really undeclared.
-        warnings = reap_report(*trees) if clean else []
-        return warnings, _logging_status(role, platform_ctx), clean, cycle_error
-
-
-def cmd_converge(*, sources_file: Path, signers_dir: Path, state_dir: Path) -> int:
-    """Converge this host from every source in `sources_file` (contracts C3).
-
-    The platform source goes first. Each source is fetched with its own deploy key, verified
-    against its own signers file, downgrade-guarded and archived separately; one source
-    refusing never stops another — except that tenant sources build on the platform tree, so
-    they are refused (with that reason) when the platform source did not verify.
-    The status file is written on every exit path after the lock, including a failure.
-
-    Returns:
-        0 when every source converged or the lock was held; 1 when any source was refused.
-    """
-    with converge_lock(state_dir) as acquired:
-        if not acquired:
-            print("another converge run holds the lock; skipping this cycle")
-            return 0
-        role, self_ip = read_self()
-        blocks: dict[str, SourceBlock] = {}
-        warnings: list[str] = []
-        logging_status: LoggingStatus | None = None
-        error: str | None = None
-        code = 1
-        sources: list[SourceEntry] = []
-        try:
-            sources = load_sources(sources_file).ordered()
-        except ValueError as e:
-            error = str(e)
-            print(f"REFUSING: {error}", file=sys.stderr)
-        try:
-            if sources:
-                warnings, logging_status, clean, cycle_error = _run_cycle(
-                    sources,
-                    blocks,
-                    role=role,
-                    self_ip=self_ip,
-                    signers_dir=signers_dir,
-                    state_dir=state_dir,
-                )
-                code = 0 if clean else 1
-                error = cycle_error or error
-        finally:
-            write_converge_status(
-                state_dir / "converge-status.json",
-                role=role,
-                tenant=read_tenant(),
-                sources=blocks,
-                warnings=warnings,
-                logging=logging_status,
-                error=error,
-            )
-        if warnings:
-            print(
-                f"WARN: {len(warnings)} deployed app(s) not declared by any source: "
-                f"{', '.join(warnings)}\n"
-                f"      This loop never removes deployments. Retire explicitly:  "
-                f"nuk delete <name>"
-            )
-        return code
-
-
-def placement_matches(
-    manifest: Deployment | Facility,
-    role: str,
-    *,
-    self_ip: str | None = None,
-    org: Org | None = None,
-) -> bool:
-    """Whether THIS host, with `role` at `self_ip`, runs `manifest`.
-
-    The convergence loop hands every host the same tree; each applies the subset
-    it owns. A manifest placed elsewhere is another host's job, not an error —
-    hence a clean no-op rather than a failure (spec §5.4).
-
-    Two documented exceptions match:
-      * no `placement` at all — a manifest written before placement existed.
-        It applies wherever it is run, exactly as it did before.
-      * role `all-in-one` — a real composition of edge + data + app (spec §3.1),
-        so it owns every placement.
-
-    `placement.host` pins a manifest to one named host: it matches only where that
-    host's `privateIp == self_ip`, and a pin naming a host the org does not declare
-    is a loud error. A Deployment placed `app` with no `host` resolves to the org's
-    default app host once the org has more than one app host; without a default it
-    is a loud error, never a silent double-deploy. A Facility is shared substrate
-    and matches every host of its role (each app host runs its own `router`).
-    """
-    placement = manifest.spec.placement
-    if placement is None or role == "all-in-one":
-        return True
-    if placement.role != role:
-        return False
-    if placement.host is not None:
-        if org is None:
-            return False
-        host = org.host_named(placement.host)
-        if host is None:
-            msg = (
-                f"{manifest.metadata.name}: placement.host={placement.host!r} — the org "
-                f"manifest declares no host of that name."
-            )
-            raise ValidationError.from_exception_data(
-                manifest.metadata.name,
-                [
-                    {
-                        "type": "value_error",
-                        "loc": ("spec", "placement", "host"),
-                        "input": placement.host,
-                        "ctx": {"error": ValueError(msg)},
-                    }
-                ],
-            )
-        return host.private_ip == self_ip
-    if isinstance(manifest, Deployment) and role == "app" and org is not None:
-        count = org.app_host_count()
-        if count > 1 and org.default_host("app") is None:
-            msg = (
-                f"{manifest.metadata.name}: placement.role='app' is ambiguous — the org has "
-                f"{count} app hosts and none is the default; set spec.placement.host to pin one."
-            )
-            # `ValidationError` is pydantic's (a ValueError, so `apply_tree`'s failure
-            # guard catches it); in v2 it cannot be raised with a bare message, so
-            # build one carrying `msg` through the supported constructor.
-            raise ValidationError.from_exception_data(
-                manifest.metadata.name,
-                [
-                    {
-                        "type": "value_error",
-                        "loc": ("spec", "placement", "host"),
-                        "input": None,
-                        "ctx": {"error": ValueError(msg)},
-                    }
-                ],
-            )
-        default = org.default_host("app")
-        return default is None or default.private_ip == self_ip
-    return True
-
-
-def _render_routers(
-    tree: Path,
-    org: Org,
-    *,
-    tenant: str | None,
-    auth: HostAuth | None,
-    platform_facilities: list[Facility] | None = None,
-) -> RouteResult:
-    """On the edge: render a router for EVERY Deployment with ingress (spec §6).
-
-    Cross-host router delivery is gone. The edge reads the same git tree every
-    host reads and resolves each backend from the org manifest, so the app host
-    authors nothing that reaches the edge (spec §6, §6.3).
-
-    Stale routers for retired apps are NOT removed here — a manifest disappearing
-    from git is destructive, and the loop reports rather than deletes (spec §7.4).
-    The one bounded exception is the legacy `worker-` prefix (reap_legacy_worker_routers).
-
-    A tenant source's router set is authoritative (spec §5): a render that allows none
-    of a deployment's hosts withdraws the file it wrote before, rather than leaving a
-    lent host live — revocation. The withdrawal is keyed by the deployment's NAME (the
-    router file name), not by source: a fleet-wide deployment-name collision would
-    therefore touch a file another source wrote. The surrounding system discourages
-    cross-source name collisions, but this path does not itself detect them.
-
-    Args:
-        tree: Root of the manifest tree the loop pulled.
-        org: The validated org manifest, source of every backend private IP.
-        tenant: The source's tenant name, or None for the platform source.
-        auth: The cycle's host authorization (spec §3), consulted only for a tenant
-            source: an ingress whose host resolves to anyone but `tenant` is REFUSED —
-            recorded, never written. The `www.<host>` variant (spec §6) is resolved the
-            same way and is omitted when it is not covered, leaving the apex router. None
-            with a tenant present refuses every host (fail-closed); None with tenant None
-            is the ungated platform render.
-        platform_facilities: The PLATFORM tree's facilities, when the caller has
-            them (a tenant source ships none). The fleet-wide `router` lives in
-            the platform source, so `router_present` must be read from here — not
-            from `tree`, which in the S1 topology holds only this source's
-            deployments. Falls back to `tree`'s own facilities when empty, so a
-            caller that does not plumb them keeps the old behaviour.
-
-    Returns:
-        The router names written and the refusal lines (one per foreign host).
-    """
-    paths.DYNAMIC.mkdir(parents=True, exist_ok=True)
-    deployments = load_deployments(tree)
-    protected = {f"{m.metadata.name}.yml" for m in deployments}
-    for stale in reap_legacy_worker_routers(protected):
-        print(f"edge: reaped legacy router {stale} (cross-host delivery is retired)")
-    facilities = load_facilities(tree)
-    vocab = route_vocabulary(facilities)
-    router_present = _router_present(platform_facilities or facilities)
-    rendered: list[str] = []
-    refused: list[str] = []
-    for manifest in deployments:
-        ingress = manifest.spec.ingress
-        if not ingress:
-            continue
-        # A deployment placed on an entry host runs ALONGSIDE Traefik, so
-        # cmd_apply already rendered its router there with a container-name
-        # backend. Re-rendering it from here would overwrite that working file
-        # with a `privateIp:port` backend nothing is listening on.
-        placement = manifest.spec.placement
-        if placement is not None and placement.role in _ENTRY_ROLES:
-            continue
-        if tenant is not None:
-            allowed = _authorized_ingress(ingress, tenant, auth, refused)
-            if not allowed:
-                # Revocation (spec §5): the owner's router set is authoritative, so a
-                # render that allows none of the deployment's hosts withdraws the file
-                # it wrote before. The withdrawal is keyed by the deployment's name, so a
-                # fleet-wide name collision would touch another source's router — the
-                # system discourages that, but this path does not detect it.
-                write_ingress(manifest.metadata.name, [], vocab)
-                continue
-            ingress = allowed
-        resolved = [
-            ing.model_copy(
-                update={
-                    "address": backend_address(org, manifest, ing, router_present=router_present),
-                    "service": None,
-                    "port": None,
-                    "host_port": None,
-                }
-            )
-            for ing in ingress
-        ]
-        name = manifest.metadata.name
-        write_ingress(name, resolved, vocab)
-        rendered.append(name)
-    return RouteResult(rendered, refused)
-
-
-def render_routes(ctx: TreeContext, auth: HostAuth | None = None) -> RouteResult:
-    """On the edge: render ONE source's routers through the host authorization (spec §3).
-
-    The platform source (ctx.tenant is None) is unconstrained — it owns the platform
-    domains. A tenant source renders only the hosts `auth` names as its own; without an
-    authorization it renders nothing (fail-closed).
-    """
-    if ctx.org is None:
-        return RouteResult([], [])
-    return _render_routers(
-        ctx.tree,
-        ctx.org,
-        tenant=ctx.tenant,
-        auth=auth,
-        platform_facilities=ctx.facilities,
-    )
-
-
-def consumes(manifest: Deployment) -> set[str]:
-    """The capabilities this Deployment consumes, derived from its own fields.
-
-    Static consumption (spec §5.3) — the map is a literal lookup, and adding a
-    capability adds a row:
-
-    | Deployment field        | Consumes                   |
-    |--------------------------|----------------------------|
-    | `databases:`            | env capability `databases` |
-
-    A Deployment consuming nothing still gets the default `tls` route from the
-    ingress facility; `tls` is substrate, not consumption. Plan 3's loop uses
-    this to refuse the consumers of a facility that failed its health gate
-    (§7.5) without any runtime state.
-
-    Args:
-        manifest: The Deployment being considered.
-
-    Returns:
-        The capability names consumed; empty for none.
-    """
-    caps: set[str] = set()
-    db = manifest.spec.databases
-    if db.postgres or db.redis:
-        caps.add(_DATABASES_CAPABILITY)
-    return caps
 
 
 # --- provenance-on-apply -------------------------------------------------------

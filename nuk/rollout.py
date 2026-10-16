@@ -16,6 +16,7 @@ import typer
 import yaml
 
 import nuk
+from nuk.models import ValidationError  # noqa: TC003
 
 # --- command layer ------------------------------------------------------------
 # Commands read typed scalars off the validated Manifest but pass its raw dict
@@ -756,7 +757,7 @@ def cmd_rollback(name: str, to: int | None, show: bool) -> None:  # noqa: C901  
     try:
         raw = yaml.safe_load(manifest.read_text(encoding="utf-8"))
         parsed = nuk.models._MANIFEST_ADAPTER.validate_python(raw)
-    except nuk.ValidationError as e:
+    except ValidationError as e:
         nuk.die(
             f"{name}: the persisted manifest no longer validates under the current "
             f"schema (a field was removed since; spec §8) — refusing to silently "
