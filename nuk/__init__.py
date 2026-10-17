@@ -743,7 +743,7 @@ if TYPE_CHECKING:
         Json,
     )
 
-__version__ = "2.7.0"  # bumped on release by .github/workflows/release.yml
+__version__ = "2.8.0"  # bumped on release by .github/workflows/release.yml
 
 # Named, never globbed: the infra tree also carries nuklaut.org.yml,
 # nuklaut.test.org.yml and nuklaut.min.org.yml, and a glob picking one of those
