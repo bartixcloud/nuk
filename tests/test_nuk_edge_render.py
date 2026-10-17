@@ -270,7 +270,8 @@ def test_edge_routes_apps_through_the_app_host_router(tmp_path, monkeypatch):
 
 STRIPPED_API = HELLO.replace(
     "        - {host: hello.example.com, service: web, port: 8080}\n",
-    "        - {host: hello.example.com, service: api, port: 8000, path: /api, stripPrefix: true}\n",
+    "        - {host: hello.example.com, service: api, port: 8000,\n"
+    "           path: /api, stripPrefix: true}\n",
 )
 
 
