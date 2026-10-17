@@ -107,6 +107,9 @@ class Host(BaseModel):
     # The default host for its role: where an UNPINNED deployment of that role runs
     # when the role has more than one host (spec §13 selector follow-up).
     default: bool = False
+    # The tenant whose own bridge this host sits on, if any (design 2026-10-17 §D1).
+    # Such a host is validated against that tenant's bridge CIDR, not `vswitchSubnet`.
+    tenant: str | None = None
 
 
 def _ip_in_cidr(ip: str, cidr: str) -> bool:
@@ -204,16 +207,50 @@ def _check_vm_hosts(hosts: list[Host]) -> None:
 
 
 def _check_subnets(hosts: list[Host], network: Network) -> None:
-    """Raise unless every host's private IP sits in its provider's declared subnet."""
+    """Raise unless every host's private IP sits in its provider's declared subnet.
+
+    Two kinds of host are skipped: the hypervisor (its privateIp is a management IP, not
+    an app subnet) and a host declaring a `tenant` — that host is placed on its tenant's
+    own bridge and is validated against that bridge's CIDR by `check_tenant_subnets`,
+    the only place with the tenant registry in hand.
+    """
     for h in hosts:
-        if h.role == "hypervisor":
-            # The hypervisor's privateIp is its management IP, not an app subnet.
+        if h.role == "hypervisor" or h.tenant is not None:
             continue
         cloud = h.provider == "hcloud"
         subnet = network.cloud_subnet if cloud else network.vswitch_subnet
         if not _ip_in_cidr(h.private_ip, subnet):
             field = "cloudSubnet" if cloud else "vswitchSubnet"
             msg = f"host {h.name}: privateIp {h.private_ip} is not in {field} {subnet}"
+            raise ValueError(msg)
+
+
+def check_tenant_subnets(org: Org, registry: TenantRegistry) -> None:
+    """Raise unless every tenant host sits on the bridge its tenant declares.
+
+    The registry (`tenants.yml`) and the org manifest are different files, so this cannot
+    be an `Org` validator: it needs both. A host with no `tenant` keeps `Org`'s own
+    fleet-subnet rule.
+
+    Raises:
+        ValueError: On a tenant host outside its tenant's bridge CIDR, a `tenant` the
+            registry does not declare, or a tenant row that declares no bridge.
+    """
+    for h in org.hosts:
+        if h.tenant is None:
+            continue
+        tenant = registry.get(h.tenant)
+        if tenant is None:
+            msg = f"{h.name}: tenant {h.tenant} is not in tenants.yml"
+            raise ValueError(msg)
+        if tenant.bridge is None:
+            msg = f"{h.name}: tenant {h.tenant} declares no bridge in tenants.yml"
+            raise ValueError(msg)
+        if not _ip_in_cidr(h.private_ip, tenant.bridge.cidr):
+            msg = (
+                f"{h.name}: privateIp {h.private_ip} is not in tenant {tenant.name} "
+                f"bridge {tenant.bridge.name} {tenant.bridge.cidr}"
+            )
             raise ValueError(msg)
 
 
@@ -325,12 +362,20 @@ DELEGATIONS_FILE = "delegations.yml"
 DELEGATIONS_CACHE_FILE = "delegations.json"
 
 
+class Bridge(BaseModel):
+    """A tenant's own Incus bridge: the network its app hosts sit on."""
+
+    name: str
+    cidr: str
+
+
 class TenantRow(BaseModel):
     """One `tenants[]` row, as far as nuk reads it.
 
     `tenants.yml` is the shared platform registry (the runner broker's
     `bcx-gen-tenant-env` reads the same file and tolerates unknown keys). nuk models
-    only `name` + the edge allowlist `domains`; any other field is ignored.
+    `name`, the edge allowlist `domains`, and the tenant's own `bridge`; any other field
+    is ignored.
     """
 
     model_config = ConfigDict(extra="ignore")
@@ -339,6 +384,7 @@ class TenantRow(BaseModel):
     domains: list[str] = []
     edge: Literal["shared", "passthrough"] | None = None
     signer_principal: str | None = None
+    bridge: Bridge | None = None
 
 
 def specificity(pattern: str) -> int:

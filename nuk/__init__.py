@@ -435,6 +435,9 @@ from nuk.org import (
     check_cross_zone_patterns as check_cross_zone_patterns,
 )
 from nuk.org import (
+    check_tenant_subnets as check_tenant_subnets,
+)
+from nuk.org import (
     host_in_domains as host_in_domains,
 )
 from nuk.org import (

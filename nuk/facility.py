@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Literal
 
 import nuk
 from nuk.models import Deployment, Facility, load
-from nuk.org import TENANTS_FILE, load_org, load_tenants
+from nuk.org import TENANTS_FILE, check_tenant_subnets, load_org, load_tenants
 from nuk.util import die
 
 if TYPE_CHECKING:
@@ -184,6 +184,12 @@ class TreeContext:
         from nuk import DEFAULT_ORG_FILE
         org_path = base / DEFAULT_ORG_FILE
         tenants_path = base / TENANTS_FILE
+        org = load_org(org_path) if org_path.is_file() else None
+        tenants = load_tenants(base) if tenants_path.is_file() else None
+        if org is not None and tenants is not None:
+            # The two halves of the tenant-bridge invariant live in different files, so
+            # it cannot be an `Org` validator (design 2026-10-17 §D1).
+            check_tenant_subnets(org, tenants)
         return cls(
             tree=tree,
             role=role,
@@ -191,8 +197,8 @@ class TreeContext:
             tenant=tenant,
             apply=apply,
             facilities=load_facilities(base, lenient=True),
-            org=load_org(org_path) if org_path.is_file() else None,
-            tenants=load_tenants(base) if tenants_path.is_file() else None,
+            org=org,
+            tenants=tenants,
             trees=trees if trees is not None else {"tag": tree},
             commits=commits if commits is not None else {},
             source_repo=source_repo,

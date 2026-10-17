@@ -500,3 +500,71 @@ def test_org_rejects_two_default_hosts_for_one_role():
     ]
     with pytest.raises(nuk.ValidationError, match="at most one default host"):
         nuk.Org.model_validate(_hosts(hosts))
+
+
+# --- tenant bridge CIDRs (design 2026-10-17 §D1) ----------------------------------
+
+
+# A host may declare `tenant:`; that tenant's row declares the bridge it sits on. The
+# bridge CIDR deliberately sits OUTSIDE the org's vswitchSubnet: a tenant host is placed
+# on its tenant's bridge, not on the fleet bridge, so the tenant rule is what admits it.
+_TENANT_HOSTS = [
+    {"name": "edge", "provider": "hcloud", "role": "edge", "privateIp": "10.10.1.2"},
+    {
+        "name": "nuroot-metal",
+        "provider": "manual",
+        "ip": "1.2.3.4",
+        "role": "hypervisor",
+        "privateIp": "10.10.2.2",
+    },
+    {
+        "name": "kolbe-app",
+        "provider": "incus",
+        "metal": "nuroot-metal",
+        "role": "app",
+        "privateIp": "10.10.3.190",
+        "tenant": "kolbeapp-de",
+    },
+]
+
+_TENANT_REGISTRY = {
+    "tenants": [
+        {
+            "name": "kolbeapp-de",
+            "domains": [],
+            "bridge": {"name": "br-kolbeapp", "cidr": "10.10.3.0/24"},
+        }
+    ]
+}
+
+
+def test_org_tenant_host_is_admitted_by_its_bridge_cidr():
+    org = nuk.Org.model_validate(_hosts(_TENANT_HOSTS))
+    nuk.check_tenant_subnets(org, nuk.TenantRegistry.model_validate(_TENANT_REGISTRY))
+
+
+def test_org_rejects_tenant_host_outside_its_bridge_cidr():
+    hosts = [*_TENANT_HOSTS[:-1], {**_TENANT_HOSTS[-1], "privateIp": "10.10.2.9"}]
+    org = nuk.Org.model_validate(_hosts(hosts))
+    with pytest.raises(
+        ValueError,
+        match=r"kolbe-app: privateIp 10.10.2.9 is not in tenant kolbeapp-de bridge "
+        r"br-kolbeapp 10.10.3.0/24",
+    ):
+        nuk.check_tenant_subnets(org, nuk.TenantRegistry.model_validate(_TENANT_REGISTRY))
+
+
+def test_org_rejects_tenant_host_whose_tenant_declares_no_bridge():
+    org = nuk.Org.model_validate(_hosts(_TENANT_HOSTS))
+    registry = nuk.TenantRegistry.model_validate(
+        {"tenants": [{"name": "kolbeapp-de", "domains": []}]}
+    )
+    with pytest.raises(ValueError, match=r"kolbe-app: tenant kolbeapp-de declares no bridge"):
+        nuk.check_tenant_subnets(org, registry)
+
+
+def test_org_tenantless_host_is_still_checked_against_the_fleet_subnet():
+    host = {**_TENANT_HOSTS[-1], "privateIp": "10.10.9.9"}
+    del host["tenant"]
+    with pytest.raises(nuk.ValidationError, match="vswitchSubnet"):
+        nuk.Org.model_validate(_hosts([*_TENANT_HOSTS[:-1], host]))
