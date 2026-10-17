@@ -594,7 +594,7 @@ def test_shipped_logging_facility_validates_and_provides_logs(tmp_path):
     assert f.spec.placement.role == "edge"
     assert f.spec.provides.env.capability == "logs"
     assert f.spec.provides.env.bind == "otlp"
-    assert f.spec.health.containers == ["loki"]
+    assert f.spec.health.containers == ["loki", "grafana"]
     payload = manifest.parent / "logging" / f.spec.compose.file
     assert payload.is_file(), "the compose payload must ship beside the manifest"
 
