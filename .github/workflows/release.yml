@@ -33,3 +33,50 @@ jobs:
       version-files: |
         nuk/__init__.py
         pyproject.toml
+
+  # The shared workflow stamps the version and only then creates the tag, and its
+  # stamping rewrites just the first `^version = "…"` line of a *.toml file — in
+  # uv.lock that is an unrelated package, not the root one. So the lock cannot ride
+  # the stamp commit, and every tag shipped a uv.lock that disagreed with the
+  # pyproject.toml it was built from (v2.8.0's still named 2.5.0). Regenerate it
+  # here, in the same run — a GITHUB_TOKEN push triggers no workflow, so a later run
+  # could not — and move the tag onto the re-locked commit. The move is safe: the two
+  # commits differ only in uv.lock's own bookkeeping (lockfile revision + the root
+  # package's version), it happens seconds after the tag is created, and the release
+  # object is keyed by tag name, so it follows.
+  relock:
+    needs: release
+    if: needs.release.outputs.released == 'true'
+    runs-on: [self-hosted, build]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0   # so the tag this run just created is present locally
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v9.0.0
+        with:
+          python-version: "3.13"
+          version: "0.13.1"   # pinned: uv.lock's revision field is version-sensitive
+
+      - name: Re-lock uv.lock against the stamped version
+        env:
+          TAG: ${{ needs.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          uv lock
+          if git diff --quiet -- uv.lock; then
+            echo "uv.lock already matches the stamped version — nothing to move"
+            exit 0
+          fi
+          git config user.name "nuklaut-release"
+          git config user.email "release@astrojones.de"
+          git add uv.lock
+          git commit -m "chore(release): re-lock uv.lock for ${TAG} [skip ci]"
+          git push origin HEAD:main
+          git tag -f "$TAG"
+          git push --force origin "refs/tags/${TAG}"
+          echo "re-locked for ${TAG}; tag moved onto the re-locked commit"
