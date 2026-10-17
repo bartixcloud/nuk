@@ -904,6 +904,10 @@ def _render_routers(
                 nuk.write_ingress(manifest.metadata.name, [], vocab)
                 continue
             ingress = allowed
+        # Fronted by the app-host router (backend_address's rule): that router strips
+        # `path` itself, so stripping here too sends `/api/x` on as `/x`, past every
+        # PathPrefix router there, into the catch-all. Only the last hop may strip.
+        fronted = router_present and placement is not None and placement.role == "app"
         resolved = [
             ing.model_copy(
                 update={
@@ -913,6 +917,7 @@ def _render_routers(
                     "service": None,
                     "port": None,
                     "host_port": None,
+                    "strip_prefix": ing.strip_prefix and not (fronted and not ing.address),
                 }
             )
             for ing in ingress

@@ -268,6 +268,38 @@ def test_edge_routes_apps_through_the_app_host_router(tmp_path, monkeypatch):
     assert server["url"] == "http://10.0.10.107:8443"
 
 
+STRIPPED_API = HELLO.replace(
+    "        - {host: hello.example.com, service: web, port: 8080}\n",
+    "        - {host: hello.example.com, service: api, port: 8000,\n"
+    "           path: /api, stripPrefix: true}\n",
+)
+
+
+@pytest.mark.parametrize(
+    ("facilities", "strips"), [({"router": ROUTER_FACILITY}, False), ({}, True)]
+)
+def test_edge_strips_the_prefix_only_when_it_dials_the_container(
+    tmp_path, monkeypatch, facilities, strips
+):
+    """The app-host router strips `path` itself, so the edge must forward it untouched.
+
+    Stripping on both hops sent `/api/health` to the app host as `/health`, which only
+    the SPA catch-all matched: every fleet API call answered 200 with index.html
+    (found live 2026-10-17). Without a router the edge dials the container directly
+    and remains the only hop that can strip.
+    """
+    tree = _tree(tmp_path, {"hello": STRIPPED_API}, facilities)
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
+    nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml"))
+    doc = yaml.safe_load((dynamic / "hello.yml").read_text())
+    router = doc["http"]["routers"]["hello-0"]
+    assert router["rule"] == "Host(`hello.example.com`) && PathPrefix(`/api`)"
+    assert ("hello-0-strip" in router["middlewares"]) is strips
+    assert ("hello-0-strip" in doc["http"].get("middlewares", {})) is strips
+
+
 def test_edge_uses_router_when_facility_is_in_the_platform_tree(tmp_path, monkeypatch):
     """C4: router_present comes from the platform facilities, not the rendered tree.
 
