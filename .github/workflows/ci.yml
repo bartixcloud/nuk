@@ -29,6 +29,13 @@ jobs:
           python-version: "3.13"   # matches requires-python>=3.13
           version: "0.13.1"        # pinned: uv.lock's revision field is version-sensitive
 
+      # The release workflow re-locks uv.lock after stamping a version, because the
+      # shared workflow tags before a caller can re-lock. Guard the invariant from the
+      # other side too: a pyproject.toml change that forgets `uv lock` should fail here
+      # rather than be silently rewritten by the `uv sync` below.
+      - name: uv.lock is up to date
+        run: uv lock --check
+
       - name: Ruff lint
         run: uvx ruff@0.15.15 check .
 
