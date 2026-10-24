@@ -39,7 +39,7 @@ spec:
   envFrom:                              # optional; merged into docker compose --env-file
     - secretRef: /opt/nuklaut/secrets/my-app.env
   databases:                            # optional; shared postgres/redis, per-app
-    postgres: true                      # -> DATABASE_URL (pgvector); or { driver: asyncpg }
+    postgres: true                      # -> DATABASE_URL (pgvector); or { driver: asyncpg, scratch: true }
     redis: true                         # -> REDIS_URL (own ACL user, key prefix my-app:)
 ```
 
@@ -129,7 +129,8 @@ script to stdout instead, to inspect or install by hand.
    existing checkout (used by the CI runner, avoiding any git auth on the controller).
 2. If `spec.databases` is set, provisions a per-app Postgres role+database (pgvector
    enabled) and/or a Redis ACL user on the shared data stack, writing the generated
-   `DATABASE_URL` / `REDIS_URL` to `/opt/nuklaut/secrets/<name>-db.env` (600).
+   `DATABASE_URL` / `SCRATCH_DATABASE_URL` / `REDIS_URL` to
+   `/opt/nuklaut/secrets/<name>-db.env` (600).
 3. Writes `/opt/nuklaut/deployments/<name>/compose.override.yml` joining each ingress
    service to the external `edge` network (and the private `data` network + the creds
    `env_file` when a database was requested) — so your compose file stays Traefik- and
@@ -154,6 +155,14 @@ never touches**:
   (600); re-applies reuse them (no credential churn).
 - `postgres: { driver: asyncpg }` emits `postgresql+asyncpg://…` for SQLAlchemy/asyncpg
   apps; bare `true` yields a libpq `postgresql://` URL.
+- `postgres: { scratch: true }` adds a second database `<app>-scratch`, owned by the same
+  role with the same password, and injects `SCRATCH_DATABASE_URL` next to `DATABASE_URL`.
+  Use it for the app's own staging work (a restore drill, a throwaway import): **it is
+  empty at rest** — nuk only creates it and never writes, empties or reads its contents,
+  the app owns and empties them. Turning `scratch` off on a later apply does **not** drop
+  it (same zero-delete habit as the main database); only `nuk delete --purge` /
+  `nuk db purge` destroys it. Postgres caps identifiers at 63 bytes, so `<app>-scratch`
+  must fit — nuk refuses the apply rather than let the server silently truncate the name.
 
 Admin paths never need a TCP password — provisioning runs `docker exec` against the
 shared containers (Postgres local-socket trust; Redis admin password from the

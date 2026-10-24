@@ -129,6 +129,30 @@ def test_remote_mode_writes_private_ip_urls(tmp_path, monkeypatch):
     assert f"REDIS_URL=redis://hello:{rd}@10.0.10.180:6379/0" in body
 
 
+def test_remote_scratch_url_uses_remote_ip(tmp_path, monkeypatch):
+    """Remote mode derives the scratch URL too — same seed password, data-host IP."""
+    seed = b"\x0b" * 32
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk, "load_db_seed", lambda: seed)
+    monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
+
+    def _boom(*a, **k):
+        msg = "remote mode must not provision the local data stack"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(nuk, "preflight_data_stack", _boom)
+    monkeypatch.setattr(nuk, "ensure_postgres", _boom)
+    monkeypatch.setattr(nuk, "ensure_scratch_postgres", _boom)
+
+    dbs = nuk.Databases.model_validate({"postgres": {"driver": "asyncpg", "scratch": True}})
+    nuk.provision_databases("app", dbs, [], remote_ip="10.0.0.5")
+    env = nuk.read_db_env("app")
+    derived = nuk.derive_db_password(seed, "pg", "app")
+    assert env["SCRATCH_DATABASE_URL"] == nuk._pg_url(
+        "app", derived, "10.0.0.5", "asyncpg", db="app-scratch"
+    )
+
+
 def test_remote_mode_without_seed_refuses(monkeypatch):
     monkeypatch.setattr(nuk, "load_db_seed", lambda: None)
     monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
@@ -198,18 +222,17 @@ def test_data_host_ip_reads_org_role():
     assert nuk.data_host_ip(org) == "10.0.10.180"
 
 
-def _db_deployment(tmp_path, name, placement_role="app"):
+def _db_deployment(tmp_path, name, placement_role="app", *, scratch=False):
     d = tmp_path / "deployments"
     d.mkdir(parents=True, exist_ok=True)
+    pg = "    postgres: {scratch: true}\n" if scratch else "    postgres: true\n"
     (d / f"{name}.yml").write_text(
         "apiVersion: nuk/v1\n"
         "kind: Deployment\n"
         f"metadata: {{name: {name}}}\n"
         "spec:\n"
         f"  placement: {{role: {placement_role}}}\n"
-        "  databases:\n"
-        "    postgres: true\n"
-        "  ingress:\n"
+        "  databases:\n" + pg + "  ingress:\n"
         f"    - {{host: {name}.example.com, service: web, port: 8080}}\n",
         encoding="utf-8",
     )
@@ -293,6 +316,43 @@ def test_sweep_is_idempotent_no_rotation(tmp_path, monkeypatch):
 
 
 # --- final-review robustness fixes (I-1, I-4, I-3) --------------------------------
+
+
+# --- scratch database status results (kolbe D3) -----------------------------------
+
+
+def test_provision_remote_reports_scratch_database(tmp_path, monkeypatch):
+    """The scratch DB is its own `Database` result so backup maps it to the tenant."""
+    tree = _data_facility(_db_deployment(tmp_path, "kolbe-prod", scratch=True))
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path / "secrets")
+    monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
+    monkeypatch.setattr(nuk, "load_db_seed", lambda: b"\x0c" * 32)
+    monkeypatch.setattr(nuk, "provision_databases", lambda *a, **k: "/x")
+    out = nuk.provision_remote_databases(tree, "data", nuk.load_facilities(tree))
+    assert [r.name for r in out] == ["kolbe-prod", "kolbe-prod-scratch"]
+    assert all(r.result == "ok" for r in out)
+
+
+def test_provision_remote_scratch_failure_isolated(tmp_path, monkeypatch):
+    """A failing scratch provisioning fails both results and spares the next deployment."""
+    tree = _data_facility(_db_deployment(tmp_path, "kolbe-prod", scratch=True))
+    _db_deployment(tree, "kolbe-test")
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path / "secrets")
+    monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
+    monkeypatch.setattr(nuk, "load_db_seed", lambda: b"\x0d" * 32)
+
+    def boom(app, *a, **k):
+        if app == "kolbe-prod":
+            raise subprocess.CalledProcessError(1, ["docker", "exec", "nuk-postgres", "psql"])
+        return "/x"
+
+    monkeypatch.setattr(nuk, "provision_databases", boom)
+    out = nuk.provision_remote_databases(tree, "data", nuk.load_facilities(tree))
+    assert [r.name for r in out] == ["kolbe-prod", "kolbe-prod-scratch", "kolbe-test"]
+    failed = [r for r in out if r.name.startswith("kolbe-prod")]
+    assert [r.result for r in failed] == ["failed", "failed"]
+    assert failed[0].error == failed[1].error
+    assert out[-1].result == "ok"
 
 
 def test_sweep_catches_called_process_error_not_just_systemexit(tmp_path, monkeypatch):

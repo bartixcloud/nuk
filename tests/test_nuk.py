@@ -732,6 +732,119 @@ def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
     assert seen == ["asyncpg", None]
 
 
+# --- postgres scratch database (restore staging, kolbe D3) ---------------------
+
+
+def test_postgres_scratch_flag_parses():
+    assert nuk.Databases.model_validate({"postgres": {"scratch": True}}).postgres_scratch is True
+    assert nuk.Databases.model_validate({"postgres": {"scratch": True}}).wants_postgres is True
+    assert nuk.Databases.model_validate({"postgres": True}).postgres_scratch is False
+    assert (
+        nuk.Databases.model_validate({"postgres": {"driver": "asyncpg"}}).postgres_scratch is False
+    )
+
+
+def test_scratch_db_name_and_length_guard():
+    assert nuk.scratch_db_name("kolbe-prod") == "kolbe-prod-scratch"
+    with pytest.raises(SystemExit):
+        nuk.scratch_db_name("a" * 56)  # 56 + len("-scratch") = 64 > 63
+
+
+def test_ensure_scratch_postgres_sql(monkeypatch):
+    sql: list[tuple[str, str]] = []
+    monkeypatch.setattr(nuk, "_psql", lambda s, db="postgres": sql.append((s, db)) or "")
+    url = nuk.ensure_scratch_postgres("kolbe-prod", "pw", "asyncpg")
+    assert url == "postgresql+asyncpg://kolbe-prod:pw@nuk-postgres:5432/kolbe-prod-scratch"
+    stmts = [s for s, _ in sql]
+    assert 'CREATE DATABASE "kolbe-prod-scratch" OWNER "kolbe-prod";' in stmts
+    assert 'REVOKE CONNECT ON DATABASE "kolbe-prod-scratch" FROM PUBLIC;' in stmts
+    assert 'GRANT CONNECT ON DATABASE "kolbe-prod-scratch" TO "kolbe-prod";' in stmts
+    assert ("CREATE EXTENSION IF NOT EXISTS vector;", "kolbe-prod-scratch") in sql
+    # no role statements: the role belongs to ensure_postgres
+    assert not any("ROLE" in s for s in stmts)
+
+
+def test_ensure_scratch_postgres_skips_create_when_exists(monkeypatch):
+    sql: list[str] = []
+
+    def fake(s, db="postgres"):
+        sql.append(s)
+        return "1" if s.startswith("SELECT 1 FROM pg_database") else ""
+
+    monkeypatch.setattr(nuk, "_psql", fake)
+    nuk.ensure_scratch_postgres("kolbe-prod", "pw", None)
+    assert not any(s.startswith("CREATE DATABASE") for s in sql)
+
+
+def test_provision_databases_local_scratch(tmp_path, monkeypatch):
+    """Local mode provisions the scratch DB with the main DB's role and password."""
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk, "preflight_data_stack", lambda *a, **k: None)
+    monkeypatch.setattr(nuk, "env_facility", lambda *a, **k: object())
+    monkeypatch.setattr(
+        nuk,
+        "ensure_postgres",
+        lambda app, prev, driver=None: (
+            (f"postgresql+{driver}" if driver else "postgresql") + f"://{app}:x@h:5432/{app}"
+        ),
+    )
+    seen: list[tuple[str, str, str | None]] = []
+
+    def fake_scratch(app, pw, driver):
+        seen.append((app, pw, driver))
+        return (
+            f"postgresql+{driver}" if driver else "postgresql"
+        ) + f"://{app}:{pw}@h:5432/{app}-scratch"
+
+    monkeypatch.setattr(nuk, "ensure_scratch_postgres", fake_scratch)
+    dbs = nuk.Databases.model_validate({"postgres": {"driver": "asyncpg", "scratch": True}})
+    nuk.provision_databases("app", dbs, [])
+    env = nuk.read_db_env("app")
+    assert set(env) == {"DATABASE_URL", "SCRATCH_DATABASE_URL"}
+    assert env["SCRATCH_DATABASE_URL"].endswith("/app-scratch")
+    assert seen == [("app", nuk._pw_from_url(env["DATABASE_URL"]), "asyncpg")]
+
+
+def test_provision_databases_drops_stale_scratch_key(tmp_path, monkeypatch):
+    """Turning scratch off on a later apply must not leave the old key behind."""
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk, "preflight_data_stack", lambda *a, **k: None)
+    monkeypatch.setattr(nuk, "env_facility", lambda *a, **k: object())
+    monkeypatch.setattr(
+        nuk,
+        "ensure_postgres",
+        lambda app, prev, driver=None: f"postgresql://{app}:x@h:5432/{app}",
+    )
+    monkeypatch.setattr(
+        nuk,
+        "ensure_scratch_postgres",
+        lambda app, pw, driver: f"postgresql://{app}:{pw}@h:5432/{app}-scratch",
+    )
+    nuk.provision_databases(
+        "app", nuk.Databases.model_validate({"postgres": {"scratch": True}}), []
+    )
+    assert "SCRATCH_DATABASE_URL" in nuk.read_db_env("app")
+    nuk.provision_databases("app", nuk.Databases.model_validate({"postgres": True}), [])
+    assert "SCRATCH_DATABASE_URL" not in nuk.read_db_env("app")
+
+
+def test_purge_drops_scratch_before_role(tmp_path, monkeypatch):
+    """A scratch DB left behind (flag turned off) must not block DROP ROLE."""
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
+    nuk.write_db_env("app", {"DATABASE_URL": "postgresql://app:pw@nuk-postgres:5432/app"})
+    sql: list[str] = []
+    monkeypatch.setattr(nuk, "_psql", lambda s, db="postgres": sql.append(s) or "")
+    nuk.purge_databases("app")
+    terminate = [s for s in sql if "pg_terminate_backend" in s]
+    assert any("'app-scratch'" in s for s in terminate)
+    drop = sql.index('DROP DATABASE IF EXISTS "app-scratch";')
+    role = sql.index('DROP ROLE IF EXISTS "app";')
+    assert drop < role
+    assert sql.index(next(s for s in terminate if "'app-scratch'" in s)) < role
+    assert 'DROP DATABASE IF EXISTS "app";' in sql
+
+
 # --- data-stack preflight (issue #10): own the stack, fail fast & actionably ---
 
 
