@@ -135,8 +135,12 @@ def provision_remote_databases(
                 else f"provision failed: {e}"
             )
             out.append(nuk.ManifestResult(name, "Database", "failed", error))
+            if dbs.postgres_scratch:
+                out.append(nuk.ManifestResult(f"{name}-scratch", "Database", "failed", error))
             continue
         out.append(nuk.ManifestResult(name, "Database"))
+        if dbs.postgres_scratch:
+            out.append(nuk.ManifestResult(f"{name}-scratch", "Database"))
     return out
 
 

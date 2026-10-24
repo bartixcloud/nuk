@@ -739,7 +739,9 @@ def test_postgres_scratch_flag_parses():
     assert nuk.Databases.model_validate({"postgres": {"scratch": True}}).postgres_scratch is True
     assert nuk.Databases.model_validate({"postgres": {"scratch": True}}).wants_postgres is True
     assert nuk.Databases.model_validate({"postgres": True}).postgres_scratch is False
-    assert nuk.Databases.model_validate({"postgres": {"driver": "asyncpg"}}).postgres_scratch is False
+    assert (
+        nuk.Databases.model_validate({"postgres": {"driver": "asyncpg"}}).postgres_scratch is False
+    )
 
 
 def test_scratch_db_name_and_length_guard():
@@ -782,14 +784,17 @@ def test_provision_databases_local_scratch(tmp_path, monkeypatch):
     monkeypatch.setattr(
         nuk,
         "ensure_postgres",
-        lambda app, prev, driver=None: (f"postgresql+{driver}" if driver else "postgresql")
-        + f"://{app}:x@h:5432/{app}",
+        lambda app, prev, driver=None: (
+            (f"postgresql+{driver}" if driver else "postgresql") + f"://{app}:x@h:5432/{app}"
+        ),
     )
     seen: list[tuple[str, str, str | None]] = []
 
     def fake_scratch(app, pw, driver):
         seen.append((app, pw, driver))
-        return (f"postgresql+{driver}" if driver else "postgresql") + f"://{app}:{pw}@h:5432/{app}-scratch"
+        return (
+            f"postgresql+{driver}" if driver else "postgresql"
+        ) + f"://{app}:{pw}@h:5432/{app}-scratch"
 
     monkeypatch.setattr(nuk, "ensure_scratch_postgres", fake_scratch)
     dbs = nuk.Databases.model_validate({"postgres": {"driver": "asyncpg", "scratch": True}})
@@ -821,6 +826,23 @@ def test_provision_databases_drops_stale_scratch_key(tmp_path, monkeypatch):
     assert "SCRATCH_DATABASE_URL" in nuk.read_db_env("app")
     nuk.provision_databases("app", nuk.Databases.model_validate({"postgres": True}), [])
     assert "SCRATCH_DATABASE_URL" not in nuk.read_db_env("app")
+
+
+def test_purge_drops_scratch_before_role(tmp_path, monkeypatch):
+    """A scratch DB left behind (flag turned off) must not block DROP ROLE."""
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
+    nuk.write_db_env("app", {"DATABASE_URL": "postgresql://app:pw@nuk-postgres:5432/app"})
+    sql: list[str] = []
+    monkeypatch.setattr(nuk, "_psql", lambda s, db="postgres": sql.append(s) or "")
+    nuk.purge_databases("app")
+    terminate = [s for s in sql if "pg_terminate_backend" in s]
+    assert any("'app-scratch'" in s for s in terminate)
+    drop = sql.index('DROP DATABASE IF EXISTS "app-scratch";')
+    role = sql.index('DROP ROLE IF EXISTS "app";')
+    assert drop < role
+    assert sql.index(next(s for s in terminate if "'app-scratch'" in s)) < role
+    assert 'DROP DATABASE IF EXISTS "app";' in sql
 
 
 # --- data-stack preflight (issue #10): own the stack, fail fast & actionably ---

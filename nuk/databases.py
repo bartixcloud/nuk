@@ -324,7 +324,7 @@ def scratch_db_name(app: str) -> str:
             server silently truncate a shared prefix).
     """
     name = f"{nuk._safe_ident(app)}-scratch"
-    if len(name.encode()) > 63:
+    if len(name.encode()) > 63:  # noqa: PLR2004  # Postgres NAMEDATALEN caps identifiers at 63 bytes
         die(f"nuk: database name {name!r} exceeds Postgres' 63-byte limit")
     return name
 
@@ -391,7 +391,7 @@ def data_host_ip(org: Org) -> str | None:
     return host.private_ip if host else None
 
 
-def provision_databases(
+def provision_databases(  # noqa: C901  # local/remote, postgres/redis/scratch: one branch per arm
     app: str, databases: Databases, facilities: list[Facility], *, remote_ip: str | None = None
 ) -> str | None:
     """Provision the databases a manifest requested.
@@ -484,11 +484,18 @@ def purge_databases(app: str) -> None:
     nuk._safe_ident(app)
     env = nuk.read_db_env(app)
     if "DATABASE_URL" in env:
-        nuk._psql(
-            f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "  # noqa: S608  # _lit-quoted
-            f"WHERE datname = {_lit(app)} AND pid <> pg_backend_pid();"
-        )
-        nuk._psql(f'DROP DATABASE IF EXISTS "{app}";')  # noqa: S608  # app guarded by _safe_ident
+        # Always try the scratch drop, even with the flag off today: a scratch DB
+        # orphaned by an earlier apply still blocks DROP ROLE, and IF EXISTS makes
+        # the attempt free. Built literally, not via scratch_db_name: an app whose
+        # name is too long for a scratch DB never had one, and purge must still
+        # drop its main DB rather than die on the length guard.
+        scratch = f"{app}-scratch"
+        for db in (app, scratch):
+            nuk._psql(
+                f"SELECT pg_terminate_backend(pid) FROM pg_stat_activity "  # noqa: S608  # _lit-quoted
+                f"WHERE datname = {_lit(db)} AND pid <> pg_backend_pid();"
+            )
+            nuk._psql(f'DROP DATABASE IF EXISTS "{db}";')  # noqa: S608  # app guarded by _safe_ident
         nuk._psql(f'DROP ROLE IF EXISTS "{app}";')  # noqa: S608  # app guarded by _safe_ident
     if "REDIS_URL" in env:
         nuk._redis_admin("ACL", "DELUSER", app)
