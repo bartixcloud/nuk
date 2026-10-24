@@ -440,6 +440,14 @@ def provision_databases(
         if want_pg:
             pw = nuk.derive_db_password(seed, "pg", app)
             env["DATABASE_URL"] = nuk._pg_url(app, pw, remote_ip, databases.postgres_driver)
+            if databases.postgres_scratch:
+                env["SCRATCH_DATABASE_URL"] = nuk._pg_url(
+                    app,
+                    pw,
+                    remote_ip,
+                    databases.postgres_driver,
+                    db=nuk.scratch_db_name(app),
+                )
         if want_redis:
             env["REDIS_URL"] = nuk._redis_url(
                 app, nuk.derive_db_password(seed, "redis", app), remote_ip
@@ -452,6 +460,13 @@ def provision_databases(
         env["DATABASE_URL"] = nuk.ensure_postgres(
             app, prev.get("DATABASE_URL"), databases.postgres_driver
         )
+        if databases.postgres_scratch:
+            pw = _pw_from_url(env["DATABASE_URL"])
+            if pw is None:
+                die(f"{app}: cannot derive the scratch database password from DATABASE_URL")
+            env["SCRATCH_DATABASE_URL"] = nuk.ensure_scratch_postgres(
+                app, pw, databases.postgres_driver
+            )
     if want_redis:
         env["REDIS_URL"] = nuk.ensure_redis(app, prev.get("REDIS_URL"))
     return nuk.write_db_env(app, env)

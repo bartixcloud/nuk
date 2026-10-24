@@ -774,6 +774,55 @@ def test_ensure_scratch_postgres_skips_create_when_exists(monkeypatch):
     assert not any(s.startswith("CREATE DATABASE") for s in sql)
 
 
+def test_provision_databases_local_scratch(tmp_path, monkeypatch):
+    """Local mode provisions the scratch DB with the main DB's role and password."""
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk, "preflight_data_stack", lambda *a, **k: None)
+    monkeypatch.setattr(nuk, "env_facility", lambda *a, **k: object())
+    monkeypatch.setattr(
+        nuk,
+        "ensure_postgres",
+        lambda app, prev, driver=None: (f"postgresql+{driver}" if driver else "postgresql")
+        + f"://{app}:x@h:5432/{app}",
+    )
+    seen: list[tuple[str, str, str | None]] = []
+
+    def fake_scratch(app, pw, driver):
+        seen.append((app, pw, driver))
+        return (f"postgresql+{driver}" if driver else "postgresql") + f"://{app}:{pw}@h:5432/{app}-scratch"
+
+    monkeypatch.setattr(nuk, "ensure_scratch_postgres", fake_scratch)
+    dbs = nuk.Databases.model_validate({"postgres": {"driver": "asyncpg", "scratch": True}})
+    nuk.provision_databases("app", dbs, [])
+    env = nuk.read_db_env("app")
+    assert set(env) == {"DATABASE_URL", "SCRATCH_DATABASE_URL"}
+    assert env["SCRATCH_DATABASE_URL"].endswith("/app-scratch")
+    assert seen == [("app", nuk._pw_from_url(env["DATABASE_URL"]), "asyncpg")]
+
+
+def test_provision_databases_drops_stale_scratch_key(tmp_path, monkeypatch):
+    """Turning scratch off on a later apply must not leave the old key behind."""
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk, "preflight_data_stack", lambda *a, **k: None)
+    monkeypatch.setattr(nuk, "env_facility", lambda *a, **k: object())
+    monkeypatch.setattr(
+        nuk,
+        "ensure_postgres",
+        lambda app, prev, driver=None: f"postgresql://{app}:x@h:5432/{app}",
+    )
+    monkeypatch.setattr(
+        nuk,
+        "ensure_scratch_postgres",
+        lambda app, pw, driver: f"postgresql://{app}:{pw}@h:5432/{app}-scratch",
+    )
+    nuk.provision_databases(
+        "app", nuk.Databases.model_validate({"postgres": {"scratch": True}}), []
+    )
+    assert "SCRATCH_DATABASE_URL" in nuk.read_db_env("app")
+    nuk.provision_databases("app", nuk.Databases.model_validate({"postgres": True}), [])
+    assert "SCRATCH_DATABASE_URL" not in nuk.read_db_env("app")
+
+
 # --- data-stack preflight (issue #10): own the stack, fail fast & actionably ---
 
 

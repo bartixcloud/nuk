@@ -129,6 +129,30 @@ def test_remote_mode_writes_private_ip_urls(tmp_path, monkeypatch):
     assert f"REDIS_URL=redis://hello:{rd}@10.0.10.180:6379/0" in body
 
 
+def test_remote_scratch_url_uses_remote_ip(tmp_path, monkeypatch):
+    """Remote mode derives the scratch URL too — same seed password, data-host IP."""
+    seed = b"\x0b" * 32
+    monkeypatch.setattr(nuk.paths, "SECRETS", tmp_path)
+    monkeypatch.setattr(nuk, "load_db_seed", lambda: seed)
+    monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
+
+    def _boom(*a, **k):
+        msg = "remote mode must not provision the local data stack"
+        raise AssertionError(msg)
+
+    monkeypatch.setattr(nuk, "preflight_data_stack", _boom)
+    monkeypatch.setattr(nuk, "ensure_postgres", _boom)
+    monkeypatch.setattr(nuk, "ensure_scratch_postgres", _boom)
+
+    dbs = nuk.Databases.model_validate({"postgres": {"driver": "asyncpg", "scratch": True}})
+    nuk.provision_databases("app", dbs, [], remote_ip="10.0.0.5")
+    env = nuk.read_db_env("app")
+    derived = nuk.derive_db_password(seed, "pg", "app")
+    assert env["SCRATCH_DATABASE_URL"] == nuk._pg_url(
+        "app", derived, "10.0.0.5", "asyncpg", db="app-scratch"
+    )
+
+
 def test_remote_mode_without_seed_refuses(monkeypatch):
     monkeypatch.setattr(nuk, "load_db_seed", lambda: None)
     monkeypatch.setattr(nuk, "_chown_deploy", lambda p: None)
