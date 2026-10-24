@@ -132,6 +132,7 @@ class Postgres(BaseModel):
     """`spec.databases.postgres` object form — picks the URL scheme driver."""
 
     driver: str | None = None
+    scratch: bool = False
 
 
 class Databases(_NullTolerant):
@@ -165,6 +166,11 @@ class Databases(_NullTolerant):
     def postgres_driver(self) -> str | None:
         """The URL-scheme driver of the object form; bare `true` has none."""
         return self.postgres.driver if isinstance(self.postgres, Postgres) else None
+
+    @property
+    def postgres_scratch(self) -> bool:
+        """Whether the object form asked for an extra `<app>-scratch` database."""
+        return self.postgres.scratch if isinstance(self.postgres, Postgres) else False
 
 
 # The host roles a placement can target and an org host can carry (spec §3.1).

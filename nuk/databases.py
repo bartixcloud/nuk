@@ -263,10 +263,10 @@ def _pg_driver(pg: object) -> str | None:
     return driver if isinstance(driver, str) else None
 
 
-def _pg_url(app: str, pw: str, host: str, driver: str | None) -> str:
+def _pg_url(app: str, pw: str, host: str, driver: str | None, db: str | None = None) -> str:
     """DATABASE_URL for an app's database; `driver` picks the SQLAlchemy scheme suffix."""
     scheme = f"postgresql+{driver}" if driver else "postgresql"
-    return f"{scheme}://{app}:{pw}@{host}:5432/{app}"
+    return f"{scheme}://{app}:{pw}@{host}:5432/{db or app}"
 
 
 def _redis_url(app: str, pw: str, host: str) -> str:
@@ -307,6 +307,51 @@ def ensure_postgres(app: str, prev_url: str | None, driver: str | None = None) -
     nuk._psql(f'GRANT CONNECT ON DATABASE "{app}" TO "{app}";')  # noqa: S608  # app guarded
     nuk._psql("CREATE EXTENSION IF NOT EXISTS vector;", db=app)
     return nuk._pg_url(app, pw, nuk.PG_CONTAINER, driver)
+
+
+def scratch_db_name(app: str) -> str:
+    """The scratch database name for `app`, refusing names Postgres would truncate.
+
+    Args:
+        app: The app name (must be a safe identifier).
+
+    Returns:
+        `"<app>-scratch"`.
+
+    Raises:
+        NukError: When `app` is not a safe identifier, or the result exceeds
+            Postgres' 63-byte NAMEDATALEN limit (fail closed rather than let the
+            server silently truncate a shared prefix).
+    """
+    name = f"{nuk._safe_ident(app)}-scratch"
+    if len(name.encode()) > 63:
+        die(f"nuk: database name {name!r} exceeds Postgres' 63-byte limit")
+    return name
+
+
+def ensure_scratch_postgres(app: str, pw: str, driver: str | None) -> str:
+    """Idempotently create the scratch database owned by `app`'s existing role.
+
+    The role and password come from `ensure_postgres`; this only adds the second
+    database with the same connect isolation and pgvector enabled. Its contents
+    belong to the app: nuk never creates, empties or drops it here.
+
+    Args:
+        app: The app/role name (must be a safe identifier).
+        pw: The password already issued for `app`'s role.
+        driver: Optional SQLAlchemy driver token for the URL scheme.
+
+    Returns:
+        A SCRATCH_DATABASE_URL for the provisioned database.
+    """
+    db = scratch_db_name(app)
+    if nuk._psql(f"SELECT 1 FROM pg_database WHERE datname = {_lit(db)};") != "1":  # noqa: S608  # _lit-quoted
+        nuk._psql(f'CREATE DATABASE "{db}" OWNER "{app}";')  # noqa: S608  # guarded by _safe_ident
+    # Isolate: only the owner role may connect to this database.
+    nuk._psql(f'REVOKE CONNECT ON DATABASE "{db}" FROM PUBLIC;')  # noqa: S608  # guarded
+    nuk._psql(f'GRANT CONNECT ON DATABASE "{db}" TO "{app}";')  # noqa: S608  # guarded
+    nuk._psql("CREATE EXTENSION IF NOT EXISTS vector;", db=db)
+    return nuk._pg_url(app, pw, nuk.PG_CONTAINER, driver, db=db)
 
 
 def ensure_redis(app: str, prev_url: str | None) -> str:

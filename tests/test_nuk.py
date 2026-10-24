@@ -732,6 +732,48 @@ def test_provision_databases_extracts_driver(tmp_path, monkeypatch):
     assert seen == ["asyncpg", None]
 
 
+# --- postgres scratch database (restore staging, kolbe D3) ---------------------
+
+
+def test_postgres_scratch_flag_parses():
+    assert nuk.Databases.model_validate({"postgres": {"scratch": True}}).postgres_scratch is True
+    assert nuk.Databases.model_validate({"postgres": {"scratch": True}}).wants_postgres is True
+    assert nuk.Databases.model_validate({"postgres": True}).postgres_scratch is False
+    assert nuk.Databases.model_validate({"postgres": {"driver": "asyncpg"}}).postgres_scratch is False
+
+
+def test_scratch_db_name_and_length_guard():
+    assert nuk.scratch_db_name("kolbe-prod") == "kolbe-prod-scratch"
+    with pytest.raises(SystemExit):
+        nuk.scratch_db_name("a" * 56)  # 56 + len("-scratch") = 64 > 63
+
+
+def test_ensure_scratch_postgres_sql(monkeypatch):
+    sql: list[tuple[str, str]] = []
+    monkeypatch.setattr(nuk, "_psql", lambda s, db="postgres": sql.append((s, db)) or "")
+    url = nuk.ensure_scratch_postgres("kolbe-prod", "pw", "asyncpg")
+    assert url == "postgresql+asyncpg://kolbe-prod:pw@nuk-postgres:5432/kolbe-prod-scratch"
+    stmts = [s for s, _ in sql]
+    assert 'CREATE DATABASE "kolbe-prod-scratch" OWNER "kolbe-prod";' in stmts
+    assert 'REVOKE CONNECT ON DATABASE "kolbe-prod-scratch" FROM PUBLIC;' in stmts
+    assert 'GRANT CONNECT ON DATABASE "kolbe-prod-scratch" TO "kolbe-prod";' in stmts
+    assert ("CREATE EXTENSION IF NOT EXISTS vector;", "kolbe-prod-scratch") in sql
+    # no role statements: the role belongs to ensure_postgres
+    assert not any("ROLE" in s for s in stmts)
+
+
+def test_ensure_scratch_postgres_skips_create_when_exists(monkeypatch):
+    sql: list[str] = []
+
+    def fake(s, db="postgres"):
+        sql.append(s)
+        return "1" if s.startswith("SELECT 1 FROM pg_database") else ""
+
+    monkeypatch.setattr(nuk, "_psql", fake)
+    nuk.ensure_scratch_postgres("kolbe-prod", "pw", None)
+    assert not any(s.startswith("CREATE DATABASE") for s in sql)
+
+
 # --- data-stack preflight (issue #10): own the stack, fail fast & actionably ---
 
 
