@@ -331,6 +331,9 @@ from nuk.ingress import (
     build_override as build_override,
 )
 from nuk.ingress import (
+    public_url as public_url,
+)
+from nuk.ingress import (
     reap_legacy_worker_routers as reap_legacy_worker_routers,
 )
 from nuk.ingress import (
@@ -793,14 +796,17 @@ class ServiceWiring:
     networks: list[str]
     ports: list[str] = field(default_factory=list)
     env_file: list[str] = field(default_factory=list)
+    environment: dict[str, str] = field(default_factory=dict)
 
     def to_wire(self) -> dict[str, Json]:
-        """`networks` is always present (even empty); `ports`/`env_file` only when non-empty."""
+        """`networks` is always present (even empty); the rest only when non-empty."""
         out: dict[str, Json] = {"networks": [*self.networks]}
         if self.ports:
             out["ports"] = [*self.ports]
         if self.env_file:
             out["env_file"] = [*self.env_file]
+        if self.environment:
+            out["environment"] = dict(self.environment)
         return out
 
 

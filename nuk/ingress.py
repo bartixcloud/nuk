@@ -17,6 +17,29 @@ if TYPE_CHECKING:
     from nuk.models import Deployment, Ingress
 
 
+def public_url(ingress: list[Ingress]) -> str | None:
+    """The app's canonical public URL, derived from its ingress hosts.
+
+    An app needs one fixed, configured URL for OAuth callbacks, e-mails sent
+    outside a request, and origin allowlists. Its manifest already names it: when
+    the deployment's ingress resolves to exactly ONE distinct `host`, that host is
+    canonical. Zero or several distinct hosts are ambiguous — a guess would point
+    those flows at the wrong site — so nuk sets nothing and the app fails its own
+    config check instead. `www: true` only adds a redirect to the same host.
+
+    Args:
+        ingress: The raw `spec.ingress[]` entries.
+
+    Returns:
+        `https://<host>` when exactly one distinct host is named, else None.
+        Every nuk route terminates TLS, so the scheme is always https.
+    """
+    hosts = {ing.host for ing in ingress}
+    if len(hosts) != 1:
+        return None
+    return f"https://{hosts.pop()}"
+
+
 def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-contract API; one render pass
     name: str,  # noqa: ARG001  # kept for signature stability (frozen wire-contract API / tests)
     ingress: list[Ingress],
@@ -27,6 +50,7 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
     local_data: bool = True,
     *,
     colours: list[str] | None = None,
+    public_url: str | None = None,
 ) -> nuk.ComposeOverride | None:
     """Compose override wiring services to the shared edge/data networks + secrets.
 
@@ -71,6 +95,10 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
             ``edge`` network, so the override must key on the profile-suffixed
             services, not the phantom base names. None (the default) leaves the
             service keys untouched.
+        public_url: The app's configured public URL (see `public_url`). When set,
+            every wired service's container env gets ``NUK_PUBLIC_URL`` via the
+            override's own ``environment`` mapping, so it merges over the app
+            compose file's ``environment`` (an ``env_file`` would lose to it).
 
     Returns:
         The override doc, or None when no service needs any wiring.
@@ -95,6 +123,7 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
                 if mapping not in publish_ports[svc]:
                     publish_ports[svc].append(mapping)
     services: dict[str, nuk.ServiceWiring] = {}
+    environment = {"NUK_PUBLIC_URL": public_url} if public_url else {}
     uses_edge = False
     uses_data = False
     for svc_name in ordered:
@@ -112,7 +141,10 @@ def build_override(  # noqa: C901, PLR0913, PLR0914, PLR0917  # frozen wire-cont
         # containers the router actually resolves.
         for key in [f"{svc_name}-{c}" for c in colours] if colours else [svc_name]:
             services[key] = nuk.ServiceWiring(
-                networks=nets, ports=publish_ports.get(svc_name, []), env_file=env_files
+                networks=nets,
+                ports=publish_ports.get(svc_name, []),
+                env_file=env_files,
+                environment=dict(environment),
             )
     if not services:
         return None

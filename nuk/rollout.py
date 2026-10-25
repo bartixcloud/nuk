@@ -258,6 +258,14 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         if router_mode and strategy is not None and strategy.type == "blue-green"
         else None
     )
+    # The app's own PUBLIC_URL is derived, never copied by hand: exactly one
+    # ingress host is canonical, anything else is ambiguous. nuk never guesses.
+    public_url = nuk.public_url(ingress)
+    if ingress and public_url is None:
+        print(
+            f"{name}: ingress serves {len({ing.host for ing in ingress})} hosts — "
+            f"NUK_PUBLIC_URL not set"
+        )
     nuk.write_override(
         name,
         ingress,
@@ -267,6 +275,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         publish_ip=self_ip if (edge_term and not router_mode) else None,
         local_data=remote_ip is None,
         colours=router_colours,
+        public_url=public_url,
     )
     migrate = manifest.spec.migrate
     if manifest.kind == "Deployment" and migrate is not None and pin_digest is None:
