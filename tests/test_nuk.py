@@ -308,6 +308,86 @@ def test_override_empty_is_none():
     assert nuk.build_override("x", []) is None
 
 
+# --- public URL: derived from the deployment's single ingress host ------------
+
+
+def test_public_url_is_https_of_the_only_host():
+    ingress = [nuk.Ingress.model_validate({"host": "kolbeapp.de", "service": "web", "port": 80})]
+    assert nuk.public_url(ingress) == "https://kolbeapp.de"
+
+
+def test_public_url_ignores_repeated_entries_for_the_same_host():
+    ingress = [
+        nuk.Ingress.model_validate(
+            {"host": "kolbeapp.de", "path": "/api", "service": "backend", "port": 8000}
+        ),
+        nuk.Ingress.model_validate({"host": "kolbeapp.de", "service": "frontend", "port": 80}),
+    ]
+    assert nuk.public_url(ingress) == "https://kolbeapp.de"
+
+
+def test_public_url_is_none_with_two_hosts():
+    ingress = [
+        nuk.Ingress.model_validate({"host": "kolbeapp.de", "service": "frontend", "port": 80}),
+        nuk.Ingress.model_validate({"host": "api.kolbeapp.de", "service": "backend", "port": 8000}),
+    ]
+    assert nuk.public_url(ingress) is None
+
+
+def test_public_url_is_none_without_ingress():
+    assert nuk.public_url([]) is None
+
+
+def test_public_url_www_is_not_a_second_host():
+    """`www: true` renders a redirect to the canonical host, not another host."""
+    ingress = [
+        nuk.Ingress.model_validate(
+            {"host": "kolbeapp.de", "service": "frontend", "port": 80, "www": True}
+        )
+    ]
+    assert nuk.public_url(ingress) == "https://kolbeapp.de"
+
+
+# --- override: NUK_PUBLIC_URL reaches every wired container -------------------
+
+
+def test_override_sets_nuk_public_url_on_every_service():
+    ov = _override(
+        "kolbe",
+        [
+            {"host": "kolbeapp.de", "path": "/api", "service": "backend", "port": 8000},
+            {"host": "kolbeapp.de", "service": "frontend", "port": 80},
+        ],
+        public_url="https://kolbeapp.de",
+    )
+    expected = {"NUK_PUBLIC_URL": "https://kolbeapp.de"}
+    assert ov["services"] == {
+        "backend": {"networks": ["edge"], "environment": expected},
+        "frontend": {"networks": ["edge"], "environment": expected},
+    }
+
+
+def test_override_sets_nuk_public_url_on_colour_services():
+    ov = _override(
+        "kolbe",
+        [{"host": "kolbeapp.de", "service": "backend", "port": 8000}],
+        colours=["blue", "green"],
+        public_url="https://kolbeapp.de",
+    )
+    assert set(ov["services"]) == {"backend-blue", "backend-green"}
+    for svc in ov["services"].values():
+        assert svc["environment"] == {"NUK_PUBLIC_URL": "https://kolbeapp.de"}
+
+
+def test_override_without_public_url_omits_environment():
+    ov = _override(
+        "kolbe",
+        [{"host": "kolbeapp.de", "service": "web", "port": 80}],
+        public_url=None,
+    )
+    assert ov["services"] == {"web": {"networks": ["edge"]}}
+
+
 # --- override: data-network join + env_file when a database is requested ------
 
 

@@ -411,6 +411,46 @@ def test_router_mode_override_targets_colour_services_on_the_edge_network(tmp_pa
     assert ov["networks"]["edge"] == {"external": True}
 
 
+def test_apply_sets_nuk_public_url_from_the_single_ingress_host(tmp_path, monkeypatch):
+    """The apply path derives NUK_PUBLIC_URL from the ingress and writes it into the override."""
+    import yaml
+
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines, real_override=True)
+    doc = _write(tmp_path, NON_STRATEGY_INGRESS_YML)
+    nuk.cmd_apply(doc, None)
+
+    ov = yaml.safe_load(
+        (tmp_path / "proj" / "kolbe" / "compose.override.yml").read_text(encoding="utf-8")
+    )
+    assert ov["services"]["frontend"]["environment"] == {
+        "NUK_PUBLIC_URL": "https://kolbe.astrojones.de"
+    }
+
+
+def test_apply_with_several_hosts_sets_no_nuk_public_url_and_says_so(tmp_path, monkeypatch, capsys):
+    """Several ingress hosts are ambiguous: nuk sets nothing and prints one notice."""
+    import yaml
+
+    lines: list[tuple[str, ...]] = []
+    _stub_apply(tmp_path, monkeypatch, lines, real_override=True)
+    doc = _write(
+        tmp_path,
+        NON_STRATEGY_INGRESS_YML.replace(
+            "        - {host: kolbe.astrojones.de, service: frontend, port: 80}",
+            "        - {host: kolbe.astrojones.de, service: frontend, port: 80}\n"
+            "        - {host: kolbeapp.de, service: frontend, port: 80}",
+        ),
+    )
+    nuk.cmd_apply(doc, None)
+
+    ov = yaml.safe_load(
+        (tmp_path / "proj" / "kolbe" / "compose.override.yml").read_text(encoding="utf-8")
+    )
+    assert "environment" not in ov["services"]["frontend"]
+    assert "kolbe: ingress serves 2 hosts — NUK_PUBLIC_URL not set" in capsys.readouterr().out
+
+
 def test_apply_without_strategy_keeps_the_plain_up(tmp_path, monkeypatch):
     """A non-strategy deployment still does a single `up -d`, no profile, no flip."""
     lines: list[tuple[str, ...]] = []

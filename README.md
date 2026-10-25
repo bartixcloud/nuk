@@ -135,6 +135,13 @@ script to stdout instead, to inspect or install by hand.
    service to the external `edge` network (and the private `data` network + the creds
    `env_file` when a database was requested) — so your compose file stays Traefik- and
    DB-agnostic.
+   When the ingress names exactly ONE host, every wired service also receives
+   `NUK_PUBLIC_URL=https://<host>` in its container `environment` (not a file: it is
+   derived, not a secret, and an `environment` key merges over your compose file's own).
+   That is the app's fixed public origin — for OAuth callbacks, e-mails sent outside a
+   request, and origin allowlists — and the app reads it under its own variable name.
+   With zero or several distinct ingress hosts nuk sets nothing and prints a notice: it
+   never guesses a host.
 4. Writes `/opt/nuklaut/traefik/dynamic/<name>.yml` with one Traefik router + service
    per ingress entry (TLS via the `letsencrypt` resolver).
 5. Copies the manifest to `/opt/nuklaut/deployments/<name>/manifest.yml`.

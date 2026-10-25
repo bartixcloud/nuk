@@ -64,10 +64,19 @@ def write_override(  # noqa: PLR0913, PLR0917  # thin writer over build_override
     local_data: bool = True,
     *,
     colours: list[str] | None = None,
+    public_url: str | None = None,
 ) -> None:
     """Render and write `compose.override.yml` for an app (no-op when empty)."""
     doc = nuk.build_override(
-        name, ingress, db_env, env_from, db_services, publish_ip, local_data, colours=colours
+        name,
+        ingress,
+        db_env,
+        env_from,
+        db_services,
+        publish_ip,
+        local_data,
+        colours=colours,
+        public_url=public_url,
     )
     if doc is None:
         return
