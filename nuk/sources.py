@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import shlex
 import subprocess  # noqa: S404
+import sys
 from pathlib import Path  # noqa: TC003
 from typing import Literal
 
@@ -36,6 +37,25 @@ from nuk.util import (
 # host verification (2026-08-15) are re-encoded as tests here.
 
 
+def _verify(repo: Path, signers: Path, tag: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(  # noqa: S603  # fixed argv, no shell
+        [  # noqa: S607  # git on PATH
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "gpg.format=ssh",
+            "-c",
+            f"gpg.ssh.allowedSignersFile={signers}",
+            "verify-tag",
+            tag,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
 def verify_tag(repo: Path, signers: Path, tag: str) -> bool:
     """Whether `tag`'s signature verifies against the allowed-signers file.
 
@@ -43,24 +63,7 @@ def verify_tag(repo: Path, signers: Path, tag: str) -> bool:
     from the repo's own config: a repo that names its own trust anchor does not
     have one.
     """
-    return (
-        subprocess.run(  # noqa: S603  # fixed argv, no shell
-            [  # noqa: S607  # git on PATH
-                "git",
-                "-C",
-                str(repo),
-                "-c",
-                "gpg.format=ssh",
-                "-c",
-                f"gpg.ssh.allowedSignersFile={signers}",
-                "verify-tag",
-                tag,
-            ],
-            check=False,
-            capture_output=True,
-        ).returncode
-        == 0
-    )
+    return _verify(repo, signers, tag).returncode == 0
 
 
 def resolve_signed_tag(repo: Path, signers: Path) -> str | None:
@@ -78,6 +81,10 @@ def resolve_signed_tag(repo: Path, signers: Path) -> str | None:
     changes" every cycle while a newer signed tag sat unapplied (found on the host
     2026-08-15, v2.0.1 shadowing v2.1.0). Tags on unrelated histories fall back to
     the creatordate-newest, which is the best available answer.
+
+    Skipping is silent to the loop but never to the operator: every rejected tag
+    the result does not already contain is reported on stderr with git's reason,
+    because a release signed with the wrong key otherwise just never lands.
     """
     try:
         refs = _git(
@@ -86,8 +93,12 @@ def resolve_signed_tag(repo: Path, signers: Path) -> str | None:
     except subprocess.CalledProcessError:
         return None
     best: str | None = None
+    rejected: list[tuple[str, str]] = []
     for tag in (t.strip() for t in refs if t.strip()):
-        if not verify_tag(repo, signers, tag):
+        proc = _verify(repo, signers, tag)
+        if proc.returncode != 0:
+            reason = (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[-1]
+            rejected.append((tag, reason))
             continue
         if best is None:
             best = tag
@@ -96,6 +107,13 @@ def resolve_signed_tag(repo: Path, signers: Path) -> str | None:
             repo, f"{tag}^{{commit}}", f"{best}^{{commit}}"
         ):
             best = tag
+    for tag, reason in rejected:
+        if best is None or not _is_ancestor(repo, f"{tag}^{{commit}}", f"{best}^{{commit}}"):
+            print(
+                f"IGNORING tag {tag} in {repo}: signature does not verify against {signers} "
+                f"({reason}) — it will NOT deploy; applying {best or 'nothing'} instead",
+                file=sys.stderr,
+            )
     return best
 
 

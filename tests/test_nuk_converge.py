@@ -126,6 +126,40 @@ def test_resolve_skips_an_unsigned_tag_rather_than_failing(repo, signer):
     assert nuk.resolve_signed_tag(repo, signers) == "v1.0.0"
 
 
+def test_resolve_reports_a_newer_unverified_tag_loudly(repo, signer, tmp_path, capsys):
+    """Regression: jonesh v0.3.1 was signed with a personal key, not the tenant key.
+
+    It was skipped without a word, so the host kept converging v0.3.0 and reported
+    nothing while the release never landed.
+    """
+    pubkey, signers = signer
+    _sign_tag(repo, pubkey, "v1.0.0")
+    _commit(repo, "2")
+    other = tmp_path / "other"
+    _run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "other", "-f", str(other))
+    _sign_tag(repo, other.with_suffix(".pub"), "v1.1.0")
+
+    assert nuk.resolve_signed_tag(repo, signers) == "v1.0.0"
+    err = capsys.readouterr().err
+    assert "v1.1.0" in err
+    assert "NOT deploy" in err
+    assert "No principal matched" in err
+
+
+def test_resolve_stays_quiet_about_an_unverified_tag_already_covered(
+    repo, signer, tmp_path, capsys
+):
+    """An unverified tag on a commit the chosen tag already contains changes nothing."""
+    pubkey, signers = signer
+    other = tmp_path / "other"
+    _run("ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "other", "-f", str(other))
+    _sign_tag(repo, other.with_suffix(".pub"), "v1.0.0")
+    _sign_tag(repo, pubkey, "v1.0.1")
+
+    assert nuk.resolve_signed_tag(repo, signers) == "v1.0.1"
+    assert capsys.readouterr().err == ""
+
+
 def test_resolve_prefers_the_topological_descendant_over_creatordate(repo, signer):
     """Regression: v2.0.1 shadowed v2.1.0 during host verification 2026-08-15.
 
