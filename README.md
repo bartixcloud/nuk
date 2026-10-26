@@ -251,4 +251,18 @@ nuk is operated by the **nuklaut** controller. Org repos deploy themselves via t
 (label `nuklaut`): the manifest lives at `deployment.yml` (repo root — `apply` falls back
 to a legacy `.nuklaut/deployment.yml` if absent), the image goes to
 `ghcr.io/<owner>/<repo>`, and per-app secrets live at `/opt/nuklaut/secrets/<repo>.env`.
- 
+
+### Source trust
+
+Each `sources[]` entry in `/etc/nuklaut/sources.yml` carries a trust mode, `verify`:
+
+- `verify: signed` (default) — the applied tag must be SSH-signed by a key in
+  `/etc/nuklaut/allowed_signers.d/<name>`, and that file must exist.
+- `verify: none` — no anchor file and no signature check. nuk applies the newest `v*`
+  tag whose commit is an ancestor of `origin/main`, so the mode is no more powerful
+  than push access to `main`; the downgrade guard still applies, and the cycle's
+  `target:` log line ends in `UNVERIFIED`.
+
+The platform source — the one applying `facilities` — must be `signed`: an unsigned
+platform tag would let anyone able to push there choose what every host applies. Each
+source's mode is recorded as `verify` in `converge-status.json`.

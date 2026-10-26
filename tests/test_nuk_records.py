@@ -134,7 +134,33 @@ def test_source_block_golden_key_order():
         "manifests",
         "rendered",
         "refusedRoutes",
+        "verify",
     ]
+
+
+def test_source_block_wire_carries_verify():
+    wire = SourceBlock(verify="none").to_wire()
+    assert wire["verify"] == "none"
+    block = SourceBlock.from_wire(wire)
+    assert block is not None
+    assert block.verify == "none"
+
+
+def test_source_block_reads_an_older_status_without_verify():
+    """A status written by a nuk without the field is signed-mode, the safe default."""
+    older = {
+        "result": "ok",
+        "error": None,
+        "tag": "v1.0.0",
+        "commit": "abc",
+        "apply": [],
+        "manifests": [],
+        "rendered": [],
+        "refusedRoutes": [],
+    }
+    block = SourceBlock.from_wire(older)
+    assert block is not None
+    assert block.verify == "signed"
 
 
 def test_converge_status_logging_and_error_are_absent_not_null():
