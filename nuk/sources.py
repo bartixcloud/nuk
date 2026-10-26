@@ -66,8 +66,34 @@ def verify_tag(repo: Path, signers: Path, tag: str) -> bool:
     return _verify(repo, signers, tag).returncode == 0
 
 
-def resolve_signed_tag(repo: Path, signers: Path) -> str | None:
+def _report_rejected(
+    repo: Path, rejected: list[tuple[str, str]], best: str | None, signers: Path | None
+) -> None:
+    """Name every rejected candidate the chosen tag does not already contain.
+
+    A rejected tag that is an ancestor of `best` would have deployed anyway, so
+    reporting it every cycle would be noise.
+    """
+    if signers is None:
+        return
+    for tag, reason in rejected:
+        if best is None or not _is_ancestor(repo, f"{tag}^{{commit}}", f"{best}^{{commit}}"):
+            print(
+                f"IGNORING tag {tag} in {repo}: signature does not verify against {signers} "
+                f"({reason}) — it will NOT deploy; applying {best or 'nothing'} instead",
+                file=sys.stderr,
+            )
+
+
+def resolve_signed_tag(
+    repo: Path, signers: Path | None, *, within: str | None = None
+) -> str | None:
     """The newest `v*` tag whose signature verifies, or None if none does.
+
+    `signers=None` is a tenant source's `verify: none`: there is nothing to verify,
+    so every tag is a candidate. `within`, when given, keeps only tags whose commit
+    is an ancestor of that ref, so a tag cut on a side branch can never deploy over
+    plain `main`.
 
     Iterates ALL candidates rather than verifying only the newest: one unsigned
     tag pushed by anyone with write access would otherwise be a denial of service
@@ -95,11 +121,14 @@ def resolve_signed_tag(repo: Path, signers: Path) -> str | None:
     best: str | None = None
     rejected: list[tuple[str, str]] = []
     for tag in (t.strip() for t in refs if t.strip()):
-        proc = _verify(repo, signers, tag)
-        if proc.returncode != 0:
-            reason = (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[-1]
-            rejected.append((tag, reason))
+        if within is not None and not _is_ancestor(repo, f"{tag}^{{commit}}", within):
             continue
+        if signers is not None:
+            proc = _verify(repo, signers, tag)
+            if proc.returncode != 0:
+                reason = (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[-1]
+                rejected.append((tag, reason))
+                continue
         if best is None:
             best = tag
             continue
@@ -107,13 +136,7 @@ def resolve_signed_tag(repo: Path, signers: Path) -> str | None:
             repo, f"{tag}^{{commit}}", f"{best}^{{commit}}"
         ):
             best = tag
-    for tag, reason in rejected:
-        if best is None or not _is_ancestor(repo, f"{tag}^{{commit}}", f"{best}^{{commit}}"):
-            print(
-                f"IGNORING tag {tag} in {repo}: signature does not verify against {signers} "
-                f"({reason}) — it will NOT deploy; applying {best or 'nothing'} instead",
-                file=sys.stderr,
-            )
+    _report_rejected(repo, rejected, best, signers)
     return best
 
 
@@ -277,9 +300,10 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
     The repo is bare: the tree is only ever read through `git archive` of a verified
     commit, never from a worktree.
 
-    Both refs are fetched in one round trip: the signed `v*` tags (always verified
-    against the source's own signers) and the branch head (`SOURCE_BRANCH`). The
-    branch head is UNSIGNED — branch mode is a non-prod opt-in, so it is not
+    Both refs are fetched in one round trip: the `v*` tags and the branch head
+    (`SOURCE_BRANCH`). A `verify: signed` source verifies every tag against its own
+    signers file; a `verify: none` source takes the newest tag on main without one.
+    The branch head is UNSIGNED — branch mode is a non-prod opt-in, so it is not
     signature-checked here and the tag downgrade guard does not apply to it.
 
     Returns:
@@ -289,7 +313,7 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
         ValueError: With the refusal reason; nothing but fetched objects changes.
     """
     signers = signers_dir / src.name
-    if not signers.is_file():
+    if src.verify == "signed" and not signers.is_file():
         msg = f"trust anchor {signers} (allowed_signers.d/{src.name}) is missing or unreadable"
         raise ValueError(msg)
     sdir = source_state_dir(state_dir, src.name)
@@ -357,10 +381,16 @@ def sync_source(src: SourceEntry, signers_dir: Path, state_dir: Path) -> tuple[s
         detail = (proc.stderr.strip().splitlines() or [f"exit {proc.returncode}"])[-1]
         msg = f"git fetch failed ({detail}) — no network, no change"
         raise ValueError(msg)
-    tag = resolve_signed_tag(repo, signers)
-    if tag is None:
-        msg = f"no v* tag verifies against {signers}"
-        raise ValueError(msg)
+    if src.verify == "signed":
+        tag = resolve_signed_tag(repo, signers)
+        if tag is None:
+            msg = f"no v* tag verifies against {signers}"
+            raise ValueError(msg)
+    else:
+        tag = resolve_signed_tag(repo, None, within=branch_ref)
+        if tag is None:
+            msg = f"no v* tag on {SOURCE_BRANCH}"
+            raise ValueError(msg)
     # The downgrade guard is TAG-MODE ONLY: it compares the newest signed tag against
     # the last applied one and never the branch head. The branch head is fetched and
     # archived for unsigned deployments, but a branch head that is older than the
