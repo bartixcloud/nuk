@@ -512,6 +512,33 @@ def test_load_sources_refuses_a_missing_file(tmp_path):
         nuk.load_sources(tmp_path / "absent.yml")
 
 
+def test_a_source_defaults_to_signed(tmp_path):
+    sources = nuk.load_sources(_sources(tmp_path, SOURCES_YML))
+    assert [s.verify for s in sources.sources] == ["signed", "signed"]
+
+
+def test_a_tenant_source_may_opt_out_of_signing(tmp_path):
+    body = SOURCES_YML.replace("apply: [routes]", "apply: [routes]\n    verify: none", 1)
+    sources = nuk.load_sources(_sources(tmp_path, body))
+    by_name = {s.name: s for s in sources.sources}
+    assert by_name["astrojones"].verify == "none"
+    assert by_name["bartixcloud"].verify == "signed"
+
+
+def test_load_sources_refuses_unsigned_platform(tmp_path):
+    body = SOURCES_YML.replace(
+        "apply: [facilities, routes]", "apply: [facilities, routes]\n    verify: none"
+    )
+    with pytest.raises(ValueError, match=r"platform source .* signed"):
+        nuk.load_sources(_sources(tmp_path, body))
+
+
+def test_load_sources_refuses_an_unknown_verify_value(tmp_path):
+    body = SOURCES_YML.replace("apply: [routes]", "apply: [routes]\n    verify: maybe", 1)
+    with pytest.raises(ValueError, match="signed"):
+        nuk.load_sources(_sources(tmp_path, body))
+
+
 def test_git_ssh_command_pins_the_deploy_key_and_the_host_key():
     argv = shlex.split(nuk.git_ssh_command(Path("/k/with space")))
     assert argv[:3] == ["ssh", "-i", "/k/with space"]

@@ -181,6 +181,7 @@ class SourceEntry(BaseModel):
     repo: str
     deploy_key: Path
     apply: list[SourceApply] = Field(min_length=1)
+    verify: Literal["signed", "none"] = "signed"
 
     @property
     def is_platform(self) -> bool:
@@ -215,6 +216,15 @@ class SourcesFile(BaseModel):
             raise ValueError(msg)
         if "databases" in platform[0].apply:
             msg = "the platform source cannot apply `databases` (tenant sources only)"
+            raise ValueError(msg)
+        # The platform source's tag is the root of the fleet's trust: a tenant may
+        # accept unsigned tags for its own tree, but an unsigned platform tag would
+        # let anyone who can push to that repo define what every host applies.
+        if platform[0].verify != "signed":
+            msg = (
+                f"the platform source {platform[0].name} must be signed "
+                f"(verify: signed), not verify: {platform[0].verify}"
+            )
             raise ValueError(msg)
         return self
 
