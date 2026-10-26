@@ -86,9 +86,10 @@ class SourceBlock:
     manifests: list[ManifestResult] = field(default_factory=list)
     rendered: list[str] = field(default_factory=list)
     refused_routes: list[str] = field(default_factory=list)
+    verify: Literal["signed", "none"] = "signed"
 
     def to_wire(self) -> dict[str, Json]:
-        """All eight keys, always, in this order."""
+        """All nine keys, always, in this order."""
         return {
             "result": self.result,
             "error": self.error,
@@ -98,11 +99,12 @@ class SourceBlock:
             "manifests": [m.to_wire() for m in self.manifests],
             "rendered": [*self.rendered],
             "refusedRoutes": [*self.refused_routes],
+            "verify": self.verify,
         }
 
     @classmethod
     def from_wire(cls, obj: object) -> Self | None:
-        """None for a non-conforming block; a missing list reads as empty."""
+        """None for a non-conforming block; missing lists read empty, missing verify as signed."""
         if not isinstance(obj, dict):
             return None
         raw_manifests = obj.get("manifests")
@@ -113,8 +115,8 @@ class SourceBlock:
         error = obj.get("error")
         if None in manifests or not (error is None or isinstance(error, str)):
             return None
-        match obj.get("result"):
-            case "ok" | "refused" as result:
+        match obj.get("result"), obj.get("verify", "signed"):
+            case ("ok" | "refused" as result, "signed" | "none" as verify):
                 return cls(
                     result,
                     error,
@@ -124,6 +126,7 @@ class SourceBlock:
                     [m for m in manifests if m is not None],
                     _str_list(obj.get("rendered")),
                     _str_list(obj.get("refusedRoutes")),
+                    verify,
                 )
         return None
 

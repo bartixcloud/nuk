@@ -361,7 +361,7 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
     scratch: Path,
     platform: Path | None,
 ) -> nuk.TreeContext:
-    """Sync, verify and archive one source and build its context; fill tag/commit in `block`.
+    """Sync, verify and archive one source and build its context; fill tag/commit/verify in `block`.
 
     Both refs are archived: the signed tag's tree under `tag` and the branch head's
     under `branch`. `ctx.tree` remains the tag tree (what a signed deployment
@@ -372,6 +372,7 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
         ValueError: With the refusal reason (also CalledProcessError/OSError/SystemExit from
             the git and manifest layers — `_SOURCE_FAILURES`).
     """
+    block.verify = src.verify
     if not src.is_platform and platform is None:
         msg = (
             "the platform source did not verify this cycle — no facilities or org to apply against"
@@ -379,7 +380,10 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
         raise ValueError(msg)
     tag, tag_sha, branch_sha = nuk.sync_source(src, signers_dir, state_dir)
     block.tag, block.commit = tag, tag_sha
-    print(f"target: {src.name} {tag} ({tag_sha[:12]}) role={role}")
+    if src.verify == "none":
+        print(f"target: {src.name} {tag} ({tag_sha[:12]}) UNVERIFIED")
+    else:
+        print(f"target: {src.name} {tag} ({tag_sha[:12]}) role={role}")
     repo = nuk.source_state_dir(state_dir, src.name) / "repo"
     tag_tree = scratch / src.name / "tag"
     branch_tree = scratch / src.name / "branch"

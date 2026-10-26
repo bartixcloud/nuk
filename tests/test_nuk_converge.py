@@ -512,6 +512,33 @@ def test_load_sources_refuses_a_missing_file(tmp_path):
         nuk.load_sources(tmp_path / "absent.yml")
 
 
+def test_a_source_defaults_to_signed(tmp_path):
+    sources = nuk.load_sources(_sources(tmp_path, SOURCES_YML))
+    assert [s.verify for s in sources.sources] == ["signed", "signed"]
+
+
+def test_a_tenant_source_may_opt_out_of_signing(tmp_path):
+    body = SOURCES_YML.replace("apply: [routes]", "apply: [routes]\n    verify: none", 1)
+    sources = nuk.load_sources(_sources(tmp_path, body))
+    by_name = {s.name: s for s in sources.sources}
+    assert by_name["astrojones"].verify == "none"
+    assert by_name["bartixcloud"].verify == "signed"
+
+
+def test_load_sources_refuses_unsigned_platform(tmp_path):
+    body = SOURCES_YML.replace(
+        "apply: [facilities, routes]", "apply: [facilities, routes]\n    verify: none"
+    )
+    with pytest.raises(ValueError, match=r"platform source .* signed"):
+        nuk.load_sources(_sources(tmp_path, body))
+
+
+def test_load_sources_refuses_an_unknown_verify_value(tmp_path):
+    body = SOURCES_YML.replace("apply: [routes]", "apply: [routes]\n    verify: maybe", 1)
+    with pytest.raises(ValueError, match="signed"):
+        nuk.load_sources(_sources(tmp_path, body))
+
+
 def test_git_ssh_command_pins_the_deploy_key_and_the_host_key():
     argv = shlex.split(nuk.git_ssh_command(Path("/k/with space")))
     assert argv[:3] == ["ssh", "-i", "/k/with space"]
@@ -546,9 +573,13 @@ def tenant_origin(repo, principals, tmp_path):
     return repo, origin, keys, signers_dir
 
 
-def _src(origin, name="astrojones"):
+def _src(origin, name="astrojones", verify="signed"):
     return nuk.SourceEntry(
-        name=name, repo=str(origin), deploy_key="/nonexistent/key", apply=["deployments"]
+        name=name,
+        repo=str(origin),
+        deploy_key="/nonexistent/key",
+        apply=["deployments"],
+        verify=verify,
     )
 
 
@@ -618,6 +649,63 @@ def test_sync_source_fetches_with_the_deploy_key(tenant_origin, tmp_path, monkey
     monkeypatch.setattr(nuk.subprocess, "run", spy)
     nuk.sync_source(_src(origin), signers_dir, tmp_path / "state")
     assert seen == [nuk.git_ssh_command(Path("/nonexistent/key"))]
+
+
+# --- verify: none — a tenant may accept unsigned tags on its own main ---------------
+
+
+def test_none_mode_applies_an_unsigned_tag_without_an_anchor_file(repo, tmp_path):
+    _plain_tag(repo, "v1.0.0")
+    tip = _run("git", "rev-parse", "HEAD", cwd=repo).stdout.strip()
+    origin = tmp_path / "origin.git"
+    _run("git", "clone", "--bare", "-q", str(repo), str(origin))
+    assert nuk.sync_source(
+        _src(origin, verify="none"), tmp_path / "no-such-dir", tmp_path / "state"
+    ) == ("v1.0.0", tip, tip)
+
+
+def test_none_mode_skips_a_tag_that_is_not_on_main(repo, tmp_path):
+    _plain_tag(repo, "v1.0.0")
+    _run("git", "checkout", "-q", "-b", "side", cwd=repo)
+    _commit(repo, "side")
+    _plain_tag(repo, "v2.0.0")
+    _run("git", "checkout", "-q", "main", cwd=repo)
+    origin = tmp_path / "origin.git"
+    _run("git", "clone", "--bare", "-q", str(repo), str(origin))
+    tag, _, _ = nuk.sync_source(
+        _src(origin, verify="none"), tmp_path / "no-such-dir", tmp_path / "state"
+    )
+    assert tag == "v1.0.0"
+
+
+def test_none_mode_still_refuses_a_downgrade(repo, tmp_path):
+    _plain_tag(repo, "v1.0.0")
+    origin = tmp_path / "origin.git"
+    _run("git", "clone", "--bare", "-q", str(repo), str(origin))
+    state = tmp_path / "state"
+    src = _src(origin, verify="none")
+    assert nuk.sync_source(src, tmp_path / "no-such-dir", state)[0] == "v1.0.0"
+    _commit(repo, "2")
+    _plain_tag(repo, "v1.1.0")
+    _run("git", "push", "-q", str(origin), "main", "--tags", cwd=repo)
+    tag, commit, _branch = nuk.sync_source(src, tmp_path / "no-such-dir", state)
+    assert tag == "v1.1.0"
+    nuk.record_applied(tag, commit, nuk.source_state_dir(state, "astrojones") / "last-applied-tag")
+    _run("git", "-C", str(origin), "tag", "-d", "v1.1.0")
+    with pytest.raises(ValueError, match="not a descendant"):
+        nuk.sync_source(src, tmp_path / "no-such-dir", state)
+
+
+def test_none_mode_picks_the_newest_descendant(repo, tmp_path):
+    _plain_tag(repo, "v1.0.0")
+    _commit(repo, "2")
+    _plain_tag(repo, "v1.1.0")
+    origin = tmp_path / "origin.git"
+    _run("git", "clone", "--bare", "-q", str(repo), str(origin))
+    tag, _, _ = nuk.sync_source(
+        _src(origin, verify="none"), tmp_path / "no-such-dir", tmp_path / "state"
+    )
+    assert tag == "v1.1.0"
 
 
 # --- archive_tree: a tenant repo is untrusted input to a root process ---------------

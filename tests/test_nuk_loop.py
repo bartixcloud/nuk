@@ -218,19 +218,19 @@ class Fleet:
         self.use(("bartixcloud", ["facilities"]), ("astrojones", ["deployments"]))
 
     def use(self, *entries):
-        """Write sources.yml from (name, apply) pairs."""
-        doc = {
-            "sources": [
-                {
-                    "name": name,
-                    "repo": str(self.origins[name].bare),
-                    "deploy_key": "/nonexistent/key",
-                    "apply": apply,
-                }
-                for name, apply in entries
-            ]
-        }
-        self.sources_file.write_text(yaml.safe_dump(doc), encoding="utf-8")
+        """Write sources.yml from (name, apply[, verify]) tuples."""
+        sources = []
+        for name, apply, *verify in entries:
+            entry = {
+                "name": name,
+                "repo": str(self.origins[name].bare),
+                "deploy_key": "/nonexistent/key",
+                "apply": apply,
+            }
+            if verify:
+                entry["verify"] = verify[0]
+            sources.append(entry)
+        self.sources_file.write_text(yaml.safe_dump({"sources": sources}), encoding="utf-8")
 
     def converge(self):
         return nuk.cmd_converge(
@@ -358,6 +358,15 @@ def test_a_missing_signers_file_refuses_that_source_only(fleet):
     assert sources["bartixcloud"]["result"] == "ok"
 
 
+def test_converge_prints_unverified_for_a_none_source(fleet, capsys):
+    fleet.use(("bartixcloud", ["facilities"]), ("astrojones", ["deployments"], "none"))
+    assert fleet.converge() == 0
+    out = capsys.readouterr().out.splitlines()
+    target = next(line for line in out if line.startswith("target: astrojones "))
+    assert target.endswith("UNVERIFIED")
+    assert fleet.status()["sources"]["astrojones"]["verify"] == "none"
+
+
 def test_a_downgrade_is_refused_and_the_prior_state_untouched(fleet):
     origin = fleet.origins["astrojones"]
     origin.release("v1.1.0", {"deployments/more.yml": HELLO.replace("hello", "more")})
@@ -435,7 +444,9 @@ def test_the_status_has_the_c3_shape(fleet, monkeypatch):
         "manifests",
         "rendered",
         "refusedRoutes",
+        "verify",
     }
+    assert block["verify"] == "signed"
     assert block["apply"] == ["deployments"]
     assert block["manifests"] == [
         {"name": "hello", "kind": "Deployment", "result": "ok", "error": None}
@@ -808,7 +819,8 @@ def test_converge_status_file_is_byte_identical_to_golden(tmp_path, monkeypatch)
         "        }\n"
         "      ],\n"
         '      "rendered": [],\n'
-        '      "refusedRoutes": []\n'
+        '      "refusedRoutes": [],\n'
+        '      "verify": "signed"\n'
         "    }\n"
         "  },\n"
         '  "logging": {\n'
