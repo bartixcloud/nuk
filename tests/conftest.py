@@ -50,7 +50,7 @@ def stub_apply(
     monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.10.107"))
     monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
-    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
+    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s, **_k: [])
     if not real_override:
         monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "persist_manifest", lambda *_a: None)
