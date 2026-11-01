@@ -36,6 +36,11 @@ SOURCES_FILE = Path("/etc/nuklaut/sources.yml")
 # One signers file per source, named after it: a tenant's key can verify that tenant's
 # tags and nobody else's (contracts C3). Plain `git verify-tag`, no principal flag.
 SIGNERS_DIR = Path("/etc/nuklaut/allowed_signers.d")
+# One age identity per source, named after it (`platform` for the platform source): a
+# tenant's sopsFile entries decrypt with that tenant's key and nobody else's.
+AGE_DIR = Path("/etc/nuklaut/age.d")
+# Decrypted env files; tmpfs, so a reboot drops them and nuk re-renders on demand.
+RUN_SECRETS = Path("/run/nuklaut/secrets")
 # github.com's host key, pinned by cloud-init; the deploy-key fetch never trusts on first use.
 KNOWN_HOSTS = Path("/etc/nuklaut/known_hosts")
 

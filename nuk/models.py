@@ -121,11 +121,26 @@ class Ingress(BaseModel):
 
 
 class EnvFrom(BaseModel):
-    """One `spec.envFrom[]` entry — a secret env-file reference."""
+    """One `spec.envFrom[]` entry — a secret env-file reference or a sops ciphertext."""
 
     model_config = ConfigDict(populate_by_name=True)
 
     secret_ref: str | None = Field(default=None, alias="secretRef")
+    # Tree-relative ciphertext, decrypted at apply with the tenant's own age key.
+    sops_file: str | None = Field(default=None, alias="sopsFile")
+
+    @model_validator(mode="after")
+    def _exactly_one_source(self) -> EnvFrom:
+        if (self.secret_ref is None) == (self.sops_file is None):
+            msg = "envFrom entry needs exactly one of secretRef, sopsFile"
+            raise ValueError(msg)
+        f = self.sops_file
+        if f is not None and (
+            f.startswith("/") or ".." in f.split("/") or not f.endswith(".enc.env")
+        ):
+            msg = f"sopsFile {f!r} must be tree-relative, without .., ending .enc.env"
+            raise ValueError(msg)
+        return self
 
 
 class Postgres(BaseModel):
