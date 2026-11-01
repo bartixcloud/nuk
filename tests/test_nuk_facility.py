@@ -385,7 +385,7 @@ def test_sourceless_facility_mirrors_its_payload(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deployments")
     monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
-    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
+    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s, **_k: [])
     monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "write_ingress", lambda *_a: None)
     monkeypatch.setattr(nuk, "persist_manifest", lambda *_a: None)

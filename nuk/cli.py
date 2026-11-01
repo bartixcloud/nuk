@@ -27,6 +27,9 @@ Manifest (apiVersion: nuk/v1, kind: Deployment):
   spec.envFrom[].secretRef -> existing env files injected into each
     ingress service's container env via the compose override (and also
     passed to `docker compose --env-file` for ${VAR} interpolation).
+  spec.envFrom[].sopsFile -> tree-relative *.enc.env, decrypted at apply with the
+    tenant's age key (/etc/nuklaut/age.d/<tenant>.key) into /run/nuklaut/secrets;
+    a missing file or key refuses the apply. One of secretRef/sopsFile per entry.
   spec.databases: {postgres: true, redis: true} -> per-app DB on the
     shared data stack; injects DATABASE_URL / REDIS_URL into the
     ingress service(s). Override the injection target with

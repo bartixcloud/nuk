@@ -445,7 +445,7 @@ def test_all_in_one_owner_derives_local_not_remote(tmp_path, monkeypatch):
     monkeypatch.setattr(nuk, "project_dir", lambda name: tree / "proj" / name)
     monkeypatch.setattr(nuk, "sh", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "resolve_db_services", lambda *_a: [])
-    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s: [])
+    monkeypatch.setattr(nuk, "resolve_env_from", lambda _s, **_k: [])
     monkeypatch.setattr(nuk, "write_override", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "write_ingress", lambda *_a: None)
     monkeypatch.setattr(nuk, "persist_manifest", lambda *_a: None)

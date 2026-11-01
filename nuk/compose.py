@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import yaml
 
 import nuk
+from nuk import secrets
 
 if TYPE_CHECKING:
     from nuk import ComposeImage
@@ -24,24 +25,45 @@ def compose_args(name: str, spec: Spec) -> list[str]:
     args = ["docker", "compose", "-p", name, "-f", str(repo / spec.compose.file)]
     if override.exists():
         args += ["-f", str(override)]
-    for ref in resolve_env_from(spec):
+    for ref in resolve_env_from(spec, name=name, tenant=_stored_tenant(name)):
         args += ["--env-file", ref]
     return args
 
 
-def resolve_env_from(spec: Spec) -> list[str]:
-    """Resolve `spec.envFrom[].secretRef` entries to existing file paths.
+def _stored_tenant(name: str) -> str | None:
+    """The source tenant recorded at apply; None (the platform key) when absent."""
+    try:
+        recorded = (nuk.project_dir(name) / "tenant").read_text().strip()
+    except OSError:
+        return None
+    return None if recorded in {"", secrets.key_name(None)} else recorded
 
-    Uses the same resolution `compose_args` applies for `--env-file`; only
-    existing paths are kept.
+
+def resolve_env_from(
+    spec: Spec, *, name: str | None = None, tenant: str | None = None
+) -> list[str]:
+    """Resolve `spec.envFrom` entries to env-file paths.
+
+    `secretRef` entries keep only existing paths. With `name`, every `sopsFile`
+    entry is decrypted into tmpfs (see `nuk.secrets`) and its path appended; any
+    failure refuses the caller rather than dropping the file.
 
     Args:
         spec: The typed manifest `spec`.
+        name: The deployment; enables `sopsFile` rendering from its checkout.
+        tenant: The deployment's source tenant (None: platform), selecting the age key.
 
     Returns:
-        The existing secret-file paths, in manifest order.
+        The env-file paths, `secretRef` ones first, in manifest order.
     """
-    return [e.secret_ref for e in spec.env_from if e.secret_ref and Path(e.secret_ref).exists()]
+    found = [e.secret_ref for e in spec.env_from if e.secret_ref and Path(e.secret_ref).exists()]
+    if name is not None:
+        try:
+            rendered = secrets.render(name, tenant, nuk._repo_dir(name), spec.env_from)
+        except secrets.SecretError as err:
+            nuk.die(f"{name}: {err}")
+        found += [str(p) for p in rendered]
+    return found
 
 
 def _published_port(ing: Ingress) -> int:

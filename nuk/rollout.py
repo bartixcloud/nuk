@@ -17,6 +17,7 @@ import typer
 import yaml
 
 import nuk
+from nuk import secrets
 from nuk.models import ValidationError  # noqa: TC003
 
 # --- command layer ------------------------------------------------------------
@@ -230,7 +231,8 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
             f"DATABASE_URL/REDIS_URL won't be injected. Add an ingress entry, or set "
             f"spec.databases.attachTo / attachAll to target a worker."
         )
-    env_from = nuk.resolve_env_from(manifest.spec)
+    (pdir / "tenant").write_text(secrets.key_name(ctx.tenant))
+    env_from = nuk.resolve_env_from(manifest.spec, name=name, tenant=ctx.tenant)
     if env_from and not ingress:
         print(
             f"{name}: spec.envFrom secrets resolved but no ingress service to "
@@ -832,7 +834,14 @@ def cmd_delete(name: str, purge: bool) -> None:
     pdir = nuk.project_dir(name)
     if (pdir / "manifest.yml").exists():
         manifest = nuk.load(pdir / "manifest.yml")
-        subprocess.run([*nuk.compose_args(name, manifest.spec), "down", "-v"], check=False)  # noqa: S603  # argv built from fixed verbs
+        try:
+            base = nuk.compose_args(name, manifest.spec)
+        except nuk.NukError:
+            # Secrets that no longer render must not keep the containers alive: the
+            # project name alone is enough for `down`.
+            base = ["docker", "compose", "-p", name]
+        subprocess.run([*base, "down", "-v"], check=False)  # noqa: S603  # argv built from fixed verbs
+    secrets.purge(name)
     nuk._router_file(name).unlink(missing_ok=True)
     shutil.rmtree(pdir, ignore_errors=True)
     # The app's database is kept by default — its creds file (in SECRETS, not
@@ -912,6 +921,9 @@ Manifest (apiVersion: nuk/v1, kind: Deployment):
   spec.envFrom[].secretRef -> existing env files injected into each
     ingress service's container env via the compose override (and also
     passed to `docker compose --env-file` for ${VAR} interpolation).
+  spec.envFrom[].sopsFile -> tree-relative *.enc.env, decrypted at apply with the
+    tenant's age key (/etc/nuklaut/age.d/<tenant>.key) into /run/nuklaut/secrets;
+    a missing file or key refuses the apply. One of secretRef/sopsFile per entry.
   spec.databases: {postgres: true, redis: true} -> per-app DB on the
     shared data stack; injects DATABASE_URL / REDIS_URL into the
     ingress service(s). Override the injection target with
