@@ -19,7 +19,7 @@ from pydantic import (
     model_validator,
 )
 
-from nuk.models import Metadata, Role, _NullTolerant
+from nuk.models import Metadata, Placement, Role, _NullTolerant
 from nuk.util import die
 
 if TYPE_CHECKING:
@@ -100,7 +100,9 @@ class Host(BaseModel):
     name: str
     provider: Literal["hcloud", "libvirt", "incus", "metal", "manual"]
     role: Role
-    private_ip: str = Field(alias="privateIp")
+    # Required once the org has more than one host (Org._check_private_ips); a lone host
+    # is addressed by nothing but itself.
+    private_ip: str | None = Field(default=None, alias="privateIp")
     type: str | None = None  # hcloud server type, e.g. cx23
     ip: str | None = None  # public IP for manual/metal hosts
     metal: str | None = None  # libvirt: the hypervisor host it runs on
@@ -138,9 +140,17 @@ def _check_unique(hosts: list[Host]) -> None:
     if len(names) != len(set(names)):
         msg = "hosts[].name must be unique"
         raise ValueError(msg)
-    ips = [h.private_ip for h in hosts]
+    ips = [h.private_ip for h in hosts if h.private_ip is not None]
     if len(ips) != len(set(ips)):
         msg = "hosts[].privateIp must be unique"
+        raise ValueError(msg)
+
+
+def _check_private_ips(hosts: list[Host]) -> None:
+    """Raise unless every host has a private IP — a lone host may omit it."""
+    if len(hosts) > 1 and any(h.private_ip is None for h in hosts):
+        missing = ", ".join(h.name for h in hosts if h.private_ip is None)
+        msg = f"hosts[].privateIp is required when the org has more than one host — missing: {missing}"
         raise ValueError(msg)
 
 
@@ -217,7 +227,7 @@ def _check_subnets(hosts: list[Host], network: Network) -> None:
     the only place with the tenant registry in hand.
     """
     for h in hosts:
-        if h.role == "hypervisor" or h.tenant is not None:
+        if h.role == "hypervisor" or h.tenant is not None or h.private_ip is None:
             continue
         cloud = h.provider == "hcloud"
         subnet = network.cloud_subnet if cloud else network.vswitch_subnet
@@ -248,7 +258,7 @@ def check_tenant_subnets(org: Org, registry: TenantRegistry) -> None:
         if tenant.bridge is None:
             msg = f"{h.name}: tenant {h.tenant} declares no bridge in tenants.yml"
             raise ValueError(msg)
-        if not _ip_in_cidr(h.private_ip, tenant.bridge.cidr):
+        if h.private_ip is None or not _ip_in_cidr(h.private_ip, tenant.bridge.cidr):
             msg = (
                 f"{h.name}: privateIp {h.private_ip} is not in tenant {tenant.name} "
                 f"bridge {tenant.bridge.name} {tenant.bridge.cidr}"
@@ -285,6 +295,7 @@ class Org(BaseModel):
                 placement).
         """
         _check_domains(self.platform_domain, self.domains)
+        _check_private_ips(self.hosts)
         _check_unique(self.hosts)
         _check_entry_and_mesh(self.hosts, self.mesh)
         _check_singleton_roles(self.hosts)
@@ -301,6 +312,21 @@ class Org(BaseModel):
     def host_named(self, name: str) -> Host | None:
         """The host with this `name`, or None."""
         return next((h for h in self.hosts if h.name == name), None)
+
+    def composed_by_all_in_one(self, placement: Placement) -> bool:
+        """Whether an all-in-one host runs this placement itself, on the entry host.
+
+        An all-in-one host composes edge + data + app (`placement_matches`), so a placement
+        for a role the org declares no host of — or a pin naming the all-in-one host — runs
+        right beside Traefik: `cmd_apply` already wrote its router with a container-name
+        backend. A role the org does declare keeps resolving to that host.
+        """
+        aio = self.host_for("all-in-one")
+        if aio is None:
+            return False
+        if placement.host is not None:
+            return placement.host == aio.name
+        return self.host_for(placement.role) is None
 
     def app_host_count(self) -> int:
         """How many hosts carry role `app` (the multi-host role)."""

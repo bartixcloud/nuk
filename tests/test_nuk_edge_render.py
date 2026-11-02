@@ -530,3 +530,75 @@ def test_revocation_rewrites_the_owners_routers_without_the_lent_host(tmp_path, 
     ]
     assert not (dynamic / "kolbe.yml").exists()
     assert (dynamic / "other.yml").read_text() == "http: {}\n"
+
+
+# --- single host: an all-in-one org composes every role ------------------------------------
+
+ORG_ALL_IN_ONE = """
+    apiVersion: nukorg/v1
+    kind: Org
+    metadata: {name: akd}
+    domains: [example.com]
+    platformDomain: example.com
+    acmeEmail: admin@example.com
+    hosts:
+      - {name: akd, provider: manual, role: all-in-one}
+    facilities:
+      dns: manual
+      tls: http01
+      secrets: sops
+      runners: none
+"""
+
+
+def _single_host(tmp_path, monkeypatch, deployment):
+    tree = _tree(tmp_path, {"hello": deployment}, {}, org_body=ORG_ALL_IN_ONE)
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    # The router cmd_apply already wrote locally, with a container-name backend.
+    (dynamic / "hello.yml").write_text("http: {local: true}\n", encoding="utf-8")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
+    return tree, dynamic
+
+
+def test_single_host_org_loads_without_a_private_ip(tmp_path):
+    tree = _tree(tmp_path, {}, {}, org_body=ORG_ALL_IN_ONE)
+    org = nuk.load_org(tree / "org.yml")
+    assert org.hosts[0].private_ip is None
+
+
+def test_single_host_edge_render_leaves_an_app_placement_local(tmp_path, monkeypatch):
+    """Placement `app` on an all-in-one host: cmd_apply wrote the router; the edge must not."""
+    tree, dynamic = _single_host(tmp_path, monkeypatch, HELLO)
+    assert nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml")) == []
+    assert yaml.safe_load((dynamic / "hello.yml").read_text()) == {"http": {"local": True}}
+
+
+def test_single_host_edge_render_leaves_a_pinned_placement_local(tmp_path, monkeypatch):
+    pinned = HELLO.replace("placement: {role: app}", "placement: {role: app, host: akd}")
+    tree, dynamic = _single_host(tmp_path, monkeypatch, pinned)
+    assert nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml")) == []
+    assert yaml.safe_load((dynamic / "hello.yml").read_text()) == {"http": {"local": True}}
+
+
+def test_a_multi_host_org_still_resolves_an_app_backend(tmp_path, monkeypatch):
+    """The all-in-one carve-out does not touch an org that declares a real app host."""
+    tree = _tree(tmp_path, {"hello": HELLO}, {"auth": OAUTH_FACILITY})
+    dynamic = tmp_path / "dynamic"
+    dynamic.mkdir()
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", dynamic)
+    assert nuk.render_edge_routers(tree, nuk.load_org(tree / "org.yml")) == ["hello"]
+
+
+def test_an_org_with_an_all_in_one_host_and_an_app_host_keeps_resolving_app(tmp_path):
+    """A role the org DOES declare still routes to its host, all-in-one or not."""
+    org_body = ORG_ALL_IN_ONE.replace(
+        "    hosts:\n",
+        "    hosts:\n      - {name: vm, provider: manual, role: app, privateIp: 10.0.0.9}\n",
+    ).replace("role: all-in-one}", "role: all-in-one, privateIp: 10.0.0.2}")
+    org_body = org_body.replace("    facilities:", "    mesh: tailscale\n    facilities:")
+    tree = _tree(tmp_path, {"hello": HELLO}, {}, org_body=org_body)
+    org = nuk.load_org(tree / "org.yml")
+    hello = nuk.load_deployments(tree)[0]
+    assert not org.composed_by_all_in_one(hello.spec.placement)
+    assert nuk.backend_address(org, hello, hello.spec.ingress[0]) == "10.0.0.9:8080"

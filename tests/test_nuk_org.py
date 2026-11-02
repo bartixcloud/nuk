@@ -10,6 +10,7 @@ from __future__ import annotations
 import nuk
 import pytest
 import yaml
+from pydantic import ValidationError
 
 # A valid multi-host org: one edge entry-point, a bare-metal hypervisor, and a
 # libvirt VM on it. Exercises every topology invariant at once.
@@ -570,3 +571,34 @@ def test_org_tenantless_host_is_still_checked_against_the_fleet_subnet():
     del host["tenant"]
     with pytest.raises(nuk.ValidationError, match="vswitchSubnet"):
         nuk.Org.model_validate(_hosts([*_TENANT_HOSTS[:-1], host]))
+
+
+# --- privateIp is optional only for a single-host org -----------------------------------
+
+
+def test_private_ip_is_optional_for_a_single_host():
+    doc = {**ONE_HOST_DOC, "hosts": [{"name": "h", "provider": "manual", "role": "all-in-one"}]}
+    assert nuk.Org.model_validate(doc).hosts[0].private_ip is None
+
+
+def test_private_ip_stays_required_with_more_than_one_host():
+    hosts = [
+        {"name": "a", "provider": "manual", "role": "all-in-one", "privateIp": "10.0.0.2"},
+        {"name": "b", "provider": "manual", "role": "app"},
+    ]
+    with pytest.raises(ValidationError, match="privateIp"):
+        nuk.Org.model_validate({**ONE_HOST_DOC, "hosts": hosts, "mesh": "tailscale"})
+
+
+def test_a_single_host_without_private_ip_skips_the_subnet_check():
+    doc = {
+        **ONE_HOST_DOC,
+        "hosts": [{"name": "h", "provider": "hcloud", "role": "all-in-one"}],
+        "network": {
+            "cidr": "10.0.0.0/16",
+            "cloudSubnet": "10.0.1.0/24",
+            "vswitchSubnet": "10.0.10.0/24",
+            "vswitchVlan": 4001,
+        },
+    }
+    assert nuk.Org.model_validate(doc).hosts[0].private_ip is None

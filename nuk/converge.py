@@ -904,9 +904,12 @@ def _render_routers(
         # A deployment placed on an entry host runs ALONGSIDE Traefik, so
         # nuk.cmd_apply already rendered its router there with a container-name
         # backend. Re-rendering it from here would overwrite that working file
-        # with a `privateIp:port` backend nothing is listening on.
+        # with a `privateIp:port` backend nothing is listening on. An all-in-one host
+        # does the same for every placement it composes, whatever role it names.
         placement = manifest.spec.placement
-        if placement is not None and placement.role in nuk._ENTRY_ROLES:
+        if placement is not None and (
+            placement.role in nuk._ENTRY_ROLES or org.composed_by_all_in_one(placement)
+        ):
             continue
         if tenant is not None:
             allowed = nuk._authorized_ingress(ingress, tenant, auth, refused)
