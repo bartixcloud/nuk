@@ -962,6 +962,7 @@ def consumes(manifest: nuk.Deployment) -> set[str]:
 
     | nuk.Deployment field        | Consumes                   |
     |--------------------------|----------------------------|
+    | `ingress[].auth: oauth` | route capability `auth`    |
     | `databases:`            | env capability `databases` |
 
     A nuk.Deployment consuming nothing still gets the default `tls` route from the
@@ -976,6 +977,8 @@ def consumes(manifest: nuk.Deployment) -> set[str]:
         The capability names consumed; empty for none.
     """
     caps: set[str] = set()
+    if any(ing.auth == "oauth" for ing in manifest.spec.ingress):
+        caps.add(nuk._ROUTE_CAPABILITY["oauth"])
     db = manifest.spec.databases
     if db.postgres or db.redis:
         caps.add(nuk._DATABASES_CAPABILITY)

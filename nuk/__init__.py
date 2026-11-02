@@ -1418,8 +1418,16 @@ def persist_manifest(spec: Spec, src_path: Path, dest: Path, repo_path: str | No
 # path — a single-host controller with no facilities dir — so its renders stay
 # byte-identical (spec §12). A tree that ships facilities/ overrides it entirely;
 # test_shipped_facilities_reproduce_the_default_vocabulary keeps the two in step.
-# Keys are route CAPABILITY names; today `ingress[].auth: basic` names the capability `basic`.
-DEFAULT_ROUTE_VOCAB: dict[str, list[str]] = {"basic": ["auth@file"]}
+# Keys are CAPABILITY names (post-translation, see _ROUTE_CAPABILITY below).
+DEFAULT_ROUTE_VOCAB: dict[str, list[str]] = {
+    "auth": ["oauth-errors@file", "oauth-auth@file"],
+    "basic": ["auth@file"],
+}
+
+# The §5.3 field→capability map for route effects: `ingress[].auth: oauth`
+# consumes route capability `auth`. Field values absent here translate to
+# themselves (`basic` → `basic`). Adding a capability adds a row.
+_ROUTE_CAPABILITY: dict[str, str] = {"oauth": "auth"}
 
 
 def _container_name(name: str, service: str, colour: str | None = None) -> str:
@@ -1497,7 +1505,9 @@ def build_ingress(  # noqa: C901, PLR0912, PLR0914  # one router-build loop; cle
         #   capability whose chain is empty, are BOTH refusals (spec §5.4).
         want = ing.auth
         if want is not None:
-            capability = want
+            # §5.3's field→capability map: the router asks for `oauth`, the
+            # facility provides `auth`. Identity for unmapped values (`basic`).
+            capability = _ROUTE_CAPABILITY.get(want, want)
             if capability not in vocab:
                 msg = (
                     f"ingress.auth={want!r} maps to capability {capability!r}, which no "

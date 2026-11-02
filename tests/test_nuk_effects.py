@@ -11,7 +11,7 @@ from pathlib import Path
 import nuk
 import pytest
 
-GATE_FACILITY = """
+OAUTH_FACILITY = """
     apiVersion: nuk/v1
     kind: Facility
     metadata: {name: auth}
@@ -19,9 +19,9 @@ GATE_FACILITY = """
       placement: {role: edge}
       provides:
         route:
-          capability: basic
-          middlewares: [auth@file]
-      health: {containers: [auth-gate]}
+          capability: auth
+          middlewares: [oauth-errors@file, oauth-auth@file]
+      health: {containers: [authentik-server]}
 """
 
 BASIC_FACILITY = """
@@ -62,11 +62,11 @@ DATA_FACILITY = """
 ROUTE_ONLY_FACILITY = """
     apiVersion: nuk/v1
     kind: Facility
-    metadata: {name: gate}
+    metadata: {name: oauth}
     spec:
       placement: {role: edge}
       provides:
-        route: {capability: basic, middlewares: [auth@file]}
+        route: {capability: auth, middlewares: [oauth-errors@file, oauth-auth@file]}
 """
 
 CUSTOM_AUTH_FACILITY = """
@@ -76,7 +76,7 @@ CUSTOM_AUTH_FACILITY = """
     spec:
       placement: {role: edge}
       provides:
-        route: {capability: basic, middlewares: [custom-gate@file]}
+        route: {capability: auth, middlewares: [custom-gate@file]}
 """
 
 DB_DEPLOYMENT = """
@@ -98,7 +98,7 @@ GATED_DEPLOYMENT = """
     spec:
       source: {repo: https://github.com/astrojones/app.git}
       ingress:
-        - {host: app.example.com, service: web, port: 8080, auth: basic}
+        - {host: app.example.com, service: web, port: 8080, auth: oauth}
 """
 
 
@@ -138,7 +138,7 @@ def _stub_apply(tmp_path: Path, monkeypatch, role: str = "app") -> None:
 
 
 def test_load_facilities_reads_every_manifest(tmp_path):
-    tree = _tree(tmp_path, gate=GATE_FACILITY, data=DATA_FACILITY)
+    tree = _tree(tmp_path, oauth=OAUTH_FACILITY, data=DATA_FACILITY)
     names = sorted(f.metadata.name for f in nuk.load_facilities(tree))
     assert names == ["auth", "data-stack"]
 
@@ -148,7 +148,7 @@ def test_load_facilities_on_a_tree_with_no_facility_dir(tmp_path):
 
 
 def test_load_facilities_ignores_deployments_in_the_dir(tmp_path):
-    tree = _tree(tmp_path, gate=GATE_FACILITY)
+    tree = _tree(tmp_path, oauth=OAUTH_FACILITY)
     (tree / "facilities" / "stray.yml").write_text(
         textwrap.dedent(
             """
@@ -163,14 +163,18 @@ def test_load_facilities_ignores_deployments_in_the_dir(tmp_path):
 
 
 def test_route_vocabulary_maps_capability_to_middlewares(tmp_path):
-    tree = _tree(tmp_path, basic=BASIC_FACILITY, tls=TLS_FACILITY)
+    tree = _tree(tmp_path, oauth=OAUTH_FACILITY, basic=BASIC_FACILITY, tls=TLS_FACILITY)
     vocab = nuk.route_vocabulary(nuk.load_facilities(tree))
-    assert vocab == {"basic": ["auth@file"], "tls": []}
+    assert vocab == {
+        "auth": ["oauth-errors@file", "oauth-auth@file"],
+        "basic": ["auth@file"],
+        "tls": [],
+    }
 
 
 def test_route_vocabulary_refuses_a_duplicate_capability(tmp_path):
     """A closed vocabulary with two answers is not closed. Refuse."""
-    tree = _tree(tmp_path, gate=GATE_FACILITY)
+    tree = _tree(tmp_path, oauth=OAUTH_FACILITY)
     (tree / "facilities" / "shadow.yml").write_text(
         textwrap.dedent(
             """
@@ -179,7 +183,7 @@ def test_route_vocabulary_refuses_a_duplicate_capability(tmp_path):
             metadata: {name: shadow}
             spec:
               provides:
-                route: {capability: basic, middlewares: [evil@file]}
+                route: {capability: auth, middlewares: [evil@file]}
             """
         ).lstrip(),
         encoding="utf-8",
@@ -189,14 +193,14 @@ def test_route_vocabulary_refuses_a_duplicate_capability(tmp_path):
 
 
 def test_env_facility_finds_the_declaring_facility(tmp_path):
-    tree = _tree(tmp_path, data=DATA_FACILITY, gate=GATE_FACILITY)
+    tree = _tree(tmp_path, data=DATA_FACILITY, oauth=OAUTH_FACILITY)
     f = nuk.env_facility(nuk.load_facilities(tree), "databases")
     assert f is not None
     assert f.metadata.name == "data-stack"
 
 
 def test_env_facility_returns_none_when_undeclared(tmp_path):
-    tree = _tree(tmp_path, gate=GATE_FACILITY)
+    tree = _tree(tmp_path, oauth=OAUTH_FACILITY)
     assert nuk.env_facility(nuk.load_facilities(tree), "databases") is None
 
 
@@ -210,11 +214,11 @@ def _dep(spec: dict) -> nuk.Deployment:
     )
 
 
-def test_consumes_does_not_count_a_route_gate_as_consumption():
+def test_consumes_maps_oauth_ingress_to_the_auth_capability():
     dep = _dep(
-        {"ingress": [{"host": "h.example.com", "service": "web", "port": 80, "auth": "basic"}]}
+        {"ingress": [{"host": "h.example.com", "service": "web", "port": 80, "auth": "oauth"}]}
     )
-    assert nuk.consumes(dep) == set()
+    assert nuk.consumes(dep) == {"auth"}
 
 
 def test_consumes_maps_databases_to_the_databases_capability():
@@ -225,11 +229,11 @@ def test_consumes_maps_databases_to_the_databases_capability():
 def test_consumes_combines_route_and_env():
     dep = _dep(
         {
-            "ingress": [{"host": "h.example.com", "service": "web", "port": 80, "auth": "basic"}],
+            "ingress": [{"host": "h.example.com", "service": "web", "port": 80, "auth": "oauth"}],
             "databases": {"postgres": True},
         }
     )
-    assert nuk.consumes(dep) == {"databases"}
+    assert nuk.consumes(dep) == {"auth", "databases"}
 
 
 def test_a_deployment_consuming_nothing_gets_an_empty_set():
@@ -247,21 +251,22 @@ HELLO_INGRESS = [
 
 def test_route_renders_declared_middlewares_in_order(tmp_path):
     """Spec §12: a capability with declared middlewares renders them in order."""
-    vocab = nuk.route_vocabulary(nuk.load_facilities(_tree(tmp_path, gate=GATE_FACILITY)))
+    vocab = nuk.route_vocabulary(nuk.load_facilities(_tree(tmp_path, oauth=OAUTH_FACILITY)))
     doc = nuk.build_ingress(
-        "hello", [HELLO_INGRESS[0].model_copy(update={"auth": "basic"})], vocab
+        "hello", [HELLO_INGRESS[0].model_copy(update={"auth": "oauth"})], vocab
     ).to_wire()
     assert doc["http"]["routers"]["hello-0"]["middlewares"] == [
-        "auth@file",
+        "oauth-errors@file",
+        "oauth-auth@file",
         "maintenance-errors@file",
     ]
 
 
 def test_route_refuses_an_undeclared_capability(tmp_path):
     """Spec §5.4: capability not declared by any facility -> refuse."""
-    vocab = nuk.route_vocabulary(nuk.load_facilities(_tree(tmp_path, tls=TLS_FACILITY)))
+    vocab = nuk.route_vocabulary(nuk.load_facilities(_tree(tmp_path, basic=BASIC_FACILITY)))
     with pytest.raises(ValueError, match="which no facility in the tree provides"):
-        nuk.build_ingress("hello", [HELLO_INGRESS[0].model_copy(update={"auth": "basic"})], vocab)
+        nuk.build_ingress("hello", [HELLO_INGRESS[0].model_copy(update={"auth": "oauth"})], vocab)
 
 
 def test_route_refuses_an_empty_middleware_list(tmp_path):
@@ -278,7 +283,7 @@ def test_route_refuses_an_empty_middleware_list(tmp_path):
 def test_route_refuses_when_the_vocabulary_is_empty(tmp_path):
     """A tree with no facilities gates nothing. It must not render ungated."""
     with pytest.raises(ValueError, match="which no facility in the tree provides"):
-        nuk.build_ingress("hello", [HELLO_INGRESS[0].model_copy(update={"auth": "basic"})], {})
+        nuk.build_ingress("hello", [HELLO_INGRESS[0].model_copy(update={"auth": "oauth"})], {})
 
 
 def test_route_without_auth_needs_no_vocabulary():
@@ -295,7 +300,10 @@ def test_default_vocab_reproduces_the_legacy_chain_byte_for_byte():
     """
     import yaml
 
-    for gate, expected in (("basic", ["auth@file", "maintenance-errors@file"]),):
+    for gate, expected in (
+        ("oauth", ["oauth-errors@file", "oauth-auth@file", "maintenance-errors@file"]),
+        ("basic", ["auth@file", "maintenance-errors@file"]),
+    ):
         doc = nuk.build_ingress(
             "hello",
             [HELLO_INGRESS[0].model_copy(update={"auth": gate})],
@@ -384,7 +392,7 @@ def test_env_bind_refuses_when_no_facility_declares_it(tmp_path, monkeypatch):
     monkeypatch.setattr(
         nuk, "preflight_data_stack", lambda *_a: pytest.fail("preflight ran before the guard")
     )
-    facilities = nuk.load_facilities(_tree(tmp_path, gate=GATE_FACILITY))
+    facilities = nuk.load_facilities(_tree(tmp_path, oauth=OAUTH_FACILITY))
     with pytest.raises(SystemExit, match="no facility provides"):
         nuk.provision_databases(
             "hello", nuk.Databases.model_validate({"postgres": True}), facilities
@@ -412,7 +420,7 @@ def test_env_bind_proceeds_when_the_tree_ships_no_facilities_dir(tmp_path, monke
 
 def test_env_bind_is_a_noop_when_nothing_is_requested(tmp_path):
     """No databases requested = no capability needed. The guard must not fire."""
-    facilities = nuk.load_facilities(_tree(tmp_path, gate=GATE_FACILITY))
+    facilities = nuk.load_facilities(_tree(tmp_path, oauth=OAUTH_FACILITY))
     assert nuk.provision_databases("hello", nuk.Databases.model_validate({}), facilities) is None
 
 
@@ -468,7 +476,7 @@ def test_unhealthy_facility_apply_does_not_append_provenance(tmp_path, monkeypat
     if the gate were placed after write_provenance, the pytest.fail below fires.
     """
     doc = tmp_path / "auth.yml"
-    doc.write_text(textwrap.dedent(GATE_FACILITY).lstrip(), encoding="utf-8")
+    doc.write_text(textwrap.dedent(OAUTH_FACILITY).lstrip(), encoding="utf-8")
 
     repo_src = tmp_path / "src"
     repo_src.mkdir()
@@ -485,7 +493,9 @@ def test_unhealthy_facility_apply_does_not_append_provenance(tmp_path, monkeypat
     monkeypatch.setattr(nuk, "write_ingress", lambda *_a: None)
     monkeypatch.setattr(nuk, "persist_manifest", lambda *_a: None)
     monkeypatch.setattr(nuk, "compose_args", lambda *_a: ["true"])
-    monkeypatch.setattr(nuk, "facility_health", lambda _m: "container 'auth-gate' is not running")
+    monkeypatch.setattr(
+        nuk, "facility_health", lambda _m: "container 'authentik-server' is not running"
+    )
     monkeypatch.setattr(
         nuk, "write_provenance", lambda *_a, **_k: pytest.fail("provenance must not be appended")
     )
@@ -543,19 +553,19 @@ def test_apply_resolves_the_route_vocabulary_from_the_tree_root(tmp_path, monkey
     monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
     monkeypatch.setattr(nuk, "write_ingress", lambda _n, _i, vocab: seen.append(vocab))
     nuk.cmd_apply(doc, None)
-    assert seen == [{"basic": ["custom-gate@file"]}]
+    assert seen == [{"auth": ["custom-gate@file"]}]
     assert seen[0] != nuk.DEFAULT_ROUTE_VOCAB
 
 
 def test_apply_of_a_declaration_only_facility_runs_nothing(tmp_path, monkeypatch):
-    """gate.yml/basic.yml declare only a route: no source, no compose, no payload.
+    """oauth.yml/basic.yml declare only a route: no source, no compose, no payload.
 
     There is nothing to mirror and nothing to compose up — the apply is a pure
     vocabulary registration, so it must complete instead of refusing for a
     payload directory it has no use for.
     """
-    tree = _tree(tmp_path, gate=ROUTE_ONLY_FACILITY)
-    doc = tree / "facilities" / "gate.yml"
+    tree = _tree(tmp_path, oauth=ROUTE_ONLY_FACILITY)
+    doc = tree / "facilities" / "oauth.yml"
     _stub_apply(tmp_path, monkeypatch, role="edge")
     monkeypatch.setattr(nuk, "provision_databases", lambda *_a, **_k: None)
 

@@ -214,6 +214,7 @@ def test_data_host_ip_reads_org_role():
                 "tls": "dns01",
                 "dnsProvider": "hetzner",
                 "secrets": "sops",
+                "auth": "authentik",
                 "runners": "ephemeral",
             },
             "mesh": "none",
