@@ -360,7 +360,7 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
     state_dir: Path,
     scratch: Path,
     platform: Path | None,
-    org_file: str,
+    org_file: str | None = None,
 ) -> nuk.TreeContext:
     """Sync, verify and archive one source and build its context; fill tag/commit/verify in `block`.
 

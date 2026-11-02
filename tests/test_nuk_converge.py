@@ -748,7 +748,9 @@ def test_org_file_accepts_a_plain_yaml_filename():
     assert nuk.SourceEntry(**_entry(org_file="nuklaut.org.yml")).org_file == "nuklaut.org.yml"
 
 
-@pytest.mark.parametrize("bad", ["../org.yml", "sub/org.yml", "/etc/org.yml", ".org.yml", "org.txt"])
+@pytest.mark.parametrize(
+    "bad", ["../org.yml", "sub/org.yml", "/etc/org.yml", ".org.yml", "org.txt"]
+)
 def test_org_file_refuses_anything_but_a_plain_filename(bad):
     with pytest.raises(ValidationError):
         nuk.SourceEntry(**_entry(org_file=bad))

@@ -150,7 +150,10 @@ def _check_private_ips(hosts: list[Host]) -> None:
     """Raise unless every host has a private IP — a lone host may omit it."""
     if len(hosts) > 1 and any(h.private_ip is None for h in hosts):
         missing = ", ".join(h.name for h in hosts if h.private_ip is None)
-        msg = f"hosts[].privateIp is required when the org has more than one host — missing: {missing}"
+        msg = (
+            f"hosts[].privateIp is required when the org has more than one host "
+            f"— missing: {missing}"
+        )
         raise ValueError(msg)
 
 

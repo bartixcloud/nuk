@@ -223,7 +223,10 @@ class SourceEntry(BaseModel):
             ValueError: If a source without `facilities` sets `org_file`.
         """
         if self.org_file is not None and not self.is_platform:
-            msg = f"org_file is only valid on the platform source (apply: facilities), not {self.name}"
+            msg = (
+                f"org_file is only valid on the platform source (apply: facilities), "
+                f"not {self.name}"
+            )
             raise ValueError(msg)
         return self
 
