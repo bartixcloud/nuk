@@ -758,7 +758,7 @@ if TYPE_CHECKING:
         Json,
     )
 
-__version__ = "2.13.0"  # bumped on release by .github/workflows/release.yml
+__version__ = "2.14.0"  # bumped on release by .github/workflows/release.yml
 
 # Shared data stack — owned, reproducible source vendored at
 # files/docker-compose.data.yml (bring it up once on the controller). Apps reach
