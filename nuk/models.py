@@ -347,6 +347,37 @@ class Metadata(BaseModel):
     name: str
 
 
+class Install(BaseModel):
+    """`spec.install[]` — a file a facility installs into traefik/dynamic/ from its payload.
+
+    `src` is relative to the facility's payload directory (the verified tag's
+    `facilities/<name>/`); `name` is the file name it gets in the watched directory.
+    `__TOKEN__`s in YAML values resolve from the org (`DOMAIN`), `vars` (literals) and
+    `secretVars` (token -> a file under the host's secret roots, first non-blank line).
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    src: str
+    name: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$")
+    vars: dict[str, str] = {}
+    secret_vars: dict[str, str] = Field(default={}, alias="secretVars")
+
+    @field_validator("src")
+    @classmethod
+    def _src_stays_in_the_payload(cls, value: str) -> str:
+        """Refuse an absolute path or one that climbs out of the payload.
+
+        Raises:
+            ValueError: If `src` is absolute, empty, or contains a `..` segment.
+        """
+        parts = value.split("/")
+        if not value or value.startswith("/") or ".." in parts:
+            msg = f"install.src must be a relative path inside the payload, got {value!r}"
+            raise ValueError(msg)
+        return value
+
+
 class FacilitySpec(Spec):
     """A Facility's `spec` — a Deployment's spec plus what it hands out.
 
@@ -356,6 +387,7 @@ class FacilitySpec(Spec):
 
     provides: Provides = Provides()
     health: Health = Health()
+    install: list[Install] = []
 
 
 class Manifest(_NullTolerant):

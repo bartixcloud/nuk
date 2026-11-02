@@ -18,6 +18,7 @@ import yaml
 
 import nuk
 from nuk import secrets
+from nuk.install import install_file
 from nuk.models import ValidationError  # noqa: TC003
 
 # --- command layer ------------------------------------------------------------
@@ -155,6 +156,7 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
         and not repo_path
         and not source.repo
         and not manifest.spec.compose.model_fields_set
+        and not (manifest.kind == "Facility" and manifest.spec.install)
     )
     pdir = nuk.project_dir(name)
     pdir.mkdir(parents=True, exist_ok=True)
@@ -206,6 +208,17 @@ def cmd_apply(  # noqa: C901, PLR0912, PLR0914, PLR0915  # linear apply pipeline
                 f"{where} payload directory — nothing to apply"
             )
         nuk.sh("rsync", "-a", "--delete", f"{payload}/", str(repo) + "/")
+    if manifest.kind == "Facility":
+        # Files the facility installs beside the routers (e.g. Traefik's global.yml),
+        # from the payload just mirrored, i.e. the verified tag. A refusal fails this
+        # facility alone; the old file stays exactly as it was.
+        for item in manifest.spec.install:
+            try:
+                changed = install_file(name, item, repo, ctx.org)
+            except ValueError as e:
+                nuk.die(f"{name}: install {item.name}: {e}")
+            state = "installed" if changed else "is current"
+            print(f"{name}: {item.name} {state}")
     if pin_digest:
         nuk._pin_image(name, manifest.spec, pin_digest)
     ingress = manifest.spec.ingress

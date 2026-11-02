@@ -377,6 +377,9 @@ from nuk.models import (
     Spec,  # noqa: TC001
 )
 from nuk.models import (
+    Install as Install,
+)
+from nuk.models import (
     Metadata as Metadata,
 )
 from nuk.models import (
