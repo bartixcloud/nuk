@@ -616,6 +616,9 @@ from nuk.rollout import (
     cmd_status_overview as cmd_status_overview,
 )
 from nuk.sources import (
+    DEFAULT_ORG_FILE as DEFAULT_ORG_FILE,
+)
+from nuk.sources import (
     SOURCE_BRANCH as SOURCE_BRANCH,
 )
 from nuk.sources import (
@@ -753,11 +756,6 @@ if TYPE_CHECKING:
     )
 
 __version__ = "2.12.0"  # bumped on release by .github/workflows/release.yml
-
-# Named, never globbed: the infra tree also carries nuklaut.org.yml,
-# nuklaut.test.org.yml and nuklaut.min.org.yml, and a glob picking one of those
-# would have the edge resolve every backend IP from a template or a test fixture.
-DEFAULT_ORG_FILE = "nuklaut.astrocloud.org.yml"
 
 # Shared data stack — owned, reproducible source vendored at
 # files/docker-compose.data.yml (bring it up once on the controller). Apps reach

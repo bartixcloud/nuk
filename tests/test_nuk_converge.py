@@ -19,6 +19,7 @@ from pathlib import Path
 
 import nuk
 import pytest
+from pydantic import ValidationError
 
 
 @pytest.fixture(autouse=True)
@@ -724,3 +725,35 @@ def test_archive_tree_refuses_a_symlink_that_leaves_the_tree(repo, tmp_path):
     with pytest.raises(ValueError, match="unsafe archive member"):
         nuk.archive_tree(repo, "HEAD", tmp_path / "out")
     assert not (tmp_path / "out" / "escape").exists()
+
+
+# --- sources.yml: org_file --------------------------------------------------------------
+
+
+def _entry(**over):
+    return {
+        "name": "platform",
+        "repo": "x",
+        "deploy_key": "/k",
+        "apply": ["facilities"],
+        **over,
+    }
+
+
+def test_org_file_defaults_to_the_fleet_name():
+    assert nuk.SourceEntry(**_entry()).org_manifest == nuk.DEFAULT_ORG_FILE
+
+
+def test_org_file_accepts_a_plain_yaml_filename():
+    assert nuk.SourceEntry(**_entry(org_file="nuklaut.org.yml")).org_file == "nuklaut.org.yml"
+
+
+@pytest.mark.parametrize("bad", ["../org.yml", "sub/org.yml", "/etc/org.yml", ".org.yml", "org.txt"])
+def test_org_file_refuses_anything_but_a_plain_filename(bad):
+    with pytest.raises(ValidationError):
+        nuk.SourceEntry(**_entry(org_file=bad))
+
+
+def test_a_tenant_source_cannot_set_org_file():
+    with pytest.raises(ValidationError, match="org_file"):
+        nuk.SourceEntry(**_entry(apply=["deployments"], org_file="nuklaut.org.yml"))

@@ -360,6 +360,7 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
     state_dir: Path,
     scratch: Path,
     platform: Path | None,
+    org_file: str,
 ) -> nuk.TreeContext:
     """Sync, verify and archive one source and build its context; fill tag/commit/verify in `block`.
 
@@ -397,6 +398,7 @@ def _prepare_source(  # noqa: PLR0913  # one keyword per cycle input; they are a
         tenant,
         frozenset(src.apply),
         platform=platform,
+        org_file=org_file,
         trees={"tag": tag_tree, "branch": branch_tree},
         commits={"tag": tag_sha, "branch": branch_sha},
         source_repo=src.repo,
@@ -439,6 +441,7 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
     state_dir: Path,
     scratch: Path,
     platform: Path | None,
+    org_file: str,
 ) -> tuple[nuk.SourceBlock, nuk.TreeContext | None]:
     """PREPARE one source (sync/verify/archive); never raises for a source-level failure.
 
@@ -461,10 +464,11 @@ def _converge_source(  # noqa: PLR0913  # one keyword per cycle input; they are 
             state_dir=state_dir,
             scratch=scratch,
             platform=platform,
+            org_file=org_file,
         )
         if src.is_platform and ctx.org is None:
             msg = (
-                f"the platform tree at {block.tag} lacks {nuk.DEFAULT_ORG_FILE} — "
+                f"the platform tree at {block.tag} lacks {org_file} — "
                 f"backends and routes resolve from it and cannot be guessed"
             )
             raise ValueError(msg)  # noqa: TRY301  # same refusal path as every other failure here
@@ -657,6 +661,8 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
         prepared: list[tuple[nuk.SourceEntry, nuk.TreeContext]] = []
         refused: list[nuk.SourceEntry] = []
         platform_ctx: nuk.TreeContext | None = None
+        # sources.yml guarantees exactly one platform source; tenants read ITS org manifest.
+        org_file = next(s.org_manifest for s in sources if s.is_platform)
         for src in sources:
             blocks[src.name], ctx = _converge_source(
                 src,
@@ -666,6 +672,7 @@ def _run_cycle(  # noqa: PLR0913  # one keyword per cycle input
                 state_dir=state_dir,
                 scratch=Path(scratch),
                 platform=platform_ctx.tree if platform_ctx else None,
+                org_file=org_file,
             )
             if ctx is not None:
                 prepared.append((src, ctx))
