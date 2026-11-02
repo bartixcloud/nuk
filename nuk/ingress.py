@@ -253,6 +253,9 @@ def backend_address(
                     f"host default."
                 )
             raise ValueError(msg)
+    if host.private_ip is None:
+        msg = f"{manifest.metadata.name}: host {host.name!r} declares no privateIp to dial."
+        raise ValueError(msg)
     if router_present and placement.role == "app":
         return f"{host.private_ip}:{nuk.ROUTER_PORT}"
     return f"{host.private_ip}:{nuk._published_port(ing)}"

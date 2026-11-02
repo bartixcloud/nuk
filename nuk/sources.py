@@ -190,6 +190,12 @@ def record_applied(tag: str, commit: str, state: Path) -> None:
 
 # --- sources (contracts C3) ----------------------------------------------------------
 
+# Named, never globbed: the infra tree also carries nuklaut.org.yml,
+# nuklaut.test.org.yml and nuklaut.min.org.yml, and a glob picking one of those
+# would have the edge resolve every backend IP from a template or a test fixture.
+# A platform source may name a different file with `org_file` (a single-host tree).
+DEFAULT_ORG_FILE = "nuklaut.astrocloud.org.yml"
+
 # The platform source is the one that applies `facilities`; every other source is a tenant
 # and its name is the tenant name.
 SourceApply = Literal["facilities", "deployments", "databases", "routes"]
@@ -205,6 +211,29 @@ class SourceEntry(BaseModel):
     deploy_key: Path
     apply: list[SourceApply] = Field(min_length=1)
     verify: Literal["signed", "none"] = "signed"
+    # Host configuration, never tag content: a tag must not choose which file defines the
+    # topology. A plain file name, so it cannot point out of the platform tree.
+    org_file: str | None = Field(default=None, pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]*\.ya?ml$")
+
+    @model_validator(mode="after")
+    def _org_file_is_platform_only(self) -> SourceEntry:
+        """Only the platform source has an org manifest; a tenant naming one is a misconfiguration.
+
+        Raises:
+            ValueError: If a source without `facilities` sets `org_file`.
+        """
+        if self.org_file is not None and not self.is_platform:
+            msg = (
+                f"org_file is only valid on the platform source (apply: facilities), "
+                f"not {self.name}"
+            )
+            raise ValueError(msg)
+        return self
+
+    @property
+    def org_manifest(self) -> str:
+        """The org manifest file name this source's tree is read with."""
+        return self.org_file or DEFAULT_ORG_FILE
 
     @property
     def is_platform(self) -> bool:

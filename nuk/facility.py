@@ -175,6 +175,7 @@ class TreeContext:
         apply: frozenset[str],
         *,
         platform: Path | None = None,
+        org_file: str | None = None,
         trees: dict[Literal["tag", "branch"], Path] | None = None,
         commits: dict[Literal["tag", "branch"], str] | None = None,
         source_repo: str | None = None,
@@ -182,7 +183,7 @@ class TreeContext:
         """Load the platform-wide inputs from `platform` (default: `tree` itself)."""
         base = platform or tree
         from nuk import DEFAULT_ORG_FILE
-        org_path = base / DEFAULT_ORG_FILE
+        org_path = base / (org_file or DEFAULT_ORG_FILE)
         tenants_path = base / TENANTS_FILE
         org = load_org(org_path) if org_path.is_file() else None
         tenants = load_tenants(base) if tenants_path.is_file() else None

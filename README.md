@@ -109,6 +109,33 @@ nuk org get <path> <dotted.key>   # one value for scripts, e.g. `facilities.auth
 nuk org show <path>               # the validated manifest as normalized YAML
 ```
 
+### Single-host operation
+
+One tenant on one VM (role `all-in-one`, no `host.env`) needs no fleet files:
+
+- **Org manifest name.** The platform source's entry in `/etc/nuklaut/sources.yml` may set
+  `org_file: nuklaut.org.yml`. The default stays `nuklaut.astrocloud.org.yml`. It is host
+  configuration, so a tag cannot choose it, and it is refused on any non-platform source.
+- **One host.** `hosts[].privateIp` is optional when the org has exactly one host and required
+  otherwise. A deployment placed `app` (or `data`, `edge`) runs on the `all-in-one` host: its
+  router is written locally and the edge render leaves it alone.
+- **Files from the tag.** A facility may declare `spec.install` to put a file from its payload
+  directory (`facilities/<name>/`) into `/opt/nuklaut/traefik/dynamic/`:
+
+  ```yaml
+  spec:
+    install:
+      - src: global.yml          # relative to the payload directory
+        name: global.yml         # file name in traefik/dynamic/
+        vars: {AUTH_BACKEND: "authentik-server:9000"}
+        secretVars: {DASHBOARD_AUTH: /etc/nuklaut/secrets/dashboard-users}
+  ```
+
+  `__TOKEN__`s are replaced in YAML *values* only (`DOMAIN` is the org's `platformDomain`), the
+  result is re-parsed, and the file is swapped in with an atomic rename from a staging directory
+  beside the watched one. nuk never overwrites a file it did not write: move an existing one
+  aside once (`mv global.yml global.yml.pre-nuk`) to hand it over.
+
 ## Shell completion
 
 `nuk` ships tab-completion for subcommands, flags, and **live deployment names**

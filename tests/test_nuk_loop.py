@@ -829,3 +829,47 @@ def test_converge_status_file_is_byte_identical_to_golden(tmp_path, monkeypatch)
         "  }\n"
         "}\n"
     )
+
+
+# --- org_file: the platform source names its org manifest --------------------------------
+
+
+def _use_org_file(fleet, org_file):
+    """Rewrite sources.yml with `org_file` on the platform source."""
+    fleet.use(("bartixcloud", ["facilities"]), ("astrojones", ["deployments"]))
+    doc = yaml.safe_load(fleet.sources_file.read_text(encoding="utf-8"))
+    doc["sources"][0]["org_file"] = org_file
+    fleet.sources_file.write_text(yaml.safe_dump(doc), encoding="utf-8")
+
+
+def test_a_platform_source_can_name_its_org_manifest(
+    tmp_path, monkeypatch, platform_files, signing_keys
+):
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk.paths, "DYNAMIC", tmp_path / "dynamic")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.11.10"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: None)
+    renamed = {
+        ("nuklaut.org.yml" if k == nuk.DEFAULT_ORG_FILE else k): v
+        for k, v in platform_files.items()
+    }
+    f = Fleet(tmp_path, renamed, signing_keys)
+    _use_org_file(f, "nuklaut.org.yml")
+    assert f.converge() == 0
+    assert f.status()["sources"]["bartixcloud"]["result"] == "ok"
+
+
+def test_the_default_org_manifest_name_is_unchanged(fleet):
+    assert fleet.converge() == 0
+
+
+def test_a_missing_configured_org_manifest_names_it_in_the_refusal(
+    tmp_path, monkeypatch, platform_files, signing_keys
+):
+    monkeypatch.setattr(nuk.paths, "DEPLOYS", tmp_path / "deploys")
+    monkeypatch.setattr(nuk, "read_self", lambda: ("app", "10.0.11.10"))
+    monkeypatch.setattr(nuk, "cmd_apply", lambda *_a, **_k: pytest.fail("must not apply"))
+    f = Fleet(tmp_path, platform_files, signing_keys)
+    _use_org_file(f, "nuklaut.org.yml")
+    assert f.converge() == 1
+    assert "lacks nuklaut.org.yml" in f.status()["sources"]["bartixcloud"]["error"]

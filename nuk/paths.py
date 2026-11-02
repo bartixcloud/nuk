@@ -50,3 +50,9 @@ KNOWN_HOSTS = Path("/etc/nuklaut/known_hosts")
 DB_SEED_ENV = Path("/etc/nuklaut/secrets/db-seed.env")
 
 RELEASES = CONVERGE_STATE / "releases"
+# SHA-256 of each file `spec.install` last wrote: what lets nuk tell its own file from one it
+# must not overwrite. Under /var/lib/nuk so it outlives a wiped /opt/nuklaut.
+INSTALLED = CONVERGE_STATE / "installed"
+# Where host-delivered secret files live; the only place besides RUN_SECRETS that
+# `install.secretVars` may read from.
+SECRET_FILES = Path("/etc/nuklaut/secrets")
