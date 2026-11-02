@@ -54,6 +54,7 @@ ORG_DOC = {
         "tls": "dns01",
         "dnsProvider": "hetzner",
         "secrets": "sops",
+        "auth": "authentik",
         "runners": "ephemeral",
     },
     "mesh": "tailscale",
@@ -82,6 +83,7 @@ ONE_HOST_DOC = {
         "tls": "dns01",
         "dnsProvider": "hetzner",
         "secrets": "sops",
+        "auth": "authentik",
         "runners": "ephemeral",
     },
     "mesh": "none",
@@ -123,7 +125,7 @@ def test_org_parses_full_manifest():
     assert org.acme_email == "admin@astrojones.guru"
     assert org.network.vswitch_vlan == 4001
     assert [h.name for h in org.hosts] == ["hcbase", "nuroot-metal", "nuroot-db"]
-    assert "auth" not in nuk.Facilities.model_fields  # the gate belongs to the route, not the org
+    assert org.facilities.auth == "authentik"
     assert org.mesh == "tailscale"
 
 
@@ -155,7 +157,7 @@ def test_org_one_host_all_in_one_no_network():
 
 def test_org_rejects_unknown_enum():
     with pytest.raises(nuk.ValidationError):
-        nuk.Org.model_validate(_facilities(runners="swarm"))
+        nuk.Org.model_validate(_facilities(auth="ldap"))
 
 
 def test_org_rejects_bad_provider():
@@ -357,7 +359,7 @@ def test_load_org_invalid_exits(tmp_path):
 
 def test_org_get_dotted_by_alias():
     org = nuk.Org.model_validate(ORG_DOC)
-    assert nuk.org_get(org, "facilities.dnsProvider") == "hetzner"
+    assert nuk.org_get(org, "facilities.auth") == "authentik"
     assert nuk.org_get(org, "platformDomain") == "astrojones.guru"
     assert nuk.org_get(org, "metadata.name") == "astrojones"
 

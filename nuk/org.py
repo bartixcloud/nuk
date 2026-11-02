@@ -49,6 +49,8 @@ class Facilities(BaseModel):
     tls: Literal["dns01", "http01"]
     dns_provider: str | None = Field(default=None, alias="dnsProvider")
     secrets: Literal["sops", "generate", "ci-inject"]
+    # Optional: a single-gate org (basic only) never has to name one.
+    auth: Literal["basic", "oauth2-proxy", "authentik"] | None = None
     runners: Literal["none", "ephemeral", "persistent"]
     data: OrgData = OrgData()
 

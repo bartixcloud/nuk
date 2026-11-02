@@ -35,7 +35,7 @@ spec:
       # stripPrefix: true               # strip `path` before proxying (needs path)
       # priority: 100                   # explicit router priority
       # www: true                       # also 301 www.<host> -> <host> (apex only)
-      # auth: basic                     # HTTP Basic Auth (refused unless a Facility provides the capability)
+      # auth: oauth                     # gate via the oauth2-proxy GitHub forwardAuth chain
   envFrom:                              # optional; merged into docker compose --env-file
     - secretRef: /opt/nuklaut/secrets/my-app.env
   databases:                            # optional; shared postgres/redis, per-app
@@ -105,7 +105,7 @@ guard. See [`examples/nuklaut.org.yml`](examples/nuklaut.org.yml).
 ```bash
 nuk org resolve [--repo-path .]   # print the GitHub org of a repo's origin (its <org>/infra)
 nuk org validate <path>           # validate a nukorg/v1 Org manifest; nonzero exit if invalid
-nuk org get <path> <dotted.key>   # one value for scripts, e.g. `facilities.dnsProvider` → hetzner
+nuk org get <path> <dotted.key>   # one value for scripts, e.g. `facilities.auth` → oauth2-proxy
 nuk org show <path>               # the validated manifest as normalized YAML
 ```
 

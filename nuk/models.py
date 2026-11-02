@@ -20,6 +20,7 @@ from pydantic import (
     StringConstraints,
     TypeAdapter,
     ValidationError,
+    field_validator,
     model_validator,
 )
 
@@ -97,12 +98,34 @@ class Ingress(BaseModel):
     # that bind (default = port), so two worker apps sharing a container port don't collide
     # on the host. Ignored on an edge/all-in-one host (no publish). Finding 6.
     host_port: int | None = Field(default=None, alias="hostPort")
-    # Which gate to put in front of this route. Since authentik and oauth2-proxy were retired
-    # `basic` is the only value, and it resolves through the route capability of the same name.
-    # This MUST stay a closed set: an unknown value used to render a router with NO auth
-    # middleware and NO error, an authentication control failing OPEN on a typo. A retired value
-    # (`oauth`, `authentik`) is now a load-time ValidationError.
-    auth: Literal["basic"] | None = None
+    # Which gate to put in front of this route — NOT which implementation provides it.
+    # `oauth` resolves to whatever the tree's auth Facility provides, because every
+    # implementation deliberately defines the same middleware names (oauth-auth,
+    # oauth-errors). So an org on Authentik still writes `auth: oauth` here.
+    #
+    # ⚠ This MUST stay a closed set. It was a bare `str | None`, and build_ingress matched
+    #   it with if/elif and no else — so any unrecognised value rendered a router with NO
+    #   auth middleware and NO error. `auth: authentik` is the tempting way to write it
+    #   and it silently published the route. An authentication control that fails OPEN on
+    #   a typo is exactly the silent-failure class this closed set makes impossible.
+    auth: Literal["basic", "oauth"] | None = None
+
+    @field_validator("auth", mode="before")
+    @classmethod
+    def _reject_impl_names(cls, v: object) -> object:
+        """Point the implementation names at the capability name they belong to.
+
+        Raises:
+            ValueError: If `auth` names an auth *implementation* rather than the gate.
+        """
+        if isinstance(v, str) and v in {"authentik", "oauth2-proxy"}:
+            msg = (
+                f"ingress.auth={v!r} names an auth IMPLEMENTATION, which belongs in the "
+                f"org's facilities.auth. Per-route, write `auth: oauth` — it resolves to "
+                f"whichever implementation this org runs."
+            )
+            raise ValueError(msg)
+        return v
 
     @model_validator(mode="after")
     def _check_backend(self) -> Ingress:
@@ -221,8 +244,8 @@ class Health(_NullTolerant):
 class RouteProvide(BaseModel):
     """`spec.provides.route` — a stateless decoration a router can opt into.
 
-    `capability` is what the facility HANDS OUT; a Deployment consumes it by
-    naming it in a field (`ingress[].auth: basic` → capability `basic`).
+    `capability` is what the facility HANDS OUT; a Deployment consumes it via
+    the §5.3 field→capability map (`ingress[].auth: oauth` → `auth`).
     `middlewares` are applied in declaration order, outer→inner.
     """
 
