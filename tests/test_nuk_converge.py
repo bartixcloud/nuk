@@ -759,3 +759,19 @@ def test_org_file_refuses_anything_but_a_plain_filename(bad):
 def test_a_tenant_source_cannot_set_org_file():
     with pytest.raises(ValidationError, match="org_file"):
         nuk.SourceEntry(**_entry(apply=["deployments"], org_file="nuklaut.org.yml"))
+
+
+@pytest.mark.parametrize("role", ["edge", "all-in-one"])
+def test_logging_status_is_reported_on_every_entry_role(role, monkeypatch):
+    # A single all-in-one box hosts the logging facility just like an edge host does.
+    monkeypatch.setattr(nuk, "env_facility", lambda facilities, capability: object())
+    monkeypatch.setattr(nuk, "facility_health", lambda facility: None)
+    ctx = type("Ctx", (), {"facilities": []})()
+    assert nuk._logging_status(role, ctx) == nuk.LoggingStatus(healthy=True, detail="ok")
+
+
+@pytest.mark.parametrize("role", ["app", "data"])
+def test_logging_status_is_absent_off_the_entry_host(role, monkeypatch):
+    monkeypatch.setattr(nuk, "env_facility", lambda facilities, capability: object())
+    ctx = type("Ctx", (), {"facilities": []})()
+    assert nuk._logging_status(role, ctx) is None
