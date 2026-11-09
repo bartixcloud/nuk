@@ -4,7 +4,7 @@ version = "2.14.1"
 description = "Minimal Kubernetes-shaped Docker Compose deployer (nuklaut controller CLI)"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = ["pydantic>=2.9", "typer>=0.15", "pyyaml>=6"]
+dependencies = ["pydantic>=2.9", "typer>=0.29.0", "pyyaml>=6"]
 
 [project.scripts]
 nuk = "nuk:main"
