@@ -622,8 +622,8 @@ def _host_auth(
 
 
 def _logging_status(role: str, platform_ctx: nuk.TreeContext | None) -> nuk.LoggingStatus | None:
-    """The LOGGING pipeline's own health (spec §14.3): info-only, edge cycles only."""
-    if role != "edge" or platform_ctx is None:
+    """The LOGGING pipeline's own health (spec §14.3): info-only, entry-host cycles only."""
+    if role not in nuk._ENTRY_ROLES or platform_ctx is None:
         return None
     facility = nuk.env_facility(platform_ctx.facilities, "logs")
     if facility is None:
