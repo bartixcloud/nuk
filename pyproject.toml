@@ -3,6 +3,8 @@ name = "nuk"
 version = "2.14.1"
 description = "Minimal Kubernetes-shaped Docker Compose deployer (nuklaut controller CLI)"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.13"
 dependencies = ["pydantic>=2.9", "typer>=0.29.0", "pyyaml>=6"]
 
@@ -20,7 +22,7 @@ build-backend = "hatchling.build"
 packages = ["nuk"]
 
 [tool.hatch.build.targets.sdist]
-include = ["nuk", "tests", "README.md"]
+include = ["nuk", "tests", "README.md", "LICENSE"]
 
 [dependency-groups]
 dev = ["ty", "pytest", "pytest-cov", "pytest-asyncio", "ruff", "pre-commit"]
